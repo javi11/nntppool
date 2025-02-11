@@ -1,82 +1,109 @@
-# nntpcli
+# nntppool
 
-A NNTP client with the fastest yenc support.
+A nntp pool connection with retry and provider rotation.
+
+## Features
+
+- Connection pooling
+- Body download retry and yenc decode
+- Post article with retry and yenc encode
+- Stat article with retry
+- TLS support
+- Multiple providers with rotation. In case of failure for article not found the provider will be rotated.
+- Backup providers. If all providers fail, the backup provider will be used for download. Useful for block accounts usage.
 
 ## Installation
 
-To install the `nntpcli` package, you can use `go get`:
+To install the `nntppool` package, you can use `go get`:
 
 ```sh
-go get github.com/javi11/nntpcli
+go get github.com/javi11/nntppool
 ```
 
 Since this package uses [Rapidyenc](github.com/mnightingale/rapidyenc), you will need to build it with **CGO enabled**
 
-## Usage
-
-Here is a simple example of how to use the `nntpcli` package:
+## Usage Example
 
 ```go
 package main
 
 import (
     "context"
-    "fmt"
     "log"
     "os"
-    "strings"
     "time"
 
-    "github.com/javi11/nntpcli"
+    "github.com/javi11/nntppool"
 )
 
 func main() {
-    client := nntpcli.New()
-    conn, err := client.Dial(context.Background(), "news.example.com", 119, time.Now().Add(5*time.Second))
+    // Configure the connection pool
+    config := connectionpool.Config{
+        MinConnections: 5,
+        MaxRetries:    3,
+        Providers: []connectionpool.Provider{
+            {
+                Host:                          "news.example.com",
+                Port:                          119,
+                Username:                      "user",
+                Password:                      "pass",
+                MaxConnections:                10,
+                MaxConnectionIdleTimeInSeconds: 300,
+                TLS:                           false,
+            },
+            {
+                Host:                          "news-backup.example.com",
+                Port:                          119,
+                Username:                      "user",
+                Password:                      "pass",
+                MaxConnections:                5,
+                MaxConnectionIdleTimeInSeconds: 300,
+                TLS:                           true,
+                IsBackupProvider:              true,
+            },
+        },
+    }
+
+    // Create a new connection pool
+    pool, err := connectionpool.NewConnectionPool(config)
     if err != nil {
         log.Fatal(err)
     }
-    defer conn.Close()
+    defer pool.Quit()
 
-    err = conn.Authenticate("username", "password")
+    // Example: Download an article
+    ctx := context.Background()
+    msgID := "<example-message-id@example.com>"
+    file, err := os.Create("article.txt")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer file.Close()
+
+    written, err := pool.Body(ctx, msgID, file, nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("Downloaded %d bytes", written)
+
+    // Example: Post an article
+    article, err := os.Open("article.txt")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer article.Close()
+
+    err = pool.Post(ctx, article)
     if err != nil {
         log.Fatal(err)
     }
 
-    err = conn.JoinGroup("misc.test")
+    // Example: Check if an article exists
+    msgNum, err := pool.Stat(ctx, msgID, []string{"alt.binaries.test"})
     if err != nil {
         log.Fatal(err)
     }
-
-    fmt.Println("Joined group:", conn.CurrentJoinedGroup())
-
-    // Example of Body command
-    body, err := os.Create("article_body.txt")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer body.Close()
-
-    _, err = conn.BodyDecoded("<message-id>", body, 0)
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Println("Article body saved to article_body.txt")
-
-    // Example of Post command
-    postContent := `From: <nobody@example.com>
-Newsgroups: misc.test
-Subject: Test Post
-Message-Id: <1234>
-Organization: nntpcli
-
-This is a test post.
-`
-    err = conn.Post(strings.NewReader(postContent))
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Println("Article posted successfully")
+    log.Printf("Article number: %d", msgNum)
 }
 ```
 
