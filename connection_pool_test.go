@@ -27,13 +27,13 @@ func TestBody(t *testing.T) {
 	mockConn.EXPECT().Close().AnyTimes()
 
 	tests := []struct {
-		name          string
-		providers     []UsenetProviderConfig
-		msgID         string
-		nntpGroups    []string
-		setup         func()
-		expectedBytes int64
 		expectedError error
+		setup         func()
+		name          string
+		msgID         string
+		providers     []UsenetProviderConfig
+		nntpGroups    []string
+		expectedBytes int64
 	}{
 		{
 			name: "successfully downloads article body",
@@ -327,12 +327,12 @@ func TestGetConnection(t *testing.T) {
 	mockConn.EXPECT().Close().AnyTimes()
 
 	tests := []struct {
+		expectedError      error
+		setup              func()
 		name               string
 		providers          []UsenetProviderConfig
 		skipProviders      []string
 		useBackupProviders bool
-		setup              func()
-		expectedError      error
 	}{
 		{
 			name: "successfully gets connection from primary provider",
@@ -448,11 +448,11 @@ func TestPost(t *testing.T) {
 	mockConn.EXPECT().Close().AnyTimes()
 
 	tests := []struct {
+		articleData   io.Reader
+		expectedError error
+		setup         func()
 		name          string
 		providers     []UsenetProviderConfig
-		articleData   io.Reader
-		setup         func()
-		expectedError error
 	}{
 		{
 			name: "successfully posts article",
@@ -610,6 +610,7 @@ func TestPost(t *testing.T) {
 				assert.ErrorIs(t, err, tt.expectedError)
 				return
 			}
+
 			assert.NoError(t, err)
 		})
 
@@ -628,11 +629,11 @@ func TestStat(t *testing.T) {
 	mockConn.EXPECT().Close().AnyTimes()
 
 	tests := []struct {
-		name          string
-		providers     []UsenetProviderConfig
-		msgID         string
-		setup         func()
 		expectedError error
+		setup         func()
+		name          string
+		msgID         string
+		providers     []UsenetProviderConfig
 	}{
 		{
 			name: "successfully checks article status",
@@ -788,6 +789,7 @@ func TestStat(t *testing.T) {
 				assert.ErrorIs(t, err, tt.expectedError)
 				return
 			}
+
 			assert.NoError(t, err)
 		})
 
@@ -824,10 +826,10 @@ func TestHotReload(t *testing.T) {
 	}
 
 	tests := []struct {
-		name          string
-		setup         func()
-		newConfig     Config
 		expectedError error
+		setup         func()
+		name          string
+		newConfig     Config
 	}{
 		{
 			name: "successfully reloads configuration",
@@ -898,11 +900,13 @@ func TestHotReload(t *testing.T) {
 				assert.ErrorIs(t, err, tt.expectedError)
 				return
 			}
+
 			assert.NoError(t, err)
 
 			// Verify the new configuration is active
 			providers := pool.GetProvidersInfo()
 			assert.Equal(t, len(tt.newConfig.Providers), len(providers))
+
 			if len(providers) > 0 {
 				assert.Equal(t, tt.newConfig.Providers[0].Host, providers[0].Host)
 				assert.Equal(t, tt.newConfig.Providers[0].MaxConnections, providers[0].MaxConnections)

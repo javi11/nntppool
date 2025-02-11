@@ -19,9 +19,9 @@ import (
 
 // MockPooledConnection is a mock of PooledConnection interface.
 type MockPooledConnection struct {
+	isgomock struct{}
 	ctrl     *gomock.Controller
 	recorder *MockPooledConnectionMockRecorder
-	isgomock struct{}
 }
 
 // MockPooledConnectionMockRecorder is the mock recorder for MockPooledConnection.

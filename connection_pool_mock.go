@@ -19,9 +19,9 @@ import (
 
 // MockUsenetConnectionPool is a mock of UsenetConnectionPool interface.
 type MockUsenetConnectionPool struct {
+	isgomock struct{}
 	ctrl     *gomock.Controller
 	recorder *MockUsenetConnectionPoolMockRecorder
-	isgomock struct{}
 }
 
 // MockUsenetConnectionPoolMockRecorder is the mock recorder for MockUsenetConnectionPool.
