@@ -1,0 +1,47 @@
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  disable-all: true
+  fast: false
+  enable:
+    - bodyclose
+    - dogsled
+    - durationcheck
+    - errcheck
+    - copyloopvar
+    - govet
+    - gosimple
+    - gofmt
+    - gofumpt
+    - goconst
+    - goimports
+    - gocyclo
+    - ineffassign
+    - lll
+    - prealloc
+    - revive
+    - staticcheck
+    - typecheck
+    - unused
+    - whitespace
+    - unconvert
+    - asciicheck
+    - wsl
+    - decorder
+    - errname
+    - errorlint
+    - nilnil
+
+linters-settings:
+  govet:
+    enable-all: true
+  lll:
+    line-length: 160
+  goconst:
+    ignore-tests: true
+  gocyclo:
+    min-complexity: 20
+  goimports:
+    local-prefixes: github.com/javi11/nntppool
