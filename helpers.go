@@ -1,4 +1,4 @@
-package connectionpool
+package nntppool
 
 import (
 	"context"

@@ -1,6 +1,6 @@
-//go:generate .tools/mockgen -source=./connection_pool.go -destination=./connection_pool_mock.go -package=connectionpool UsenetConnectionPool
+//go:generate mockgen -source=./connection_pool.go -destination=./connection_pool_mock.go -package=nntppool UsenetConnectionPool
 
-package connectionpool
+package nntppool
 
 import (
 	"context"
