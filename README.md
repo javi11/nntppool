@@ -38,10 +38,10 @@ import (
 
 func main() {
     // Configure the connection pool
-    config := connectionpool.Config{
+    config := nntppool.Config{
         MinConnections: 5,
         MaxRetries:    3,
-        Providers: []connectionpool.Provider{
+        Providers: []nntppool.Provider{
             {
                 Host:                          "news.example.com",
                 Port:                          119,
@@ -65,7 +65,7 @@ func main() {
     }
 
     // Create a new connection pool
-    pool, err := connectionpool.NewConnectionPool(config)
+    pool, err := nntppool.NewConnectionPool(config)
     if err != nil {
         log.Fatal(err)
     }
