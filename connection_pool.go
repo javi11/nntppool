@@ -252,8 +252,6 @@ func (p *connectionPool) Body(
 				return err
 			}
 
-			p.log.ErrorContext(ctx, "Error getting nntp connection:", "error", err)
-
 			return fmt.Errorf("error getting nntp connection: %w", err)
 		}
 
@@ -297,7 +295,7 @@ func (p *connectionPool) Body(
 
 				if nntpcli.IsArticleNotFoundError(err) {
 					skipProviders = append(skipProviders, provider.ID())
-					p.log.InfoContext(ctx,
+					p.log.DebugContext(ctx,
 						"Article not found in provider, trying another one...",
 						"provider",
 						provider.Host,
@@ -373,8 +371,6 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
-
-			p.log.ErrorContext(ctx, "Error getting nntp connection:", "error", err)
 
 			return fmt.Errorf("error getting nntp connection: %w", err)
 		}
@@ -493,8 +489,6 @@ func (p *connectionPool) Stat(
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
-
-			p.log.ErrorContext(ctx, "Error getting nntp connection:", "error", err)
 
 			return fmt.Errorf("error getting nntp connection: %w", err)
 		}
