@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/avast/retry-go"
 	"github.com/javi11/nntpcli"
 )
 
@@ -21,6 +22,14 @@ type Logger interface {
 	ErrorContext(ctx context.Context, msg string, args ...any)
 }
 
+type DelayType int
+
+const (
+	DelayTypeFixed DelayType = iota
+	DelayTypeRandom
+	DelayTypeExponential
+)
+
 type Config struct {
 	Logger                              Logger
 	NntpCli                             nntpcli.Client
@@ -28,7 +37,9 @@ type Config struct {
 	HealthCheckInterval                 time.Duration
 	MinConnections                      int
 	MaxRetries                          uint
+	DelayType                           DelayType
 	SkipProvidersVerificationOnCreation bool
+	delayTypeFn                         retry.DelayTypeFunc
 }
 
 type UsenetProviderConfig struct {
@@ -105,6 +116,17 @@ func mergeWithDefault(config ...Config) Config {
 		}
 
 		cfg.Providers[i] = p
+	}
+
+	switch cfg.DelayType {
+	case DelayTypeFixed:
+		cfg.delayTypeFn = retry.FixedDelay
+	case DelayTypeRandom:
+		cfg.delayTypeFn = retry.RandomDelay
+	case DelayTypeExponential:
+		cfg.delayTypeFn = retry.BackOffDelay
+	default:
+		cfg.delayTypeFn = retry.FixedDelay
 	}
 
 	return cfg
