@@ -31,6 +31,7 @@ const (
 )
 
 type Config struct {
+	delayTypeFn                         retry.DelayTypeFunc
 	Logger                              Logger
 	NntpCli                             nntpcli.Client
 	Providers                           []UsenetProviderConfig
@@ -39,7 +40,6 @@ type Config struct {
 	MaxRetries                          uint
 	DelayType                           DelayType
 	SkipProvidersVerificationOnCreation bool
-	delayTypeFn                         retry.DelayTypeFunc
 }
 
 type UsenetProviderConfig struct {
