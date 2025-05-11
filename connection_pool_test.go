@@ -577,6 +577,42 @@ func TestPost(t *testing.T) {
 
 				mockConn.EXPECT().Post(gomock.Any()).Return(&net.OpError{Op: "write", Err: syscall.EPIPE})
 				mockConn.EXPECT().Post(gomock.Any()).Return(nil)
+			},
+			expectedError: nil,
+		},
+		{
+			name: "rotates providers when segment already exists",
+			providers: []UsenetProviderConfig{
+				{
+					Host:                      "primary.example.com",
+					Port:                      119,
+					MaxConnections:            1,
+					MaxConnectionTTLInSeconds: 2400,
+				},
+				{
+					Host:                      "backup.example.com",
+					Port:                      119,
+					MaxConnections:            1,
+					MaxConnectionTTLInSeconds: 2400,
+					IsBackupProvider:          true,
+				},
+			},
+			articleData: strings.NewReader("test article data"),
+			setup: func() {
+				ttl := time.Duration(2400) * time.Second
+				// Primary provider fails with segment already exists
+				mockClient.EXPECT().Dial(
+					gomock.Any(),
+					"primary.example.com",
+					119,
+					nntpcli.DialConfig{
+						KeepAliveTime: ttl,
+					},
+				).Return(mockConn, nil)
+
+				mockConn.EXPECT().Post(gomock.Any()).Return(&textproto.Error{
+					Code: SegmentAlreadyExistsErrCode,
+				})
 
 				// Backup provider succeeds
 				mockClient.EXPECT().Dial(
@@ -586,7 +622,9 @@ func TestPost(t *testing.T) {
 					nntpcli.DialConfig{
 						KeepAliveTime: ttl,
 					},
-				).Return(mockConn, nil).MaxTimes(2)
+				).Return(mockConn, nil)
+
+				mockConn.EXPECT().Post(gomock.Any()).Return(nil)
 			},
 			expectedError: nil,
 		},

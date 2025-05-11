@@ -61,6 +61,8 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 
 		if err := verifyProviders(pools, log); err != nil {
 			log.Error(fmt.Sprintf("failed to verify providers: %v", err))
+
+			return nil, err
 		}
 
 		log.Info("providers verified")
@@ -279,13 +281,13 @@ func (p *connectionPool) Body(
 	},
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
-		retry.DelayType(retry.FixedDelay),
+		retry.DelayType(p.config.delayTypeFn),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			p.log.DebugContext(ctx,
-				"Retrying download",
+				"Retrying body",
 				"error", err,
 				"retry", n,
 			)
@@ -336,7 +338,7 @@ func (p *connectionPool) Body(
 		}
 
 		p.log.DebugContext(ctx,
-			"All download retries exhausted",
+			"All body retries exhausted",
 			"error", retryErr,
 		)
 
@@ -359,10 +361,13 @@ func (p *connectionPool) Body(
 // The reader should contain the entire article, headers and body in
 // RFC822ish format.
 func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
-	var conn PooledConnection
+	var (
+		conn          PooledConnection
+		skipProviders []string
+	)
 
 	retryErr := retry.Do(func() error {
-		c, err := p.GetConnection(ctx, []string{}, true)
+		c, err := p.GetConnection(ctx, skipProviders, true)
 		if err != nil {
 			if c != nil {
 				_ = c.Close()
@@ -389,7 +394,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 	},
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
-		retry.DelayType(retry.FixedDelay),
+		retry.DelayType(p.config.delayTypeFn),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
@@ -403,16 +408,28 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			if conn != nil {
 				provider := conn.Provider()
 
-				p.log.DebugContext(ctx,
-					"Closing connection",
-					"error", err,
-					"retry", n,
-					"error_connection_host", provider.Host,
-					"error_connection_created_at", conn.CreatedAt(),
-				)
+				if nntpcli.IsSegmentAlreadyExistsError(err) {
+					skipProviders = append(skipProviders, provider.ID())
+					p.log.DebugContext(ctx,
+						"Article posting failed in provider, trying another one...",
+						"provider",
+						provider.Host,
+					)
 
-				_ = conn.Close()
-				conn = nil
+					conn.Free()
+					conn = nil
+				} else {
+					p.log.DebugContext(ctx,
+						"Closing connection",
+						"error", err,
+						"retry", n,
+						"error_connection_host", provider.Host,
+						"error_connection_created_at", conn.CreatedAt(),
+					)
+
+					_ = conn.Close()
+					conn = nil
+				}
 			}
 		}),
 	)
@@ -514,13 +531,13 @@ func (p *connectionPool) Stat(
 	},
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
-		retry.DelayType(retry.FixedDelay),
+		retry.DelayType(p.config.delayTypeFn),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			p.log.DebugContext(ctx,
-				"Retrying download",
+				"Retrying stat",
 				"error", err,
 				"retry", n,
 			)
@@ -571,7 +588,7 @@ func (p *connectionPool) Stat(
 		}
 
 		p.log.DebugContext(ctx,
-			"All download retries exhausted",
+			"All stat retries exhausted",
 			"error", retryErr,
 		)
 
