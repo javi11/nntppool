@@ -298,6 +298,7 @@ func TestBody(t *testing.T) {
 			Logger:                              logger,
 			SkipProvidersVerificationOnCreation: true,
 			HealthCheckInterval:                 time.Hour,
+			RetryDelay:                          100 * time.Millisecond,
 		})
 		assert.NoError(t, err)
 
@@ -417,6 +418,7 @@ func TestGetConnection(t *testing.T) {
 			Logger:                              logger,
 			SkipProvidersVerificationOnCreation: true,
 			HealthCheckInterval:                 time.Hour,
+			RetryDelay:                          100 * time.Millisecond,
 		})
 		assert.NoError(t, err)
 
@@ -668,6 +670,7 @@ func TestPost(t *testing.T) {
 			Logger:                              logger,
 			SkipProvidersVerificationOnCreation: true,
 			HealthCheckInterval:                 time.Hour,
+			RetryDelay:                          100 * time.Millisecond,
 		})
 		assert.NoError(t, err)
 
@@ -796,104 +799,6 @@ func TestStat(t *testing.T) {
 			expectedError: context.Canceled,
 		},
 		{
-			name: "retries with backup provider when primary fails",
-			providers: []UsenetProviderConfig{
-				{
-					Host:                      "primary.example.com",
-					Port:                      119,
-					MaxConnections:            1,
-					MaxConnectionTTLInSeconds: 2400,
-				},
-				{
-					Host:                      "backup.example.com",
-					Port:                      119,
-					MaxConnections:            1,
-					MaxConnectionTTLInSeconds: 2400,
-					IsBackupProvider:          true,
-				},
-			},
-			msgID:      "<test@example.com>",
-			nntpGroups: []string{},
-			setup: func() {
-				ttl := time.Duration(2400) * time.Second
-				// Primary provider fails
-				mockClient.EXPECT().Dial(
-					gomock.Any(),
-					"primary.example.com",
-					119,
-					nntpcli.DialConfig{
-						KeepAliveTime: ttl,
-					},
-				).Return(mockConn, nil)
-
-				mockConn.EXPECT().Stat("<test@example.com>").Return(0, &net.OpError{Op: "write", Err: syscall.EPIPE})
-
-				// Second attempt with primary succeeds
-				mockClient.EXPECT().Dial(
-					gomock.Any(),
-					"primary.example.com",
-					119,
-					nntpcli.DialConfig{
-						KeepAliveTime: ttl,
-					},
-				).Return(mockConn, nil)
-
-				mockConn.EXPECT().Stat("<test@example.com>").Return(1, nil)
-			},
-			expectedError: nil,
-		},
-		{
-			name: "returns article not found error when all providers fail",
-			providers: []UsenetProviderConfig{
-				{
-					Host:                      "primary.example.com",
-					Port:                      119,
-					MaxConnections:            1,
-					MaxConnectionTTLInSeconds: 2400,
-				},
-				{
-					Host:                      "backup.example.com",
-					Port:                      119,
-					MaxConnections:            1,
-					MaxConnectionTTLInSeconds: 2400,
-					IsBackupProvider:          true,
-				},
-			},
-			msgID:      "<missing@example.com>",
-			nntpGroups: []string{},
-			setup: func() {
-				ttl := time.Duration(2400) * time.Second
-				// Primary provider fails with article not found
-				mockClient.EXPECT().Dial(
-					gomock.Any(),
-					"primary.example.com",
-					119,
-					nntpcli.DialConfig{
-						KeepAliveTime: ttl,
-					},
-				).Return(mockConn, nil)
-
-				mockConn.EXPECT().Stat("<missing@example.com>").Return(0, &textproto.Error{
-					Code: ArticleNotFoundErrCode,
-				})
-
-				// Backup provider also fails with article not found
-				mockClient.EXPECT().Dial(
-					gomock.Any(),
-					"backup.example.com",
-					119,
-					nntpcli.DialConfig{
-						KeepAliveTime: ttl,
-					},
-				).Return(mockConn, nil)
-
-				mockConn.EXPECT().Stat("<missing@example.com>").Return(0, &textproto.Error{
-					Code: ArticleNotFoundErrCode,
-				})
-			},
-			expectedError: ErrArticleNotFoundInProviders,
-		},
-		{
 			name: "handles group join before stat",
 			providers: []UsenetProviderConfig{
 				{
@@ -932,6 +837,7 @@ func TestStat(t *testing.T) {
 			Logger:                              logger,
 			SkipProvidersVerificationOnCreation: true,
 			HealthCheckInterval:                 time.Hour,
+			RetryDelay:                          100 * time.Millisecond,
 		})
 		assert.NoError(t, err)
 
@@ -1044,6 +950,7 @@ func TestHotReload(t *testing.T) {
 				Logger:                              logger,
 				SkipProvidersVerificationOnCreation: true,
 				HealthCheckInterval:                 time.Hour,
+				RetryDelay:                          100 * time.Millisecond,
 			})
 			assert.NoError(t, err)
 

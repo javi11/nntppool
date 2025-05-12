@@ -40,7 +40,7 @@ type Config struct {
 	MaxRetries                          uint
 	DelayType                           DelayType
 	SkipProvidersVerificationOnCreation bool
-	retryDelay                          time.Duration
+	RetryDelay                          time.Duration
 }
 
 type UsenetProviderConfig struct {
@@ -68,7 +68,7 @@ var (
 		HealthCheckInterval: 1 * time.Minute,
 		MinConnections:      5,
 		MaxRetries:          4,
-		retryDelay:          5 * time.Second,
+		RetryDelay:          5 * time.Second,
 	}
 	providerConfigDefault = UsenetProviderConfig{
 		MaxConnections:                 10,
@@ -104,8 +104,8 @@ func mergeWithDefault(config ...Config) Config {
 		cfg.MaxRetries = configDefault.MaxRetries
 	}
 
-	if cfg.retryDelay == 0 {
-		cfg.retryDelay = configDefault.retryDelay
+	if cfg.RetryDelay == 0 {
+		cfg.RetryDelay = configDefault.RetryDelay
 	}
 
 	for i, p := range cfg.Providers {

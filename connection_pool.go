@@ -282,7 +282,7 @@ func (p *connectionPool) Body(
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
 		retry.DelayType(p.config.delayTypeFn),
-		retry.Delay(p.config.retryDelay),
+		retry.Delay(p.config.RetryDelay),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
@@ -398,7 +398,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
 		retry.DelayType(p.config.delayTypeFn),
-		retry.Delay(p.config.retryDelay),
+		retry.Delay(p.config.RetryDelay),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
@@ -538,7 +538,7 @@ func (p *connectionPool) Stat(
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
 		retry.DelayType(p.config.delayTypeFn),
-		retry.Delay(p.config.retryDelay),
+		retry.Delay(p.config.RetryDelay),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
