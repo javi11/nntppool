@@ -443,6 +443,11 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			err = errors.Join(e.WrappedErrors()...)
 		}
 
+		// Convert provider rotation error to a more specific error for POST
+		if errors.Is(err, ErrArticleNotFoundInProviders) {
+			return ErrFailedToPostInAllProviders
+		}
+
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
 				conn.Free()

@@ -16,6 +16,7 @@ var (
 	ErrNilNntpConn                = errors.New("nil nntp connection")
 	ErrNoProviderAvailable        = errors.New("no provider available, because possible max connections reached")
 	ErrArticleNotFoundInProviders = errors.New("the article is not found in any of your providers")
+	ErrFailedToPostInAllProviders = errors.New("failed to post in all providers")
 )
 
 const (
