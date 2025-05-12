@@ -337,10 +337,12 @@ func (p *connectionPool) Body(
 			}
 		}
 
-		p.log.DebugContext(ctx,
-			"All body retries exhausted",
-			"error", retryErr,
-		)
+		if !errors.Is(err, context.Canceled) {
+			p.log.DebugContext(ctx,
+				"All body retries exhausted",
+				"error", retryErr,
+			)
+		}
 
 		if nntpcli.IsArticleNotFoundError(err) {
 			// if article not found, we don't want to retry so mark it as corrupted
@@ -456,10 +458,12 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			}
 		}
 
-		p.log.DebugContext(ctx,
-			"All post retries exhausted",
-			"error", retryErr,
-		)
+		if !errors.Is(err, context.Canceled) {
+			p.log.DebugContext(ctx,
+				"All post retries exhausted",
+				"error", retryErr,
+			)
+		}
 
 		return err
 	}
@@ -592,10 +596,12 @@ func (p *connectionPool) Stat(
 			}
 		}
 
-		p.log.DebugContext(ctx,
-			"All stat retries exhausted",
-			"error", retryErr,
-		)
+		if !errors.Is(err, context.Canceled) {
+			p.log.DebugContext(ctx,
+				"All stat retries exhausted",
+				"error", retryErr,
+			)
+		}
 
 		if nntpcli.IsArticleNotFoundError(err) {
 			// if article not found, we don't want to retry so mark it as corrupted
