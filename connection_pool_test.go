@@ -628,6 +628,35 @@ func TestPost(t *testing.T) {
 			},
 			expectedError: nil,
 		},
+		{
+			name: "converts ErrArticleNotFoundInProviders to ErrFailedToPostInAllProviders",
+			providers: []UsenetProviderConfig{
+				{
+					Host:                      "primary.example.com",
+					Port:                      119,
+					MaxConnections:            1,
+					MaxConnectionTTLInSeconds: 2400,
+				},
+			},
+			articleData: strings.NewReader("test article data"),
+			setup: func() {
+				ttl := time.Duration(2400) * time.Second
+				// Primary provider fails with article not found
+				mockClient.EXPECT().Dial(
+					gomock.Any(),
+					"primary.example.com",
+					119,
+					nntpcli.DialConfig{
+						KeepAliveTime: ttl,
+					},
+				).Return(mockConn, nil)
+
+				mockConn.EXPECT().Post(gomock.Any()).Return(&textproto.Error{
+					Code: SegmentAlreadyExistsErrCode,
+				})
+			},
+			expectedError: ErrFailedToPostInAllProviders,
+		},
 	}
 
 	for _, tt := range tests {
@@ -672,6 +701,7 @@ func TestStat(t *testing.T) {
 		name          string
 		msgID         string
 		providers     []UsenetProviderConfig
+		nntpGroups    []string
 	}{
 		{
 			name: "successfully checks article status",
@@ -683,7 +713,8 @@ func TestStat(t *testing.T) {
 					MaxConnectionTTLInSeconds: 2400,
 				},
 			},
-			msgID: "<test@example.com>",
+			msgID:      "<test@example.com>",
+			nntpGroups: []string{},
 			setup: func() {
 				ttl := time.Duration(2400) * time.Second
 				mockClient.EXPECT().Dial(
@@ -709,7 +740,8 @@ func TestStat(t *testing.T) {
 					MaxConnectionTTLInSeconds: 2400,
 				},
 			},
-			msgID: "<test@example.com>",
+			msgID:      "<test@example.com>",
+			nntpGroups: []string{},
 			setup: func() {
 				ttl := time.Duration(2400) * time.Second
 				// First attempt fails with timeout
@@ -746,7 +778,8 @@ func TestStat(t *testing.T) {
 					MaxConnectionTTLInSeconds: 2400,
 				},
 			},
-			msgID: "<test@example.com>",
+			msgID:      "<test@example.com>",
+			nntpGroups: []string{},
 			setup: func() {
 				ttl := time.Duration(2400) * time.Second
 				mockClient.EXPECT().Dial(
@@ -779,7 +812,8 @@ func TestStat(t *testing.T) {
 					IsBackupProvider:          true,
 				},
 			},
-			msgID: "<test@example.com>",
+			msgID:      "<test@example.com>",
+			nntpGroups: []string{},
 			setup: func() {
 				ttl := time.Duration(2400) * time.Second
 				// Primary provider fails
@@ -790,12 +824,60 @@ func TestStat(t *testing.T) {
 					nntpcli.DialConfig{
 						KeepAliveTime: ttl,
 					},
-				).Return(mockConn, nil).MaxTimes(2)
+				).Return(mockConn, nil)
 
 				mockConn.EXPECT().Stat("<test@example.com>").Return(0, &net.OpError{Op: "write", Err: syscall.EPIPE})
-				mockConn.EXPECT().Stat("<test@example.com>").Return(1, nil)
 
-				// Backup provider succeeds
+				// Second attempt with primary succeeds
+				mockClient.EXPECT().Dial(
+					gomock.Any(),
+					"primary.example.com",
+					119,
+					nntpcli.DialConfig{
+						KeepAliveTime: ttl,
+					},
+				).Return(mockConn, nil)
+
+				mockConn.EXPECT().Stat("<test@example.com>").Return(1, nil)
+			},
+			expectedError: nil,
+		},
+		{
+			name: "returns article not found error when all providers fail",
+			providers: []UsenetProviderConfig{
+				{
+					Host:                      "primary.example.com",
+					Port:                      119,
+					MaxConnections:            1,
+					MaxConnectionTTLInSeconds: 2400,
+				},
+				{
+					Host:                      "backup.example.com",
+					Port:                      119,
+					MaxConnections:            1,
+					MaxConnectionTTLInSeconds: 2400,
+					IsBackupProvider:          true,
+				},
+			},
+			msgID:      "<missing@example.com>",
+			nntpGroups: []string{},
+			setup: func() {
+				ttl := time.Duration(2400) * time.Second
+				// Primary provider fails with article not found
+				mockClient.EXPECT().Dial(
+					gomock.Any(),
+					"primary.example.com",
+					119,
+					nntpcli.DialConfig{
+						KeepAliveTime: ttl,
+					},
+				).Return(mockConn, nil)
+
+				mockConn.EXPECT().Stat("<missing@example.com>").Return(0, &textproto.Error{
+					Code: ArticleNotFoundErrCode,
+				})
+
+				// Backup provider also fails with article not found
 				mockClient.EXPECT().Dial(
 					gomock.Any(),
 					"backup.example.com",
@@ -803,7 +885,39 @@ func TestStat(t *testing.T) {
 					nntpcli.DialConfig{
 						KeepAliveTime: ttl,
 					},
-				).Return(mockConn, nil).MaxTimes(2)
+				).Return(mockConn, nil)
+
+				mockConn.EXPECT().Stat("<missing@example.com>").Return(0, &textproto.Error{
+					Code: ArticleNotFoundErrCode,
+				})
+			},
+			expectedError: ErrArticleNotFoundInProviders,
+		},
+		{
+			name: "handles group join before stat",
+			providers: []UsenetProviderConfig{
+				{
+					Host:                      "primary.example.com",
+					Port:                      119,
+					MaxConnections:            1,
+					MaxConnectionTTLInSeconds: 2400,
+				},
+			},
+			msgID:      "<test@example.com>",
+			nntpGroups: []string{"alt.test"},
+			setup: func() {
+				ttl := time.Duration(2400) * time.Second
+				mockClient.EXPECT().Dial(
+					gomock.Any(),
+					"primary.example.com",
+					119,
+					nntpcli.DialConfig{
+						KeepAliveTime: ttl,
+					},
+				).Return(mockConn, nil)
+
+				mockConn.EXPECT().JoinGroup("alt.test").Return(nil)
+				mockConn.EXPECT().Stat("<test@example.com>").Return(1, nil)
 			},
 			expectedError: nil,
 		},
@@ -822,7 +936,7 @@ func TestStat(t *testing.T) {
 		assert.NoError(t, err)
 
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := pool.Stat(context.Background(), tt.msgID, []string{})
+			_, err := pool.Stat(context.Background(), tt.msgID, tt.nntpGroups)
 			if tt.expectedError != nil {
 				assert.ErrorIs(t, err, tt.expectedError)
 				return
