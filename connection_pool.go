@@ -282,6 +282,7 @@ func (p *connectionPool) Body(
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
 		retry.DelayType(p.config.delayTypeFn),
+		retry.Delay(p.config.retryDelay),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
@@ -397,6 +398,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
 		retry.DelayType(p.config.delayTypeFn),
+		retry.Delay(p.config.retryDelay),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
@@ -499,12 +501,7 @@ func (p *connectionPool) Stat(
 	skipProviders := make([]string, 0)
 
 	retryErr := retry.Do(func() error {
-		// In case of skip provider it means that the article was not found,
-		// in such case we want to use backup providers as well
-		useBackupProviders := false
-		if len(skipProviders) > 0 {
-			useBackupProviders = true
-		}
+		useBackupProviders := true
 
 		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
 		if err != nil {
@@ -541,6 +538,7 @@ func (p *connectionPool) Stat(
 		retry.Context(ctx),
 		retry.Attempts(p.config.MaxRetries),
 		retry.DelayType(p.config.delayTypeFn),
+		retry.Delay(p.config.retryDelay),
 		retry.RetryIf(func(err error) bool {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
@@ -555,13 +553,6 @@ func (p *connectionPool) Stat(
 				provider := conn.Provider()
 
 				if nntpcli.IsArticleNotFoundError(err) {
-					skipProviders = append(skipProviders, provider.ID())
-					p.log.InfoContext(ctx,
-						"Article not found in provider, trying another one...",
-						"provider",
-						provider.Host,
-					)
-
 					conn.Free()
 					conn = nil
 				} else {
