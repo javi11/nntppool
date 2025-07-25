@@ -83,16 +83,70 @@ func (mr *MockPooledConnectionMockRecorder) CreatedAt() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreatedAt", reflect.TypeOf((*MockPooledConnection)(nil).CreatedAt))
 }
 
-// Free mocks base method.
-func (m *MockPooledConnection) Free() {
+// ExtendLease mocks base method.
+func (m *MockPooledConnection) ExtendLease(duration time.Duration) {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "Free")
+	m.ctrl.Call(m, "ExtendLease", duration)
+}
+
+// ExtendLease indicates an expected call of ExtendLease.
+func (mr *MockPooledConnectionMockRecorder) ExtendLease(duration any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExtendLease", reflect.TypeOf((*MockPooledConnection)(nil).ExtendLease), duration)
+}
+
+// Free mocks base method.
+func (m *MockPooledConnection) Free() error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Free")
+	ret0, _ := ret[0].(error)
+	return ret0
 }
 
 // Free indicates an expected call of Free.
 func (mr *MockPooledConnectionMockRecorder) Free() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Free", reflect.TypeOf((*MockPooledConnection)(nil).Free))
+}
+
+// IsLeaseExpired mocks base method.
+func (m *MockPooledConnection) IsLeaseExpired() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsLeaseExpired")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// IsLeaseExpired indicates an expected call of IsLeaseExpired.
+func (mr *MockPooledConnectionMockRecorder) IsLeaseExpired() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsLeaseExpired", reflect.TypeOf((*MockPooledConnection)(nil).IsLeaseExpired))
+}
+
+// IsMarkedForReplacement mocks base method.
+func (m *MockPooledConnection) IsMarkedForReplacement() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsMarkedForReplacement")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// IsMarkedForReplacement indicates an expected call of IsMarkedForReplacement.
+func (mr *MockPooledConnectionMockRecorder) IsMarkedForReplacement() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsMarkedForReplacement", reflect.TypeOf((*MockPooledConnection)(nil).IsMarkedForReplacement))
+}
+
+// MarkForReplacement mocks base method.
+func (m *MockPooledConnection) MarkForReplacement() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "MarkForReplacement")
+}
+
+// MarkForReplacement indicates an expected call of MarkForReplacement.
+func (mr *MockPooledConnectionMockRecorder) MarkForReplacement() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MarkForReplacement", reflect.TypeOf((*MockPooledConnection)(nil).MarkForReplacement))
 }
 
 // Provider mocks base method.

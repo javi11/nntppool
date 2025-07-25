@@ -14,6 +14,7 @@ import (
 	io "io"
 	reflect "reflect"
 
+	nntpcli "github.com/javi11/nntpcli"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -56,6 +57,35 @@ func (mr *MockUsenetConnectionPoolMockRecorder) Body(ctx, msgID, w, nntpGroups a
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Body", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Body), ctx, msgID, w, nntpGroups)
 }
 
+// BodyReader mocks base method.
+func (m *MockUsenetConnectionPool) BodyReader(ctx context.Context, msgID string, nntpGroups []string) (nntpcli.ArticleBodyReader, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "BodyReader", ctx, msgID, nntpGroups)
+	ret0, _ := ret[0].(nntpcli.ArticleBodyReader)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// BodyReader indicates an expected call of BodyReader.
+func (mr *MockUsenetConnectionPoolMockRecorder) BodyReader(ctx, msgID, nntpGroups any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyReader", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyReader), ctx, msgID, nntpGroups)
+}
+
+// GetActiveMigrations mocks base method.
+func (m *MockUsenetConnectionPool) GetActiveMigrations() map[string]*MigrationStatus {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetActiveMigrations")
+	ret0, _ := ret[0].(map[string]*MigrationStatus)
+	return ret0
+}
+
+// GetActiveMigrations indicates an expected call of GetActiveMigrations.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetActiveMigrations() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetActiveMigrations", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetActiveMigrations))
+}
+
 // GetConnection mocks base method.
 func (m *MockUsenetConnectionPool) GetConnection(ctx context.Context, skipProviders []string, useBackupProviders bool) (PooledConnection, error) {
 	m.ctrl.T.Helper()
@@ -71,6 +101,21 @@ func (mr *MockUsenetConnectionPoolMockRecorder) GetConnection(ctx, skipProviders
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetConnection", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetConnection), ctx, skipProviders, useBackupProviders)
 }
 
+// GetMigrationStatus mocks base method.
+func (m *MockUsenetConnectionPool) GetMigrationStatus(migrationID string) (*MigrationStatus, bool) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetMigrationStatus", migrationID)
+	ret0, _ := ret[0].(*MigrationStatus)
+	ret1, _ := ret[1].(bool)
+	return ret0, ret1
+}
+
+// GetMigrationStatus indicates an expected call of GetMigrationStatus.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetMigrationStatus(migrationID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMigrationStatus", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetMigrationStatus), migrationID)
+}
+
 // GetProvidersInfo mocks base method.
 func (m *MockUsenetConnectionPool) GetProvidersInfo() []ProviderInfo {
 	m.ctrl.T.Helper()
@@ -83,24 +128,6 @@ func (m *MockUsenetConnectionPool) GetProvidersInfo() []ProviderInfo {
 func (mr *MockUsenetConnectionPoolMockRecorder) GetProvidersInfo() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetProvidersInfo", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetProvidersInfo))
-}
-
-// HotReload mocks base method.
-func (m *MockUsenetConnectionPool) HotReload(arg0 ...Config) error {
-	m.ctrl.T.Helper()
-	varargs := []any{}
-	for _, a := range arg0 {
-		varargs = append(varargs, a)
-	}
-	ret := m.ctrl.Call(m, "HotReload", varargs...)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// HotReload indicates an expected call of HotReload.
-func (mr *MockUsenetConnectionPoolMockRecorder) HotReload(arg0 ...any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HotReload", reflect.TypeOf((*MockUsenetConnectionPool)(nil).HotReload), arg0...)
 }
 
 // Post mocks base method.
@@ -142,4 +169,22 @@ func (m *MockUsenetConnectionPool) Stat(ctx context.Context, msgID string, nntpG
 func (mr *MockUsenetConnectionPoolMockRecorder) Stat(ctx, msgID, nntpGroups any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stat", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Stat), ctx, msgID, nntpGroups)
+}
+
+// UpdateConfiguration mocks base method.
+func (m *MockUsenetConnectionPool) UpdateConfiguration(arg0 ...Config) error {
+	m.ctrl.T.Helper()
+	varargs := []any{}
+	for _, a := range arg0 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "UpdateConfiguration", varargs...)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// UpdateConfiguration indicates an expected call of UpdateConfiguration.
+func (mr *MockUsenetConnectionPoolMockRecorder) UpdateConfiguration(arg0 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateConfiguration", reflect.TypeOf((*MockUsenetConnectionPool)(nil).UpdateConfiguration), arg0...)
 }

@@ -41,6 +41,8 @@ type Config struct {
 	DelayType                           DelayType
 	SkipProvidersVerificationOnCreation bool
 	RetryDelay                          time.Duration
+	ShutdownTimeout                     time.Duration
+	DefaultConnectionLease              time.Duration
 }
 
 type UsenetProviderConfig struct {
@@ -65,10 +67,12 @@ type Option func(*Config)
 
 var (
 	configDefault = Config{
-		HealthCheckInterval: 1 * time.Minute,
-		MinConnections:      5,
-		MaxRetries:          4,
-		RetryDelay:          5 * time.Second,
+		HealthCheckInterval:    1 * time.Minute,
+		MinConnections:         5,
+		MaxRetries:             4,
+		RetryDelay:             5 * time.Second,
+		ShutdownTimeout:        30 * time.Second,
+		DefaultConnectionLease: 10 * time.Minute,
 	}
 	providerConfigDefault = UsenetProviderConfig{
 		MaxConnections:                 10,
@@ -106,6 +110,14 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.RetryDelay == 0 {
 		cfg.RetryDelay = configDefault.RetryDelay
+	}
+
+	if cfg.ShutdownTimeout == 0 {
+		cfg.ShutdownTimeout = configDefault.ShutdownTimeout
+	}
+
+	if cfg.DefaultConnectionLease == 0 {
+		cfg.DefaultConnectionLease = configDefault.DefaultConnectionLease
 	}
 
 	for i, p := range cfg.Providers {

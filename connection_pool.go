@@ -9,6 +9,7 @@ import (
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/avast/retry-go"
@@ -40,16 +41,23 @@ type UsenetConnectionPool interface {
 	Post(ctx context.Context, r io.Reader) error
 	Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error)
 	GetProvidersInfo() []ProviderInfo
-	HotReload(...Config) error
+	UpdateConfiguration(...Config) error
+	GetMigrationStatus(migrationID string) (*MigrationStatus, bool)
+	GetActiveMigrations() map[string]*MigrationStatus
 	Quit()
 }
 
 type connectionPool struct {
-	closeChan chan struct{}
-	connPools []providerPool
-	log       Logger
-	config    Config
-	wg        sync.WaitGroup
+	closeChan        chan struct{}
+	connPools        []*providerPool
+	log              Logger
+	config           Config
+	wg               sync.WaitGroup
+	shutdownMu       sync.RWMutex      // Protects shutdown operations
+	isShutdown       int32             // Atomic flag for shutdown state
+	shutdownOnce     sync.Once         // Ensures single shutdown
+	connectionBudget *ConnectionBudget // Tracks connection limits per provider
+	migrationManager *MigrationManager // Handles incremental migrations
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
@@ -73,13 +81,23 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 		log.Info("providers verified")
 	}
 
-	pool := &connectionPool{
-		connPools: pools,
-		log:       log,
-		config:    config,
-		closeChan: make(chan struct{}, 1),
-		wg:        sync.WaitGroup{},
+	// Initialize connection budget
+	budget := NewConnectionBudget()
+	for _, provider := range config.Providers {
+		budget.SetProviderLimit(provider.ID(), provider.MaxConnections)
 	}
+
+	pool := &connectionPool{
+		connPools:        pools,
+		log:              log,
+		config:           config,
+		closeChan:        make(chan struct{}, 1),
+		wg:               sync.WaitGroup{},
+		connectionBudget: budget,
+	}
+
+	// Initialize migration manager
+	pool.migrationManager = NewMigrationManager(pool)
 
 	healthCheckInterval := defaultHealthCheckInterval
 	if config.HealthCheckInterval > 0 {
@@ -93,16 +111,46 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 }
 
 func (p *connectionPool) Quit() {
-	p.closeChan <- struct{}{}
-	close(p.closeChan)
+	p.shutdownOnce.Do(func() {
+		atomic.StoreInt32(&p.isShutdown, 1)
 
-	p.wg.Wait()
+		p.shutdownMu.Lock()
+		defer p.shutdownMu.Unlock()
 
-	for _, cp := range p.connPools {
-		cp.connectionPool.Close()
-	}
+		// Signal shutdown to health checker
+		select {
+		case p.closeChan <- struct{}{}:
+		default:
+			// Channel might be full, that's ok
+		}
+		close(p.closeChan)
 
-	p.connPools = nil
+		// Wait for health checker to finish with timeout
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			p.wg.Wait()
+		}()
+
+		select {
+		case <-done:
+			// Normal shutdown
+		case <-time.After(p.config.ShutdownTimeout):
+			p.log.Warn("Shutdown timeout exceeded, forcing close")
+		}
+
+		// Shutdown migration manager first to cancel any ongoing migrations
+		if p.migrationManager != nil {
+			p.migrationManager.Shutdown()
+		}
+
+		// Close all connection pools
+		for _, cp := range p.connPools {
+			cp.connectionPool.Close()
+		}
+
+		p.connPools = nil
+	})
 }
 
 func (p *connectionPool) GetConnection(
@@ -110,15 +158,29 @@ func (p *connectionPool) GetConnection(
 	skipProviders []string,
 	useBackupProviders bool,
 ) (PooledConnection, error) {
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		return nil, fmt.Errorf("connection pool is shutdown")
+	}
+
+	// Add read lock to prevent shutdown during connection acquisition
+	p.shutdownMu.RLock()
+	defer p.shutdownMu.RUnlock()
+
+	// Double-check after acquiring lock
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		return nil, fmt.Errorf("connection pool is shutdown")
+	}
+
 	if p.connPools == nil {
 		return nil, fmt.Errorf("connection pool is not available")
 	}
 
-	cp := make([]providerPool, 0, len(p.connPools))
+	cp := make([]*providerPool, 0, len(p.connPools))
 
 	for _, provider := range p.connPools {
 		if !slices.Contains(skipProviders, provider.provider.ID()) &&
-			(!provider.provider.IsBackupProvider || useBackupProviders) {
+			(!provider.provider.IsBackupProvider || useBackupProviders) &&
+			provider.IsAcceptingConnections() {
 			cp = append(cp, provider)
 		}
 	}
@@ -132,10 +194,18 @@ func (p *connectionPool) GetConnection(
 		return nil, err
 	}
 
-	return pooledConnection{
+	pooledConn := pooledConnection{
 		resource: conn,
 		log:      p.log,
-	}, nil
+	}
+
+	// Log connection acquisition for debugging
+	p.log.Debug("Connection acquired",
+		"provider", conn.Value().provider.Host,
+		"total_connections", conn.Value().provider.MaxConnections,
+	)
+
+	return pooledConn, nil
 }
 
 func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
@@ -143,69 +213,67 @@ func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
 
 	for _, pool := range p.connPools {
 		pi = append(pi, ProviderInfo{
-			Host:            pool.provider.Host,
-			Username:        pool.provider.Username,
-			MaxConnections:  pool.provider.MaxConnections,
-			UsedConnections: int(pool.connectionPool.Stat().TotalResources()),
+			Host:                     pool.provider.Host,
+			Username:                 pool.provider.Username,
+			MaxConnections:           pool.provider.MaxConnections,
+			UsedConnections:          int(pool.connectionPool.Stat().TotalResources()),
+			MaxConnectionIdleTimeout: time.Duration(pool.provider.MaxConnectionIdleTimeInSeconds) * time.Second,
 		})
 	}
 
 	return pi
 }
 
-func (p *connectionPool) HotReload(c ...Config) error {
-	p.log.Info("reloading connection pool")
-	defer p.log.Info("connection pool reloaded")
+func (p *connectionPool) UpdateConfiguration(c ...Config) error {
+	// Check if already shutdown
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		return fmt.Errorf("connection pool is shutdown")
+	}
 
-	config := mergeWithDefault(c...)
+	newConfig := mergeWithDefault(c...)
 
-	if len(config.Providers) == 0 {
+	if len(newConfig.Providers) == 0 {
 		return ErrNoProviderAvailable
 	}
 
-	p.closeChan <- struct{}{}
-	close(p.closeChan)
+	p.log.Info("starting incremental configuration update")
 
-	p.wg.Wait()
+	// Analyze what needs to change
+	diff := AnalyzeConfigurationChanges(p.config, newConfig)
 
-	oldConnPools := p.connPools
-	for _, cp := range oldConnPools {
-		idle := cp.connectionPool.AcquireAllIdle()
-		for _, res := range idle {
-			res.Destroy()
-		}
-
-		cp.connectionPool.Reset()
+	if !diff.HasChanges {
+		p.log.Info("no configuration changes detected")
+		return nil
 	}
 
-	cp, err := getPools(config.Providers, config.NntpCli, config.Logger)
-	if err != nil {
-		return err
+	p.log.Info("configuration changes detected",
+		"migration_id", diff.MigrationID,
+		"changes", len(diff.Changes),
+	)
+
+	// Start incremental migration
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	if err := p.migrationManager.StartMigration(ctx, diff, newConfig); err != nil {
+		return fmt.Errorf("failed to start migration: %w", err)
 	}
 
-	p.connPools = cp
-	p.config = config
+	// Update pool configuration
+	p.config = newConfig
 
-	p.closeChan = make(chan struct{}, 1)
-	p.wg.Add(1)
-
-	go p.connectionHealCheck(config.HealthCheckInterval)
-
-	if !config.SkipProvidersVerificationOnCreation {
-		p.log.Info("verifying providers...")
-
-		if err := verifyProviders(cp, config.Logger); err != nil {
-			return err
-		}
-
-		p.log.Info("providers verified")
-	}
-
-	for _, cp := range oldConnPools {
-		cp.connectionPool.Close()
-	}
-
+	p.log.Info("incremental migration started", "migration_id", diff.MigrationID)
 	return nil
+}
+
+// GetMigrationStatus returns the status of a specific migration
+func (p *connectionPool) GetMigrationStatus(migrationID string) (*MigrationStatus, bool) {
+	return p.migrationManager.GetMigrationStatus(migrationID)
+}
+
+// GetActiveMigrations returns all currently active migrations
+func (p *connectionPool) GetActiveMigrations() map[string]*MigrationStatus {
+	return p.migrationManager.GetActiveMigrations()
 }
 
 // Helper that will implement retry mechanism and provider rotation on top of the connection.
@@ -280,7 +348,7 @@ func (p *connectionPool) Body(
 
 		bytesWritten = n
 
-		conn.Free()
+		_ = conn.Free()
 
 		return nil
 	},
@@ -309,7 +377,7 @@ func (p *connectionPool) Body(
 						provider.Host,
 					)
 
-					conn.Free()
+					_ = conn.Free()
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -337,7 +405,7 @@ func (p *connectionPool) Body(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				conn.Free()
+				_ = conn.Free()
 			} else {
 				_ = conn.Close()
 			}
@@ -454,7 +522,7 @@ func (p *connectionPool) BodyReader(
 						provider.Host,
 					)
 
-					conn.Free()
+					_ = conn.Free()
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -483,7 +551,7 @@ func (p *connectionPool) BodyReader(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				conn.Free()
+				_ = conn.Free()
 			} else {
 				_ = conn.Close()
 			}
@@ -543,7 +611,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			return fmt.Errorf("error posting article: %w", err)
 		}
 
-		conn.Free()
+		_ = conn.Free()
 
 		return nil
 	},
@@ -572,7 +640,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 						provider.Host,
 					)
 
-					conn.Free()
+					_ = conn.Free()
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -606,7 +674,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				conn.Free()
+				_ = conn.Free()
 			} else {
 				_ = conn.Close()
 			}
@@ -683,7 +751,7 @@ func (p *connectionPool) Stat(
 			return fmt.Errorf("error checking article: %w", err)
 		}
 
-		conn.Free()
+		_ = conn.Free()
 
 		return nil
 	},
@@ -705,7 +773,7 @@ func (p *connectionPool) Stat(
 				provider := conn.Provider()
 
 				if nntpcli.IsArticleNotFoundError(err) {
-					conn.Free()
+					_ = conn.Free()
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -733,7 +801,7 @@ func (p *connectionPool) Stat(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				conn.Free()
+				_ = conn.Free()
 			} else {
 				_ = conn.Close()
 			}
@@ -761,7 +829,7 @@ func (p *connectionPool) Stat(
 
 func (p *connectionPool) getConnection(
 	ctx context.Context,
-	cPool []providerPool,
+	cPool []*providerPool,
 	poolNumber int,
 ) (*puddle.Resource[*internalConnection], error) {
 	if poolNumber > len(cPool)-1 {
@@ -794,21 +862,30 @@ func (p *connectionPool) connectionHealCheck(healthCheckInterval time.Duration) 
 	defer ticker.Stop()
 	defer p.wg.Done()
 
+	// Create a context that can be cancelled for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	for {
 		select {
 		case <-p.closeChan:
+			cancel() // Cancel any ongoing operations
 			return
 		case <-ticker.C:
-			p.checkHealth()
+			// Create a timeout context for this health check cycle
+			checkCtx, checkCancel := context.WithTimeout(ctx, healthCheckInterval/2)
+			p.checkHealth(checkCtx)
+			checkCancel()
 		}
 	}
 }
 
-func (p *connectionPool) checkHealth() {
+func (p *connectionPool) checkHealth(ctx context.Context) {
 	for {
 		// If checkMinConns failed we don't destroy any connections since we couldn't
 		// even get to minConns
-		if err := p.checkMinConns(); err != nil {
+		if err := p.checkMinConns(ctx); err != nil {
+			p.log.Debug("Failed to maintain minimum connections", "error", err)
 			break
 		}
 
@@ -820,6 +897,8 @@ func (p *connectionPool) checkHealth() {
 		// Technically Destroy is asynchronous but 500ms should be enough for it to
 		// remove it from the underlying pool
 		select {
+		case <-ctx.Done():
+			return
 		case <-p.closeChan:
 			return
 		case <-time.After(500 * time.Millisecond):
@@ -861,7 +940,7 @@ func (p *connectionPool) createIdleResources(ctx context.Context, toCreate int) 
 	return nil
 }
 
-func (p *connectionPool) checkMinConns() error {
+func (p *connectionPool) checkMinConns(ctx context.Context) error {
 	// TotalConns can include ones that are being destroyed but we should have
 	// sleep(500ms) around all of the destroys to help prevent that from throwing
 	// off this check
@@ -872,7 +951,7 @@ func (p *connectionPool) checkMinConns() error {
 
 	toCreate := p.config.MinConnections - totalConns
 	if toCreate > 0 {
-		return p.createIdleResources(context.Background(), toCreate)
+		return p.createIdleResources(ctx, toCreate)
 	}
 
 	return nil
