@@ -14,6 +14,7 @@ import (
 	io "io"
 	reflect "reflect"
 
+	nntpcli "github.com/javi11/nntpcli"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -56,6 +57,35 @@ func (mr *MockUsenetConnectionPoolMockRecorder) Body(ctx, msgID, w, nntpGroups a
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Body", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Body), ctx, msgID, w, nntpGroups)
 }
 
+// BodyReader mocks base method.
+func (m *MockUsenetConnectionPool) BodyReader(ctx context.Context, msgID string, nntpGroups []string) (nntpcli.ArticleBodyReader, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "BodyReader", ctx, msgID, nntpGroups)
+	ret0, _ := ret[0].(nntpcli.ArticleBodyReader)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// BodyReader indicates an expected call of BodyReader.
+func (mr *MockUsenetConnectionPoolMockRecorder) BodyReader(ctx, msgID, nntpGroups any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyReader", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyReader), ctx, msgID, nntpGroups)
+}
+
+// GetActiveReconfigurations mocks base method.
+func (m *MockUsenetConnectionPool) GetActiveReconfigurations() map[string]*ReconfigurationStatus {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetActiveReconfigurations")
+	ret0, _ := ret[0].(map[string]*ReconfigurationStatus)
+	return ret0
+}
+
+// GetActiveReconfigurations indicates an expected call of GetActiveReconfigurations.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetActiveReconfigurations() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetActiveReconfigurations", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetActiveReconfigurations))
+}
+
 // GetConnection mocks base method.
 func (m *MockUsenetConnectionPool) GetConnection(ctx context.Context, skipProviders []string, useBackupProviders bool) (PooledConnection, error) {
 	m.ctrl.T.Helper()
@@ -85,22 +115,19 @@ func (mr *MockUsenetConnectionPoolMockRecorder) GetProvidersInfo() *gomock.Call 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetProvidersInfo", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetProvidersInfo))
 }
 
-// HotReload mocks base method.
-func (m *MockUsenetConnectionPool) HotReload(arg0 ...Config) error {
+// GetReconfigurationStatus mocks base method.
+func (m *MockUsenetConnectionPool) GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool) {
 	m.ctrl.T.Helper()
-	varargs := []any{}
-	for _, a := range arg0 {
-		varargs = append(varargs, a)
-	}
-	ret := m.ctrl.Call(m, "HotReload", varargs...)
-	ret0, _ := ret[0].(error)
-	return ret0
+	ret := m.ctrl.Call(m, "GetReconfigurationStatus", migrationID)
+	ret0, _ := ret[0].(*ReconfigurationStatus)
+	ret1, _ := ret[1].(bool)
+	return ret0, ret1
 }
 
-// HotReload indicates an expected call of HotReload.
-func (mr *MockUsenetConnectionPoolMockRecorder) HotReload(arg0 ...any) *gomock.Call {
+// GetReconfigurationStatus indicates an expected call of GetReconfigurationStatus.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetReconfigurationStatus(migrationID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HotReload", reflect.TypeOf((*MockUsenetConnectionPool)(nil).HotReload), arg0...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetReconfigurationStatus", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetReconfigurationStatus), migrationID)
 }
 
 // Post mocks base method.
@@ -127,6 +154,24 @@ func (m *MockUsenetConnectionPool) Quit() {
 func (mr *MockUsenetConnectionPoolMockRecorder) Quit() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Quit", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Quit))
+}
+
+// Reconfigure mocks base method.
+func (m *MockUsenetConnectionPool) Reconfigure(arg0 ...Config) error {
+	m.ctrl.T.Helper()
+	varargs := []any{}
+	for _, a := range arg0 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "Reconfigure", varargs...)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Reconfigure indicates an expected call of Reconfigure.
+func (mr *MockUsenetConnectionPoolMockRecorder) Reconfigure(arg0 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Reconfigure", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Reconfigure), arg0...)
 }
 
 // Stat mocks base method.

@@ -29,8 +29,17 @@ func getPools(
 	p []UsenetProviderConfig,
 	nttpCli nntpcli.Client,
 	log Logger,
-) ([]providerPool, error) {
-	pSlice := make([]providerPool, 0)
+) ([]*providerPool, error) {
+	return getPoolsWithLease(p, nttpCli, log, 10*time.Minute)
+}
+
+func getPoolsWithLease(
+	p []UsenetProviderConfig,
+	nttpCli nntpcli.Client,
+	log Logger,
+	defaultLease time.Duration,
+) ([]*providerPool, error) {
+	pSlice := make([]*providerPool, 0)
 
 	for _, provider := range p {
 		pools, err := puddle.NewPool(
@@ -47,8 +56,10 @@ func getPools(
 					}
 
 					return &internalConnection{
-						nntp:     nntpCon,
-						provider: provider,
+						nntp:        nntpCon,
+						provider:    provider,
+						leaseExpiry: time.Now().Add(defaultLease),
+						markedForReplacement: false,
 					}, nil
 				},
 				Destructor: func(value *internalConnection) {
@@ -64,16 +75,17 @@ func getPools(
 			return nil, err
 		}
 
-		pSlice = append(pSlice, providerPool{
+		pSlice = append(pSlice, &providerPool{
 			connectionPool: pools,
 			provider:       provider,
+			state:          ProviderStateActive,
 		})
 	}
 
 	return pSlice, nil
 }
 
-func verifyProviders(pools []providerPool, log Logger) error {
+func verifyProviders(pools []*providerPool, log Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
