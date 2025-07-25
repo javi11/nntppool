@@ -255,18 +255,10 @@ func (p *connectionPool) GetConnection(
 		return nil, err
 	}
 
-	pooledConn := pooledConnection{
+	return pooledConnection{
 		resource: conn,
 		log:      p.log,
-	}
-
-	// Log connection acquisition for debugging
-	p.log.Debug("Connection acquired",
-		"provider", conn.Value().provider.Host,
-		"total_connections", conn.Value().provider.MaxConnections,
-	)
-
-	return pooledConn, nil
+	}, nil
 }
 
 func (p *connectionPool) GetProvidersInfo() []ProviderInfo {

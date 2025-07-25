@@ -12,10 +12,10 @@ import (
 )
 
 type internalConnection struct {
-	nntp        nntpcli.Connection   // 8 bytes
-	provider    UsenetProviderConfig // 128 bytes
-	leaseExpiry time.Time            // When this connection can be replaced
-	markedForReplacement bool        // Whether this connection should be replaced when idle
+	nntp                 nntpcli.Connection   // 8 bytes
+	provider             UsenetProviderConfig // 128 bytes
+	leaseExpiry          time.Time            // When this connection can be replaced
+	markedForReplacement bool                 // Whether this connection should be replaced when idle
 }
 
 var _ PooledConnection = (*pooledConnection)(nil)
@@ -45,7 +45,7 @@ type pooledConnection struct {
 // cases where the connection was already released.
 func (p pooledConnection) Close() error {
 	var resultErr error
-	
+
 	defer func() { // recover from panics
 		if err := recover(); err != nil {
 			errorMsg := fmt.Sprintf("can not close a connection already released: %v", err)
@@ -55,13 +55,6 @@ func (p pooledConnection) Close() error {
 			}
 		}
 	}()
-
-	// Log connection destruction for debugging
-	provider := p.resource.Value().provider
-	p.log.Debug("Connection destroyed", 
-		"provider", provider.Host,
-		"created_at", p.resource.CreationTime(),
-	)
 
 	p.resource.Destroy()
 
@@ -74,7 +67,7 @@ func (p pooledConnection) Close() error {
 // cases where the connection was already released.
 func (p pooledConnection) Free() error {
 	var resultErr error
-	
+
 	defer func() { // recover from panics
 		if err := recover(); err != nil {
 			errorMsg := fmt.Sprintf("can not free a connection already released: %v", err)
@@ -84,13 +77,6 @@ func (p pooledConnection) Free() error {
 			}
 		}
 	}()
-
-	// Log connection release for debugging
-	provider := p.resource.Value().provider
-	p.log.Debug("Connection released to pool", 
-		"provider", provider.Host,
-		"created_at", p.resource.CreationTime(),
-	)
 
 	p.resource.Release()
 	return resultErr
