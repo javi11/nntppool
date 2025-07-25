@@ -1,4 +1,4 @@
-//go:generate mockgen -source=./pooled_connection.go -destination=./pooled_connection_mock.go -package=nntppool PooledConnection
+//go:generate go tool mockgen -source=./pooled_connection.go -destination=./pooled_connection_mock.go -package=nntppool PooledConnection
 
 // Package nntppool provides a connection pooling mechanism for NNTP connections.
 package nntppool

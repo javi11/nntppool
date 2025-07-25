@@ -1,4 +1,4 @@
-//go:generate mockgen -source=./connection_pool.go -destination=./connection_pool_mock.go -package=nntppool UsenetConnectionPool
+//go:generate go tool mockgen -source=./connection_pool.go -destination=./connection_pool_mock.go -package=nntppool UsenetConnectionPool
 
 package nntppool
 
@@ -32,6 +32,11 @@ type UsenetConnectionPool interface {
 		w io.Writer,
 		nntpGroups []string,
 	) (int64, error)
+	BodyReader(
+		ctx context.Context,
+		msgID string,
+		nntpGroups []string,
+	) (nntpcli.ArticleBodyReader, error)
 	Post(ctx context.Context, r io.Reader) error
 	Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error)
 	GetProvidersInfo() []ProviderInfo
@@ -239,7 +244,7 @@ func (p *connectionPool) Body(
 	retryErr := retry.Do(func() error {
 		// In case of skip provider it means that the article was not found,
 		// in such case we want to use backup providers as well
-		useBackupProviders := false
+		var useBackupProviders bool
 		if len(skipProviders) > 0 {
 			useBackupProviders = true
 		}
@@ -356,6 +361,153 @@ func (p *connectionPool) Body(
 	conn = nil
 
 	return bytesWritten, nil
+}
+
+// BodyReader retrieves the body reader of a message with the given message ID from the NNTP server.
+//
+// Parameters:
+//   - ctx: The context for the operation.
+//   - msgID: The message ID of the article to retrieve.
+//   - nntpGroups: The list of groups to join before retrieving the article.
+//
+// Returns:
+//   - io.ReadCloser: A reader for the message body.
+//   - error: Any error encountered during the operation.
+//
+// The function sends the "BODY" command to the NNTP server and returns a reader
+// for the response body. The caller is responsible for closing the reader.
+func (p *connectionPool) BodyReader(
+	ctx context.Context,
+	msgID string,
+	nntpGroups []string,
+) (nntpcli.ArticleBodyReader, error) {
+	var (
+		conn   PooledConnection
+		reader nntpcli.ArticleBodyReader
+	)
+
+	skipProviders := make([]string, 0)
+
+	retryErr := retry.Do(func() error {
+		// In case of skip provider it means that the article was not found,
+		// in such case we want to use backup providers as well
+		var useBackupProviders bool
+		if len(skipProviders) > 0 {
+			useBackupProviders = true
+		}
+
+		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
+		if err != nil {
+			if c != nil {
+				_ = c.Close()
+			}
+
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
+
+			return fmt.Errorf("error getting nntp connection: %w", err)
+		}
+
+		conn = c
+		nntpConn := conn.Connection()
+
+		if len(nntpGroups) > 0 {
+			err = joinGroup(nntpConn, nntpGroups)
+			if err != nil {
+				return fmt.Errorf("error joining group: %w", err)
+			}
+		}
+
+		reader, err = nntpConn.BodyReader(msgID)
+		if err != nil && ctx.Err() == nil {
+			return fmt.Errorf("error getting body reader: %w", err)
+		}
+
+		// Don't free the connection here since the reader needs it
+		// The connection will be managed by a wrapper reader
+
+		return nil
+	},
+		retry.Context(ctx),
+		retry.Attempts(p.config.MaxRetries),
+		retry.DelayType(p.config.delayTypeFn),
+		retry.Delay(p.config.RetryDelay),
+		retry.RetryIf(func(err error) bool {
+			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
+		}),
+		retry.OnRetry(func(n uint, err error) {
+			p.log.DebugContext(ctx,
+				"Retrying body reader",
+				"error", err,
+				"retry", n,
+			)
+
+			if conn != nil {
+				provider := conn.Provider()
+
+				if nntpcli.IsArticleNotFoundError(err) {
+					skipProviders = append(skipProviders, provider.ID())
+					p.log.DebugContext(ctx,
+						"Article not found in provider, trying another one...",
+						"provider",
+						provider.Host,
+					)
+
+					conn.Free()
+					conn = nil
+				} else {
+					p.log.DebugContext(ctx,
+						"Closing connection",
+						"error", err,
+						"retry", n,
+						"error_connection_host", provider.Host,
+						"error_connection_created_at", conn.CreatedAt(),
+					)
+
+					_ = conn.Close()
+					conn = nil
+				}
+			}
+		}),
+	)
+
+	if retryErr != nil {
+		err := retryErr
+
+		var e retry.Error
+
+		if errors.As(err, &e) {
+			err = errors.Join(e.WrappedErrors()...)
+		}
+
+		if conn != nil {
+			if errors.Is(err, context.Canceled) {
+				conn.Free()
+			} else {
+				_ = conn.Close()
+			}
+		}
+
+		if !errors.Is(err, context.Canceled) {
+			p.log.DebugContext(ctx,
+				"All body reader retries exhausted",
+				"error", retryErr,
+			)
+		}
+
+		if nntpcli.IsArticleNotFoundError(err) {
+			return nil, ErrArticleNotFoundInProviders
+		}
+
+		return nil, err
+	}
+
+	// Wrap the reader to manage the connection lifecycle
+	return &pooledBodyReader{
+		reader: reader,
+		conn:   conn,
+	}, nil
 }
 
 // Helper that will implement retry mechanism on top of the connection.

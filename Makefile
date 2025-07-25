@@ -37,6 +37,14 @@ coverage-html: coverage
 coverage-func: coverage
 	$(GO) tool cover -func=coverage.out
 
+.PHONY: coverage-ci
+coverage-ci:
+	$(GO) test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+.PHONY: coverage-total
+coverage-total: coverage
+	@$(GO) tool cover -func=coverage.out | grep total | awk '{print $$3}' | sed 's/%//'
+
 .PHONY: lint
 lint: go-mod-tidy golangci-lint
 
@@ -53,3 +61,15 @@ check: generate go-mod-tidy golangci-lint test-race
 git-hooks:
 	@echo '#!/bin/sh\nmake' > .git/hooks/pre-commit
 	@chmod +x .git/hooks/pre-commit
+
+.PHONY: release
+release:
+	goreleaser --skip-validate --skip-publish --rm-dist
+
+.PHONY: snapshot
+snapshot:
+	goreleaser --skip-docker --snapshot --skip-publish --rm-dist 
+
+.PHONY: publish
+publish:
+	goreleaser --rm-dist
