@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/avast/retry-go"
+	"github.com/avast/retry-go/v4"
 	"github.com/javi11/nntpcli"
+
+	"github.com/javi11/nntppool/internal/config"
 )
 
 // Logger interface compatible with slog.Logger
@@ -45,6 +47,31 @@ type Config struct {
 	DefaultConnectionLease              time.Duration
 }
 
+// Adapter methods for internal package interfaces
+func (c *Config) GetProviders() []config.ProviderConfig {
+	providers := make([]config.ProviderConfig, len(c.Providers))
+	for i, p := range c.Providers {
+		providers[i] = &p
+	}
+	return providers
+}
+
+// Helper interface for internal packages
+type ProviderConfig interface {
+	ID() string
+	GetHost() string
+	GetUsername() string
+	GetPassword() string
+	GetPort() int
+	GetMaxConnections() int
+	GetMaxConnectionIdleTimeInSeconds() int
+	GetMaxConnectionTTLInSeconds() int
+	GetTLS() bool
+	GetInsecureSSL() bool
+	GetIsBackupProvider() bool
+	GetVerifyCapabilities() []string
+}
+
 type UsenetProviderConfig struct {
 	Host                           string
 	Username                       string
@@ -62,6 +89,21 @@ type UsenetProviderConfig struct {
 func (u *UsenetProviderConfig) ID() string {
 	return fmt.Sprintf("%s_%s", u.Host, u.Username)
 }
+
+// Adapter methods for internal package interfaces
+func (u *UsenetProviderConfig) GetHost() string        { return u.Host }
+func (u *UsenetProviderConfig) GetUsername() string    { return u.Username }
+func (u *UsenetProviderConfig) GetPassword() string    { return u.Password }
+func (u *UsenetProviderConfig) GetPort() int           { return u.Port }
+func (u *UsenetProviderConfig) GetMaxConnections() int { return u.MaxConnections }
+func (u *UsenetProviderConfig) GetMaxConnectionIdleTimeInSeconds() int {
+	return u.MaxConnectionIdleTimeInSeconds
+}
+func (u *UsenetProviderConfig) GetMaxConnectionTTLInSeconds() int { return u.MaxConnectionTTLInSeconds }
+func (u *UsenetProviderConfig) GetTLS() bool                      { return u.TLS }
+func (u *UsenetProviderConfig) GetInsecureSSL() bool              { return u.InsecureSSL }
+func (u *UsenetProviderConfig) GetIsBackupProvider() bool         { return u.IsBackupProvider }
+func (u *UsenetProviderConfig) GetVerifyCapabilities() []string   { return u.VerifyCapabilities }
 
 type Option func(*Config)
 

@@ -3,7 +3,7 @@ module github.com/javi11/nntppool
 go 1.24.4
 
 require (
-	github.com/avast/retry-go v3.0.0+incompatible
+	github.com/avast/retry-go/v4 v4.6.1
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/jackc/puddle/v2 v2.2.2
 	github.com/javi11/nntpcli v1.0.1

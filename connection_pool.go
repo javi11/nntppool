@@ -12,12 +12,72 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/avast/retry-go"
+	"github.com/avast/retry-go/v4"
 	"github.com/jackc/puddle/v2"
 	"github.com/javi11/nntpcli"
+
+	"github.com/javi11/nntppool/internal/budget"
+	"github.com/javi11/nntppool/internal/config"
+	"github.com/javi11/nntppool/internal/migration"
 )
 
 const defaultHealthCheckInterval = 1 * time.Minute
+
+// ReconfigurationStatus tracks the progress of a configuration reconfiguration
+type ReconfigurationStatus struct {
+	ID          string                    `json:"id"`
+	StartTime   time.Time                 `json:"start_time"`
+	Status      string                    `json:"status"` // "running", "completed", "failed", "rolled_back"
+	Changes     []ProviderChange          `json:"changes"`
+	Progress    map[string]ProviderStatus `json:"progress"` // providerID -> status
+	Error       string                    `json:"error,omitempty"`
+	CompletedAt *time.Time                `json:"completed_at,omitempty"`
+}
+
+// ProviderStatus tracks the migration status of a single provider
+type ProviderStatus struct {
+	ProviderID     string     `json:"provider_id"`
+	Status         string     `json:"status"` // "pending", "migrating", "completed", "failed"
+	ConnectionsOld int        `json:"connections_old"`
+	ConnectionsNew int        `json:"connections_new"`
+	StartTime      time.Time  `json:"start_time"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	Error          string     `json:"error,omitempty"`
+}
+
+// ProviderChange represents a change to be made to a provider during migration
+type ProviderChange struct {
+	ID         string                `json:"id"`
+	ChangeType ProviderChangeType    `json:"change_type"`
+	OldConfig  *UsenetProviderConfig `json:"old_config,omitempty"`
+	NewConfig  *UsenetProviderConfig `json:"new_config,omitempty"`
+	Priority   int                   `json:"priority"` // Migration priority (0 = highest)
+}
+
+// ProviderChangeType represents the type of change for a provider
+type ProviderChangeType int
+
+const (
+	ProviderChangeKeep   ProviderChangeType = iota // No change needed
+	ProviderChangeUpdate                           // Settings changed, migrate connections
+	ProviderChangeAdd                              // New provider, add gradually
+	ProviderChangeRemove                           // Remove provider, drain connections
+)
+
+func (pct ProviderChangeType) String() string {
+	switch pct {
+	case ProviderChangeKeep:
+		return "keep"
+	case ProviderChangeUpdate:
+		return "update"
+	case ProviderChangeAdd:
+		return "add"
+	case ProviderChangeRemove:
+		return "remove"
+	default:
+		return "unknown"
+	}
+}
 
 type UsenetConnectionPool interface {
 	GetConnection(
@@ -41,9 +101,9 @@ type UsenetConnectionPool interface {
 	Post(ctx context.Context, r io.Reader) error
 	Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error)
 	GetProvidersInfo() []ProviderInfo
-	UpdateConfiguration(...Config) error
-	GetMigrationStatus(migrationID string) (*MigrationStatus, bool)
-	GetActiveMigrations() map[string]*MigrationStatus
+	Reconfigure(...Config) error
+	GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool)
+	GetActiveReconfigurations() map[string]*ReconfigurationStatus
 	Quit()
 }
 
@@ -53,11 +113,11 @@ type connectionPool struct {
 	log              Logger
 	config           Config
 	wg               sync.WaitGroup
-	shutdownMu       sync.RWMutex      // Protects shutdown operations
-	isShutdown       int32             // Atomic flag for shutdown state
-	shutdownOnce     sync.Once         // Ensures single shutdown
-	connectionBudget *ConnectionBudget // Tracks connection limits per provider
-	migrationManager *MigrationManager // Handles incremental migrations
+	shutdownMu       sync.RWMutex       // Protects shutdown operations
+	isShutdown       int32              // Atomic flag for shutdown state
+	shutdownOnce     sync.Once          // Ensures single shutdown
+	connectionBudget *budget.Budget     // Tracks connection limits per provider
+	migrationManager *migration.Manager // Handles incremental migrations
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
@@ -82,9 +142,9 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 	}
 
 	// Initialize connection budget
-	budget := NewConnectionBudget()
+	budgetManager := budget.New()
 	for _, provider := range config.Providers {
-		budget.SetProviderLimit(provider.ID(), provider.MaxConnections)
+		budgetManager.SetProviderLimit(provider.ID(), provider.MaxConnections)
 	}
 
 	pool := &connectionPool{
@@ -93,11 +153,12 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 		config:           config,
 		closeChan:        make(chan struct{}, 1),
 		wg:               sync.WaitGroup{},
-		connectionBudget: budget,
+		connectionBudget: budgetManager,
 	}
 
-	// Initialize migration manager
-	pool.migrationManager = NewMigrationManager(pool)
+	// Initialize migration manager with adapter
+	adapter := newMigrationAdapter(pool)
+	pool.migrationManager = migration.New(adapter)
 
 	healthCheckInterval := defaultHealthCheckInterval
 	if config.HealthCheckInterval > 0 {
@@ -224,7 +285,7 @@ func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
 	return pi
 }
 
-func (p *connectionPool) UpdateConfiguration(c ...Config) error {
+func (p *connectionPool) Reconfigure(c ...Config) error {
 	// Check if already shutdown
 	if atomic.LoadInt32(&p.isShutdown) == 1 {
 		return fmt.Errorf("connection pool is shutdown")
@@ -236,17 +297,17 @@ func (p *connectionPool) UpdateConfiguration(c ...Config) error {
 		return ErrNoProviderAvailable
 	}
 
-	p.log.Info("starting incremental configuration update")
+	p.log.Info("starting incremental reconfiguration")
 
 	// Analyze what needs to change
-	diff := AnalyzeConfigurationChanges(p.config, newConfig)
+	diff := config.AnalyzeChanges(&p.config, &newConfig)
 
 	if !diff.HasChanges {
-		p.log.Info("no configuration changes detected")
+		p.log.Info("no reconfiguration changes detected")
 		return nil
 	}
 
-	p.log.Info("configuration changes detected",
+	p.log.Info("reconfiguration changes detected",
 		"migration_id", diff.MigrationID,
 		"changes", len(diff.Changes),
 	)
@@ -255,7 +316,7 @@ func (p *connectionPool) UpdateConfiguration(c ...Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	if err := p.migrationManager.StartMigration(ctx, diff, newConfig); err != nil {
+	if err := p.migrationManager.StartMigration(ctx, diff); err != nil {
 		return fmt.Errorf("failed to start migration: %w", err)
 	}
 
@@ -266,14 +327,25 @@ func (p *connectionPool) UpdateConfiguration(c ...Config) error {
 	return nil
 }
 
-// GetMigrationStatus returns the status of a specific migration
-func (p *connectionPool) GetMigrationStatus(migrationID string) (*MigrationStatus, bool) {
-	return p.migrationManager.GetMigrationStatus(migrationID)
+// GetReconfigurationStatus returns the status of a specific reconfiguration
+func (p *connectionPool) GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool) {
+	status, exists := p.migrationManager.GetReconfigurationStatus(migrationID)
+	if !exists {
+		return nil, false
+	}
+	return convertToInternalStatus(status), true
 }
 
-// GetActiveMigrations returns all currently active migrations
-func (p *connectionPool) GetActiveMigrations() map[string]*MigrationStatus {
-	return p.migrationManager.GetActiveMigrations()
+// GetActiveReconfigurations returns all currently active reconfigurations
+func (p *connectionPool) GetActiveReconfigurations() map[string]*ReconfigurationStatus {
+	internalReconfigurations := p.migrationManager.GetActiveReconfigurations()
+	result := make(map[string]*ReconfigurationStatus)
+
+	for k, v := range internalReconfigurations {
+		result[k] = convertToInternalStatus(v)
+	}
+
+	return result
 }
 
 // Helper that will implement retry mechanism and provider rotation on top of the connection.

@@ -72,18 +72,18 @@ func (mr *MockUsenetConnectionPoolMockRecorder) BodyReader(ctx, msgID, nntpGroup
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyReader", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyReader), ctx, msgID, nntpGroups)
 }
 
-// GetActiveMigrations mocks base method.
-func (m *MockUsenetConnectionPool) GetActiveMigrations() map[string]*MigrationStatus {
+// GetActiveReconfigurations mocks base method.
+func (m *MockUsenetConnectionPool) GetActiveReconfigurations() map[string]*ReconfigurationStatus {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetActiveMigrations")
-	ret0, _ := ret[0].(map[string]*MigrationStatus)
+	ret := m.ctrl.Call(m, "GetActiveReconfigurations")
+	ret0, _ := ret[0].(map[string]*ReconfigurationStatus)
 	return ret0
 }
 
-// GetActiveMigrations indicates an expected call of GetActiveMigrations.
-func (mr *MockUsenetConnectionPoolMockRecorder) GetActiveMigrations() *gomock.Call {
+// GetActiveReconfigurations indicates an expected call of GetActiveReconfigurations.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetActiveReconfigurations() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetActiveMigrations", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetActiveMigrations))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetActiveReconfigurations", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetActiveReconfigurations))
 }
 
 // GetConnection mocks base method.
@@ -101,21 +101,6 @@ func (mr *MockUsenetConnectionPoolMockRecorder) GetConnection(ctx, skipProviders
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetConnection", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetConnection), ctx, skipProviders, useBackupProviders)
 }
 
-// GetMigrationStatus mocks base method.
-func (m *MockUsenetConnectionPool) GetMigrationStatus(migrationID string) (*MigrationStatus, bool) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetMigrationStatus", migrationID)
-	ret0, _ := ret[0].(*MigrationStatus)
-	ret1, _ := ret[1].(bool)
-	return ret0, ret1
-}
-
-// GetMigrationStatus indicates an expected call of GetMigrationStatus.
-func (mr *MockUsenetConnectionPoolMockRecorder) GetMigrationStatus(migrationID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMigrationStatus", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetMigrationStatus), migrationID)
-}
-
 // GetProvidersInfo mocks base method.
 func (m *MockUsenetConnectionPool) GetProvidersInfo() []ProviderInfo {
 	m.ctrl.T.Helper()
@@ -128,6 +113,21 @@ func (m *MockUsenetConnectionPool) GetProvidersInfo() []ProviderInfo {
 func (mr *MockUsenetConnectionPoolMockRecorder) GetProvidersInfo() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetProvidersInfo", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetProvidersInfo))
+}
+
+// GetReconfigurationStatus mocks base method.
+func (m *MockUsenetConnectionPool) GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetReconfigurationStatus", migrationID)
+	ret0, _ := ret[0].(*ReconfigurationStatus)
+	ret1, _ := ret[1].(bool)
+	return ret0, ret1
+}
+
+// GetReconfigurationStatus indicates an expected call of GetReconfigurationStatus.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetReconfigurationStatus(migrationID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetReconfigurationStatus", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetReconfigurationStatus), migrationID)
 }
 
 // Post mocks base method.
@@ -156,6 +156,24 @@ func (mr *MockUsenetConnectionPoolMockRecorder) Quit() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Quit", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Quit))
 }
 
+// Reconfigure mocks base method.
+func (m *MockUsenetConnectionPool) Reconfigure(arg0 ...Config) error {
+	m.ctrl.T.Helper()
+	varargs := []any{}
+	for _, a := range arg0 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "Reconfigure", varargs...)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Reconfigure indicates an expected call of Reconfigure.
+func (mr *MockUsenetConnectionPoolMockRecorder) Reconfigure(arg0 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Reconfigure", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Reconfigure), arg0...)
+}
+
 // Stat mocks base method.
 func (m *MockUsenetConnectionPool) Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error) {
 	m.ctrl.T.Helper()
@@ -169,22 +187,4 @@ func (m *MockUsenetConnectionPool) Stat(ctx context.Context, msgID string, nntpG
 func (mr *MockUsenetConnectionPoolMockRecorder) Stat(ctx, msgID, nntpGroups any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stat", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Stat), ctx, msgID, nntpGroups)
-}
-
-// UpdateConfiguration mocks base method.
-func (m *MockUsenetConnectionPool) UpdateConfiguration(arg0 ...Config) error {
-	m.ctrl.T.Helper()
-	varargs := []any{}
-	for _, a := range arg0 {
-		varargs = append(varargs, a)
-	}
-	ret := m.ctrl.Call(m, "UpdateConfiguration", varargs...)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// UpdateConfiguration indicates an expected call of UpdateConfiguration.
-func (mr *MockUsenetConnectionPoolMockRecorder) UpdateConfiguration(arg0 ...any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateConfiguration", reflect.TypeOf((*MockUsenetConnectionPool)(nil).UpdateConfiguration), arg0...)
 }

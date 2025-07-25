@@ -855,7 +855,7 @@ func TestStat(t *testing.T) {
 	}
 }
 
-func TestUpdateConfiguration(t *testing.T) {
+func TestReconfigure(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -954,7 +954,7 @@ func TestUpdateConfiguration(t *testing.T) {
 			})
 			assert.NoError(t, err)
 
-			err = pool.UpdateConfiguration(tt.newConfig)
+			err = pool.Reconfigure(tt.newConfig)
 			if tt.expectedError != nil {
 				assert.ErrorIs(t, err, tt.expectedError)
 				return
@@ -964,12 +964,12 @@ func TestUpdateConfiguration(t *testing.T) {
 
 			// With the new asynchronous migration system, verify migration was started
 			if tt.expectedError == nil && len(tt.newConfig.Providers) > 0 {
-				// Check if there are active migrations (for cases with actual changes)
-				migrations := pool.GetActiveMigrations()
-				if len(migrations) > 0 {
+				// Check if there are active reconfigurations (for cases with actual changes)
+				reconfigurations := pool.GetActiveReconfigurations()
+				if len(reconfigurations) > 0 {
 					// Migration is in progress - this is expected with the new async behavior
-					for migrationID := range migrations {
-						status, exists := pool.GetMigrationStatus(migrationID)
+					for migrationID := range reconfigurations {
+						status, exists := pool.GetReconfigurationStatus(migrationID)
 						assert.True(t, exists, "Migration status should exist")
 						assert.NotEmpty(t, status.Changes, "Migration should have changes")
 						break

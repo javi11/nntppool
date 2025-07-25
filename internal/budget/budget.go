@@ -1,27 +1,27 @@
-package nntppool
+package budget
 
 import (
 	"fmt"
 	"sync"
 )
 
-// ConnectionBudget manages connection limits per provider to prevent exceeding NNTP server quotas
-type ConnectionBudget struct {
+// Budget manages connection limits per provider to prevent exceeding NNTP server quotas
+type Budget struct {
 	mu            sync.RWMutex
 	providerLimits map[string]int // providerID -> max connections
 	providerUsage  map[string]int // providerID -> current connections
 }
 
-// NewConnectionBudget creates a new connection budget manager
-func NewConnectionBudget() *ConnectionBudget {
-	return &ConnectionBudget{
+// New creates a new connection budget manager
+func New() *Budget {
+	return &Budget{
 		providerLimits: make(map[string]int),
 		providerUsage:  make(map[string]int),
 	}
 }
 
 // SetProviderLimit sets the maximum connections allowed for a provider
-func (cb *ConnectionBudget) SetProviderLimit(providerID string, maxConnections int) {
+func (cb *Budget) SetProviderLimit(providerID string, maxConnections int) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	
@@ -34,7 +34,7 @@ func (cb *ConnectionBudget) SetProviderLimit(providerID string, maxConnections i
 }
 
 // CanAcquireConnection checks if a new connection can be acquired for the provider
-func (cb *ConnectionBudget) CanAcquireConnection(providerID string) bool {
+func (cb *Budget) CanAcquireConnection(providerID string) bool {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	
@@ -48,7 +48,7 @@ func (cb *ConnectionBudget) CanAcquireConnection(providerID string) bool {
 }
 
 // AcquireConnection attempts to acquire a connection slot for the provider
-func (cb *ConnectionBudget) AcquireConnection(providerID string) error {
+func (cb *Budget) AcquireConnection(providerID string) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	
@@ -67,7 +67,7 @@ func (cb *ConnectionBudget) AcquireConnection(providerID string) error {
 }
 
 // ReleaseConnection releases a connection slot for the provider
-func (cb *ConnectionBudget) ReleaseConnection(providerID string) {
+func (cb *Budget) ReleaseConnection(providerID string) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	
@@ -77,7 +77,7 @@ func (cb *ConnectionBudget) ReleaseConnection(providerID string) {
 }
 
 // GetProviderUsage returns current usage for a provider
-func (cb *ConnectionBudget) GetProviderUsage(providerID string) (current, limit int, exists bool) {
+func (cb *Budget) GetProviderUsage(providerID string) (current, limit int, exists bool) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	
@@ -91,7 +91,7 @@ func (cb *ConnectionBudget) GetProviderUsage(providerID string) (current, limit 
 }
 
 // GetAvailableSlots returns how many more connections can be created for the provider
-func (cb *ConnectionBudget) GetAvailableSlots(providerID string) int {
+func (cb *Budget) GetAvailableSlots(providerID string) int {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	
@@ -109,7 +109,7 @@ func (cb *ConnectionBudget) GetAvailableSlots(providerID string) int {
 }
 
 // GetTotalBudget returns the total connection budget across all providers
-func (cb *ConnectionBudget) GetTotalBudget() (totalUsed, totalLimit int) {
+func (cb *Budget) GetTotalBudget() (totalUsed, totalLimit int) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	
@@ -122,7 +122,7 @@ func (cb *ConnectionBudget) GetTotalBudget() (totalUsed, totalLimit int) {
 }
 
 // RemoveProvider removes a provider from budget tracking
-func (cb *ConnectionBudget) RemoveProvider(providerID string) {
+func (cb *Budget) RemoveProvider(providerID string) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	
@@ -132,7 +132,7 @@ func (cb *ConnectionBudget) RemoveProvider(providerID string) {
 
 // CanMigrateConnection checks if we can create a new connection during migration
 // This considers both current usage and temporary migration overhead
-func (cb *ConnectionBudget) CanMigrateConnection(providerID string) bool {
+func (cb *Budget) CanMigrateConnection(providerID string) bool {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	
@@ -153,12 +153,21 @@ func (cb *ConnectionBudget) CanMigrateConnection(providerID string) bool {
 	return usage < (limit - migrationBuffer)
 }
 
+// Stats contains statistics for a provider's connection budget
+type Stats struct {
+	ProviderID         string  `json:"provider_id"`
+	CurrentConnections int     `json:"current_connections"`
+	MaxConnections     int     `json:"max_connections"`
+	AvailableSlots     int     `json:"available_slots"`
+	UtilizationPercent float64 `json:"utilization_percent"`
+}
+
 // GetProviderStats returns detailed statistics for all providers
-func (cb *ConnectionBudget) GetProviderStats() map[string]ProviderBudgetStats {
+func (cb *Budget) GetProviderStats() map[string]Stats {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
 	
-	stats := make(map[string]ProviderBudgetStats)
+	stats := make(map[string]Stats)
 	
 	for providerID, limit := range cb.providerLimits {
 		usage := cb.providerUsage[providerID]
@@ -167,7 +176,7 @@ func (cb *ConnectionBudget) GetProviderStats() map[string]ProviderBudgetStats {
 			available = 0
 		}
 		
-		stats[providerID] = ProviderBudgetStats{
+		stats[providerID] = Stats{
 			ProviderID:         providerID,
 			CurrentConnections: usage,
 			MaxConnections:     limit,
@@ -177,13 +186,4 @@ func (cb *ConnectionBudget) GetProviderStats() map[string]ProviderBudgetStats {
 	}
 	
 	return stats
-}
-
-// ProviderBudgetStats contains statistics for a provider's connection budget
-type ProviderBudgetStats struct {
-	ProviderID         string  `json:"provider_id"`
-	CurrentConnections int     `json:"current_connections"`
-	MaxConnections     int     `json:"max_connections"`
-	AvailableSlots     int     `json:"available_slots"`
-	UtilizationPercent float64 `json:"utilization_percent"`
 }
