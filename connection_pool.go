@@ -104,6 +104,8 @@ type UsenetConnectionPool interface {
 	Reconfigure(...Config) error
 	GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool)
 	GetActiveReconfigurations() map[string]*ReconfigurationStatus
+	GetMetrics() *PoolMetrics
+	GetMetricsSnapshot() PoolMetricsSnapshot
 	Quit()
 }
 
@@ -118,13 +120,17 @@ type connectionPool struct {
 	shutdownOnce     sync.Once          // Ensures single shutdown
 	connectionBudget *budget.Budget     // Tracks connection limits per provider
 	migrationManager *migration.Manager // Handles incremental migrations
+	metrics          *PoolMetrics       // High-performance metrics collection
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 	config := mergeWithDefault(c...)
 	log := config.Logger
+	
+	// Create metrics early so we can pass it to pool creation
+	metrics := NewPoolMetrics()
 
-	pools, err := getPools(config.Providers, config.NntpCli, config.Logger)
+	pools, err := getPoolsWithLease(config.Providers, config.NntpCli, config.Logger, 10*time.Minute, metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +160,7 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 		closeChan:        make(chan struct{}, 1),
 		wg:               sync.WaitGroup{},
 		connectionBudget: budgetManager,
+		metrics:          metrics,
 	}
 
 	// Initialize migration manager with adapter
@@ -250,14 +257,23 @@ func (p *connectionPool) GetConnection(
 		return nil, ErrArticleNotFoundInProviders
 	}
 
+	// Record acquire attempt
+	start := time.Now()
+	p.metrics.RecordAcquire()
+
 	conn, err := p.getConnection(ctx, cp, 0)
 	if err != nil {
+		p.metrics.RecordError()
 		return nil, err
 	}
+
+	// Record successful acquire timing
+	p.metrics.RecordAcquireWaitTime(time.Since(start))
 
 	return pooledConnection{
 		resource: conn,
 		log:      p.log,
+		metrics:  p.metrics,
 	}, nil
 }
 
@@ -340,6 +356,33 @@ func (p *connectionPool) GetActiveReconfigurations() map[string]*Reconfiguration
 	return result
 }
 
+// GetMetrics returns the pool's metrics instance for real-time monitoring
+func (p *connectionPool) GetMetrics() *PoolMetrics {
+	return p.metrics
+}
+
+// GetMetricsSnapshot returns a comprehensive snapshot of pool and connection metrics
+func (p *connectionPool) GetMetricsSnapshot() PoolMetricsSnapshot {
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		// Return empty snapshot if pool is shutdown
+		return PoolMetricsSnapshot{
+			Timestamp: time.Now(),
+		}
+	}
+
+	p.shutdownMu.RLock()
+	defer p.shutdownMu.RUnlock()
+
+	if p.connPools == nil {
+		// Return empty snapshot if pools are not available
+		return PoolMetricsSnapshot{
+			Timestamp: time.Now(),
+		}
+	}
+
+	return p.metrics.GetSnapshot(p.connPools)
+}
+
 // Helper that will implement retry mechanism and provider rotation on top of the connection.
 // Body retrieves the body of a message with the given message ID from the NNTP server,
 // writes it to the provided io.Writer.
@@ -407,10 +450,14 @@ func (p *connectionPool) Body(
 		n, err := nntpConn.BodyDecoded(msgID, w, written)
 		if err != nil && ctx.Err() == nil {
 			written += n
+			p.metrics.RecordCommandError()
 			return fmt.Errorf("error downloading body: %w", err)
 		}
 
 		bytesWritten = n
+		p.metrics.RecordCommand()
+		p.metrics.RecordBytesDownloaded(n)
+		p.metrics.RecordArticleRetrieved()
 
 		_ = conn.Free()
 
@@ -424,6 +471,7 @@ func (p *connectionPool) Body(
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
 		retry.OnRetry(func(n uint, err error) {
+			p.metrics.RecordRetry()
 			p.log.DebugContext(ctx,
 				"Retrying body",
 				"error", err,
@@ -553,8 +601,11 @@ func (p *connectionPool) BodyReader(
 
 		reader, err = nntpConn.BodyReader(msgID)
 		if err != nil && ctx.Err() == nil {
+			p.metrics.RecordCommandError()
 			return fmt.Errorf("error getting body reader: %w", err)
 		}
+
+		p.metrics.RecordCommand()
 
 		// Don't free the connection here since the reader needs it
 		// The connection will be managed by a wrapper reader
@@ -569,6 +620,7 @@ func (p *connectionPool) BodyReader(
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
 		retry.OnRetry(func(n uint, err error) {
+			p.metrics.RecordRetry()
 			p.log.DebugContext(ctx,
 				"Retrying body reader",
 				"error", err,
@@ -672,8 +724,12 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 
 		err = nntpConn.Post(r)
 		if err != nil {
+			p.metrics.RecordCommandError()
 			return fmt.Errorf("error posting article: %w", err)
 		}
+
+		p.metrics.RecordCommand()
+		p.metrics.RecordArticlePosted()
 
 		_ = conn.Free()
 
@@ -687,6 +743,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
 		retry.OnRetry(func(n uint, err error) {
+			p.metrics.RecordRetry()
 			p.log.DebugContext(ctx,
 				"Retrying post",
 				"error", err,
@@ -812,8 +869,11 @@ func (p *connectionPool) Stat(
 
 		res, err = nntpConn.Stat(msgID)
 		if err != nil && ctx.Err() == nil {
+			p.metrics.RecordCommandError()
 			return fmt.Errorf("error checking article: %w", err)
 		}
+
+		p.metrics.RecordCommand()
 
 		_ = conn.Free()
 
@@ -827,6 +887,7 @@ func (p *connectionPool) Stat(
 			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
 		}),
 		retry.OnRetry(func(n uint, err error) {
+			p.metrics.RecordRetry()
 			p.log.DebugContext(ctx,
 				"Retrying stat",
 				"error", err,

@@ -429,8 +429,8 @@ github.com/jackmordaunt/icns v1.0.0 h1:RYSxplerf/l/DUd09AHtITwckkv/mqjVv4DjYdPmA
 github.com/jackmordaunt/icns v1.0.0/go.mod h1:7TTQVEuGzVVfOPPlLNHJIkzA6CoV7aH1Dv9dW351oOo=
 github.com/javi11/nntp-server-mock v0.0.1 h1:05KbUlFSnzk82CG/sHWLp9s6Vg8exL3wvdAetX8Bwhc=
 github.com/javi11/nntp-server-mock v0.0.1/go.mod h1:+QBpPor0q44ttab8kWo08+/t5C26IHhUpBTC1lZqujA=
-github.com/javi11/nntpcli v1.0.1 h1:Khnpeq7ibYFcoSekCRyN12sKiE0RmopBQJqggIyOuCk=
-github.com/javi11/nntpcli v1.0.1/go.mod h1:ZDb9BCQVrG1UT0XN6ikfOlYYzqrYNxXISIuLg30ZpK0=
+github.com/javi11/nntpcli v1.1.0 h1:K3J1YLgZdphbKqrwqjTms0tJOWuxmFOpnK+UsVXCsH4=
+github.com/javi11/nntpcli v1.1.0/go.mod h1:ZDb9BCQVrG1UT0XN6ikfOlYYzqrYNxXISIuLg30ZpK0=
 github.com/jaypipes/ghw v0.13.0 h1:log8MXuB8hzTNnSktqpXMHc0c/2k/WgjOMSUtnI1RV4=
 github.com/jaypipes/ghw v0.13.0/go.mod h1:In8SsaDqlb1oTyrbmTC14uy+fbBMvp+xdqX51MidlD8=
 github.com/jaypipes/pcidb v1.0.1 h1:WB2zh27T3nwg8AE8ei81sNRb9yWBii3JGNJtT7K9Oic=

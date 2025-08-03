@@ -24,20 +24,12 @@ func joinGroup(c nntpcli.Connection, groups []string) error {
 
 	return err
 }
-
-func getPools(
-	p []UsenetProviderConfig,
-	nttpCli nntpcli.Client,
-	log Logger,
-) ([]*providerPool, error) {
-	return getPoolsWithLease(p, nttpCli, log, 10*time.Minute)
-}
-
 func getPoolsWithLease(
 	p []UsenetProviderConfig,
 	nttpCli nntpcli.Client,
 	log Logger,
 	defaultLease time.Duration,
+	metrics *PoolMetrics,
 ) ([]*providerPool, error) {
 	pSlice := make([]*providerPool, 0)
 
@@ -55,10 +47,15 @@ func getPoolsWithLease(
 						return nil, err
 					}
 
+					// Record connection creation
+					if metrics != nil {
+						metrics.RecordConnectionCreated()
+					}
+
 					return &internalConnection{
-						nntp:        nntpCon,
-						provider:    provider,
-						leaseExpiry: time.Now().Add(defaultLease),
+						nntp:                 nntpCon,
+						provider:             provider,
+						leaseExpiry:          time.Now().Add(defaultLease),
 						markedForReplacement: false,
 					}, nil
 				},
@@ -66,6 +63,11 @@ func getPoolsWithLease(
 					err := value.nntp.Close()
 					if err != nil {
 						log.Debug(fmt.Sprintf("error closing connection: %v", err))
+					}
+
+					// Record connection destruction
+					if metrics != nil {
+						metrics.RecordConnectionDestroyed()
 					}
 				},
 				MaxSize: int32(provider.MaxConnections),

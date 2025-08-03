@@ -353,6 +353,7 @@ func TestConnectionLeaseSystem(t *testing.T) {
 		nil, // nntpCli - nil for this test
 		slog.Default(),
 		100*time.Millisecond, // Very short lease for testing
+		nil, // metrics - nil for this test
 	)
 
 	if err != nil {

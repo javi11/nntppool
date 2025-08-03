@@ -101,6 +101,34 @@ func (mr *MockUsenetConnectionPoolMockRecorder) GetConnection(ctx, skipProviders
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetConnection", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetConnection), ctx, skipProviders, useBackupProviders)
 }
 
+// GetMetrics mocks base method.
+func (m *MockUsenetConnectionPool) GetMetrics() *PoolMetrics {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetMetrics")
+	ret0, _ := ret[0].(*PoolMetrics)
+	return ret0
+}
+
+// GetMetrics indicates an expected call of GetMetrics.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetMetrics() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMetrics", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetMetrics))
+}
+
+// GetMetricsSnapshot mocks base method.
+func (m *MockUsenetConnectionPool) GetMetricsSnapshot() PoolMetricsSnapshot {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetMetricsSnapshot")
+	ret0, _ := ret[0].(PoolMetricsSnapshot)
+	return ret0
+}
+
+// GetMetricsSnapshot indicates an expected call of GetMetricsSnapshot.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetMetricsSnapshot() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMetricsSnapshot", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetMetricsSnapshot))
+}
+
 // GetProvidersInfo mocks base method.
 func (m *MockUsenetConnectionPool) GetProvidersInfo() []ProviderInfo {
 	m.ctrl.T.Helper()

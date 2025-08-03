@@ -37,6 +37,7 @@ type PooledConnection interface {
 type pooledConnection struct {
 	resource *puddle.Resource[*internalConnection]
 	log      Logger
+	metrics  *PoolMetrics
 }
 
 // Close destroys the connection and removes it from the pool.
@@ -57,6 +58,11 @@ func (p pooledConnection) Close() error {
 	}()
 
 	p.resource.Destroy()
+
+	// Record connection destruction
+	if p.metrics != nil {
+		p.metrics.RecordConnectionDestroyed()
+	}
 
 	return resultErr
 }
@@ -79,6 +85,12 @@ func (p pooledConnection) Free() error {
 	}()
 
 	p.resource.Release()
+
+	// Record connection release
+	if p.metrics != nil {
+		p.metrics.RecordRelease()
+	}
+
 	return resultErr
 }
 
