@@ -573,7 +573,6 @@ func (m *PoolMetrics) calculateRecentSpeeds(pools []*providerPool) (downloadSpee
 func (m *PoolMetrics) calculateRecentSpeedsUncached() (downloadSpeed, uploadSpeed float64) {
 	var recentBytesDownloaded, recentBytesUploaded int64
 	var activeConnectionCount int
-	var timeAggregated int64
 
 	// Use only active connections - zero pool blocking, maximum performance
 	m.activeConnections.Range(func(key, value interface{}) bool {
@@ -588,17 +587,28 @@ func (m *PoolMetrics) calculateRecentSpeedsUncached() (downloadSpeed, uploadSpee
 			snapshot := metrics.GetSnapshot()
 			connectionAge := metrics.GetConnectionAge()
 
-			recentBytesDownloaded += snapshot.BytesDownloaded
-			recentBytesUploaded += snapshot.BytesUploaded
-			timeAggregated += int64(connectionAge.Seconds())
-
+			if connectionAge <= m.speedWindowDuration {
+				// Connection is newer than our time window - count all its bytes
+				recentBytesDownloaded += snapshot.BytesDownloaded
+				recentBytesUploaded += snapshot.BytesUploaded
+			} else {
+				// Connection is older than window - estimate recent activity
+				// Since it's active, we can be generous with the estimation
+				windowRatio := float64(m.speedWindowDuration) / float64(connectionAge)
+				recentBytesDownloaded += int64(float64(snapshot.BytesDownloaded) * windowRatio * 0.8)
+				recentBytesUploaded += int64(float64(snapshot.BytesUploaded) * windowRatio * 0.8)
+			}
 			activeConnectionCount++
 		}
 		return true
 	})
 
-	downloadSpeed = float64(recentBytesDownloaded) / float64(timeAggregated)
-	uploadSpeed = float64(recentBytesUploaded) / float64(timeAggregated)
+	// Calculate speeds based on active connection activity
+	windowSeconds := m.speedWindowDuration.Seconds()
+	if windowSeconds > 0 && activeConnectionCount > 0 {
+		downloadSpeed = float64(recentBytesDownloaded) / windowSeconds
+		uploadSpeed = float64(recentBytesUploaded) / windowSeconds
+	}
 
 	return downloadSpeed, uploadSpeed
 }
