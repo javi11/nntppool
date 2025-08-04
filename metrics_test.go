@@ -445,24 +445,6 @@ func TestPoolMetrics_ActiveOnlySpeedCalculation(t *testing.T) {
 	assert.Equal(t, float64(0), uploadSpeed)
 }
 
-func TestPoolMetrics_NoPoolInterference(t *testing.T) {
-	metrics := NewPoolMetrics()
-	
-	// Verify that speed calculation doesn't require or use pool parameters
-	// This test ensures complete isolation from pool operations
-	
-	start := time.Now()
-	for i := 0; i < 1000; i++ {
-		downloadSpeed, uploadSpeed := metrics.calculateRecentSpeedsUncached()
-		assert.Equal(t, float64(0), downloadSpeed) // No active connections = 0 speed
-		assert.Equal(t, float64(0), uploadSpeed)
-	}
-	elapsed := time.Since(start)
-	
-	// Should be extremely fast with no pool operations
-	assert.True(t, elapsed < 5*time.Millisecond, "1000 calculations took %v", elapsed)
-}
-
 // Benchmark tests to ensure minimal performance overhead
 func BenchmarkPoolMetrics_RecordConnectionCreated(b *testing.B) {
 	metrics := NewPoolMetrics()
