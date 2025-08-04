@@ -536,7 +536,7 @@ func (m *PoolMetrics) calculateRecentSpeeds(pools []*providerPool) (downloadSpee
 	m.speedCache.mu.RUnlock()
 	
 	// Cache is stale or empty, calculate fresh values
-	downloadSpeed, uploadSpeed = m.calculateRecentSpeedsUncached(pools)
+	downloadSpeed, uploadSpeed = m.calculateRecentSpeedsUncached()
 	
 	// Update cache with new values
 	m.speedCache.mu.Lock()
@@ -548,16 +548,13 @@ func (m *PoolMetrics) calculateRecentSpeeds(pools []*providerPool) (downloadSpee
 	return downloadSpeed, uploadSpeed
 }
 
-// calculateRecentSpeedsUncached performs the actual speed calculation without caching
-// This method focuses on active connections to minimize pool interference
-func (m *PoolMetrics) calculateRecentSpeedsUncached(pools []*providerPool) (downloadSpeed, uploadSpeed float64) {
-	now := time.Now()
-	windowStart := now.Add(-m.speedWindowDuration)
-	
+// calculateRecentSpeedsUncached performs the actual speed calculation using only active connections
+// This method provides maximum performance by completely avoiding any pool interference
+func (m *PoolMetrics) calculateRecentSpeedsUncached() (downloadSpeed, uploadSpeed float64) {
 	var recentBytesDownloaded, recentBytesUploaded int64
-	var connectionsWithRecentActivity int
+	var activeConnectionCount int
 	
-	// Primary strategy: Use active connections (no pool blocking)
+	// Use only active connections - zero pool blocking, maximum performance
 	m.activeConnections.Range(func(key, value interface{}) bool {
 		conn, ok := value.(nntpcli.Connection)
 		if !ok || conn == nil {
@@ -566,77 +563,29 @@ func (m *PoolMetrics) calculateRecentSpeedsUncached(pools []*providerPool) (down
 		
 		metrics := conn.GetMetrics()
 		if metrics != nil {
-			// Active connections are by definition recently active
+			// Active connections represent current activity
 			snapshot := metrics.GetSnapshot()
 			connectionAge := metrics.GetConnectionAge()
 			
 			if connectionAge <= m.speedWindowDuration {
-				// Connection is newer than window, count all bytes
+				// Connection is newer than our time window - count all its bytes
 				recentBytesDownloaded += snapshot.BytesDownloaded
 				recentBytesUploaded += snapshot.BytesUploaded
 			} else {
-				// For active connections, assume more recent activity
+				// Connection is older than window - estimate recent activity
+				// Since it's active, we can be generous with the estimation
 				windowRatio := float64(m.speedWindowDuration) / float64(connectionAge)
-				// More generous estimation for active connections
-				recentBytesDownloaded += int64(float64(snapshot.BytesDownloaded) * windowRatio * 0.7)
-				recentBytesUploaded += int64(float64(snapshot.BytesUploaded) * windowRatio * 0.7)
+				recentBytesDownloaded += int64(float64(snapshot.BytesDownloaded) * windowRatio * 0.8)
+				recentBytesUploaded += int64(float64(snapshot.BytesUploaded) * windowRatio * 0.8)
 			}
-			connectionsWithRecentActivity++
+			activeConnectionCount++
 		}
 		return true
 	})
 	
-	// Fallback strategy: Sample idle connections non-blockingly if we have few active connections
-	if connectionsWithRecentActivity < 3 && len(pools) > 0 {
-		// Try to get a few idle connections from the first pool only to minimize impact
-		// This is a compromise between accuracy and performance
-		if firstPool := pools[0]; firstPool != nil {
-			idleResources := firstPool.connectionPool.AcquireAllIdle()
-			
-			// Limit sampling to reduce blocking time
-			sampleSize := len(idleResources)
-			if sampleSize > 5 {
-				sampleSize = 5 // Sample at most 5 idle connections
-			}
-			
-			for i := 0; i < sampleSize; i++ {
-				res := idleResources[i]
-				conn := res.Value()
-				if conn.nntp != nil {
-					metrics := conn.nntp.GetMetrics()
-					if metrics != nil {
-						connectionAge := metrics.GetConnectionAge()
-						lastActivityTime := now.Add(-connectionAge)
-						
-						// Only count if connection was active within our window
-						if lastActivityTime.After(windowStart) {
-							snapshot := metrics.GetSnapshot()
-							if connectionAge <= m.speedWindowDuration {
-								// Connection is newer than window, count all bytes
-								recentBytesDownloaded += snapshot.BytesDownloaded
-								recentBytesUploaded += snapshot.BytesUploaded
-							} else {
-								// Conservative estimate for idle connections
-								windowRatio := float64(m.speedWindowDuration) / float64(connectionAge)
-								recentBytesDownloaded += int64(float64(snapshot.BytesDownloaded) * windowRatio * 0.2)
-								recentBytesUploaded += int64(float64(snapshot.BytesUploaded) * windowRatio * 0.2)
-							}
-							connectionsWithRecentActivity++
-						}
-					}
-				}
-			}
-			
-			// Release all idle connections back to the pool immediately
-			for _, res := range idleResources {
-				res.ReleaseUnused()
-			}
-		}
-	}
-	
-	// Calculate speeds based on recent activity
+	// Calculate speeds based on active connection activity
 	windowSeconds := m.speedWindowDuration.Seconds()
-	if windowSeconds > 0 && connectionsWithRecentActivity > 0 {
+	if windowSeconds > 0 && activeConnectionCount > 0 {
 		downloadSpeed = float64(recentBytesDownloaded) / windowSeconds
 		uploadSpeed = float64(recentBytesUploaded) / windowSeconds
 	}

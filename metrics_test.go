@@ -397,6 +397,72 @@ func TestPoolMetrics_NonBlockingSpeedCalculation(t *testing.T) {
 	assert.True(t, elapsed < 10*time.Millisecond, "100 cached calls took %v", elapsed)
 }
 
+func TestPoolMetrics_ActiveOnlySpeedCalculation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	metrics := NewPoolMetrics()
+	
+	// Test with no active connections - should return 0
+	downloadSpeed, uploadSpeed := metrics.calculateRecentSpeedsUncached()
+	assert.Equal(t, float64(0), downloadSpeed)
+	assert.Equal(t, float64(0), uploadSpeed)
+	
+	// Add mock active connections
+	mockConn1 := nntpcli.NewMockConnection(ctrl)
+	mockConn2 := nntpcli.NewMockConnection(ctrl)
+	
+	mockMetrics1 := nntpcli.NewMetrics()
+	mockMetrics2 := nntpcli.NewMetrics()
+	
+	mockConn1.EXPECT().GetMetrics().Return(mockMetrics1).AnyTimes()
+	mockConn2.EXPECT().GetMetrics().Return(mockMetrics2).AnyTimes()
+	
+	// Simulate some activity
+	mockMetrics1.RecordDownload(1000)
+	mockMetrics1.RecordUpload(500)
+	mockMetrics2.RecordDownload(2000)
+	mockMetrics2.RecordUpload(800)
+	
+	// Register as active connections
+	metrics.RegisterActiveConnection("conn1", mockConn1)
+	metrics.RegisterActiveConnection("conn2", mockConn2)
+	
+	// Calculate speed based on active connections only
+	downloadSpeed, uploadSpeed = metrics.calculateRecentSpeedsUncached()
+	
+	// Should have non-zero speeds based on active connections
+	assert.True(t, downloadSpeed > 0, "Download speed should be > 0 with active connections")
+	assert.True(t, uploadSpeed > 0, "Upload speed should be > 0 with active connections")
+	
+	// Unregister connections
+	metrics.UnregisterActiveConnection("conn1")
+	metrics.UnregisterActiveConnection("conn2")
+	
+	// Should return to 0 with no active connections
+	downloadSpeed, uploadSpeed = metrics.calculateRecentSpeedsUncached()
+	assert.Equal(t, float64(0), downloadSpeed)
+	assert.Equal(t, float64(0), uploadSpeed)
+}
+
+func TestPoolMetrics_NoPoolInterference(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Verify that speed calculation doesn't require or use pool parameters
+	// This test ensures complete isolation from pool operations
+	
+	start := time.Now()
+	for i := 0; i < 1000; i++ {
+		downloadSpeed, uploadSpeed := metrics.calculateRecentSpeedsUncached()
+		assert.Equal(t, float64(0), downloadSpeed) // No active connections = 0 speed
+		assert.Equal(t, float64(0), uploadSpeed)
+	}
+	elapsed := time.Since(start)
+	
+	// Should be extremely fast with no pool operations
+	assert.True(t, elapsed < 5*time.Millisecond, "1000 calculations took %v", elapsed)
+}
+
 // Benchmark tests to ensure minimal performance overhead
 func BenchmarkPoolMetrics_RecordConnectionCreated(b *testing.B) {
 	metrics := NewPoolMetrics()
@@ -627,12 +693,9 @@ func BenchmarkPoolMetrics_GetActiveConnectionMetrics(b *testing.B) {
 func BenchmarkPoolMetrics_CalculateRecentSpeeds(b *testing.B) {
 	metrics := NewPoolMetrics()
 	
-	// Test with empty pools (cached performance)
-	emptyPools := []*providerPool{}
-	
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = metrics.calculateRecentSpeeds(emptyPools)
+		_, _ = metrics.calculateRecentSpeeds(nil)
 	}
 }
 
@@ -642,12 +705,9 @@ func BenchmarkPoolMetrics_CalculateRecentSpeedsUncached(b *testing.B) {
 	// Set cache duration to 0 to force recalculation every time
 	metrics.SetSpeedCacheDuration(1 * time.Nanosecond)
 	
-	// Test with empty pools (uncached performance)
-	emptyPools := []*providerPool{}
-	
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = metrics.calculateRecentSpeeds(emptyPools)
+		_, _ = metrics.calculateRecentSpeeds(nil)
 	}
 }
 
