@@ -31,16 +31,33 @@ func ExampleMetricsUsage() {
 	}
 	defer pool.Quit()
 
-	// Get real-time metrics
+	// Configure speed calculation (optional)
 	metrics := pool.GetMetrics()
+	metrics.SetSpeedWindowDuration(30 * time.Second) // Use 30-second window instead of default 60
+	metrics.SetSpeedCacheDuration(2 * time.Second)   // Cache speed calculations for 2 seconds
+	
+	// Get real-time metrics
 	activeMetrics := metrics.GetActiveConnectionMetrics()
 
 	fmt.Printf("Active connections: %d\n", metrics.GetActiveConnections())
 	fmt.Printf("Tracked active connections: %d\n", activeMetrics.Count)
 	fmt.Printf("Total acquires: %d\n", metrics.GetTotalAcquires())
-	fmt.Printf("Total bytes downloaded: %d\n", metrics.GetTotalBytesDownloaded())
-	fmt.Printf("Total bytes uploaded: %d\n", metrics.GetTotalBytesUploaded())
 	fmt.Printf("Pool uptime: %v\n", metrics.GetUptime())
+	
+	// Get traffic data from snapshot instead
+	snapshot := pool.GetMetricsSnapshot()
+	fmt.Printf("Total bytes downloaded: %d\n", snapshot.TotalBytesDownloaded)
+	fmt.Printf("Total bytes uploaded: %d\n", snapshot.TotalBytesUploaded)
+	
+	// Show new speed metrics
+	fmt.Printf("\n=== Speed Metrics ===\n")
+	fmt.Printf("Current download speed: %.2f bytes/sec\n", snapshot.DownloadSpeed)
+	fmt.Printf("Current upload speed: %.2f bytes/sec\n", snapshot.UploadSpeed)
+	fmt.Printf("Historical download speed: %.2f bytes/sec\n", snapshot.HistoricalDownloadSpeed)
+	fmt.Printf("Historical upload speed: %.2f bytes/sec\n", snapshot.HistoricalUploadSpeed)
+	fmt.Printf("Speed calculation window: %.0f seconds\n", snapshot.SpeedCalculationWindow)
+	fmt.Printf("Speed cache duration: %.0f seconds\n", snapshot.SpeedCacheDuration)
+	fmt.Printf("Speed cache age: %.2f seconds\n", snapshot.SpeedCacheAge)
 
 	// Show active connection specific metrics
 	fmt.Printf("\n=== Active Connection Metrics ===\n")
@@ -50,8 +67,7 @@ func ExampleMetricsUsage() {
 	fmt.Printf("Active commands: %d\n", activeMetrics.TotalCommands)
 	fmt.Printf("Active success rate: %.2f%%\n", activeMetrics.SuccessRate)
 
-	// Get comprehensive snapshot
-	snapshot := pool.GetMetricsSnapshot()
+	// Use the same snapshot for comprehensive view
 
 	fmt.Printf("\n=== Pool Metrics Snapshot ===\n")
 	fmt.Printf("Timestamp: %v\n", snapshot.Timestamp)
