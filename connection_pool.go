@@ -270,11 +270,18 @@ func (p *connectionPool) GetConnection(
 	// Record successful acquire timing
 	p.metrics.RecordAcquireWaitTime(time.Since(start))
 
-	return pooledConnection{
+	pooledConn := pooledConnection{
 		resource: conn,
 		log:      p.log,
 		metrics:  p.metrics,
-	}, nil
+	}
+
+	// Register the connection as active for metrics tracking
+	if conn.Value().nntp != nil {
+		p.metrics.RegisterActiveConnection(pooledConn.connectionID(), conn.Value().nntp)
+	}
+
+	return pooledConn, nil
 }
 
 func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
