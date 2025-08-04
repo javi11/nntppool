@@ -509,6 +509,8 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) AggregatedM
 			totalCommands += snapshot.TotalCommands
 			totalCommandErrors += snapshot.CommandErrors
 			totalConnectionAge += metrics.GetConnectionAge()
+			totalArticlesRetrieved += snapshot.ArticlesRetrieved
+			totalArticlesPosted += snapshot.ArticlesPosted
 			connectionCount++
 		}
 		return true // Continue iteration
