@@ -531,8 +531,8 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) AggregatedM
 		TotalCommandErrors:     totalCommandErrors,
 		SuccessRate:            successRate,
 		AverageConnectionAge:   averageConnectionAge,
-		TotalArticlesRetrieved: 0, // Placeholder, can be calculated from articles if needed
-		TotalArticlesPosted:    0, // Placeholder, can be calculated from articles if
+		TotalArticlesRetrieved: totalArticlesRetrieved,
+		TotalArticlesPosted:    totalArticlesPosted,
 	}
 }
 
