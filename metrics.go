@@ -312,12 +312,14 @@ type ProviderMetricsSnapshot struct {
 	CanceledAcquireCount    int64         `json:"canceled_acquire_count"`
 
 	// Connection-level aggregated metrics
-	TotalBytesDownloaded int64         `json:"total_bytes_downloaded"`
-	TotalBytesUploaded   int64         `json:"total_bytes_uploaded"`
-	TotalCommands        int64         `json:"total_commands"`
-	TotalCommandErrors   int64         `json:"total_command_errors"`
-	SuccessRate          float64       `json:"success_rate_percent"`
-	AverageConnectionAge time.Duration `json:"average_connection_age"`
+	TotalBytesDownloaded   int64         `json:"total_bytes_downloaded"`
+	TotalBytesUploaded     int64         `json:"total_bytes_uploaded"`
+	TotalCommands          int64         `json:"total_commands"`
+	TotalCommandErrors     int64         `json:"total_command_errors"`
+	SuccessRate            float64       `json:"success_rate_percent"`
+	AverageConnectionAge   time.Duration `json:"average_connection_age"`
+	TotalArticlesRetrieved int64         `json:"total_articles_retrieved"`
+	TotalArticlesPosted    int64         `json:"total_articles_posted"`
 }
 
 type AggregatedMetrics struct {
@@ -411,6 +413,8 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 		providerSnapshot.TotalCommandErrors = aggregatedMetrics.TotalCommandErrors
 		providerSnapshot.SuccessRate = aggregatedMetrics.SuccessRate
 		providerSnapshot.AverageConnectionAge = aggregatedMetrics.AverageConnectionAge
+		providerSnapshot.TotalArticlesRetrieved = aggregatedMetrics.TotalArticlesRetrieved
+		providerSnapshot.TotalArticlesPosted = aggregatedMetrics.TotalArticlesPosted
 
 		providerMetrics = append(providerMetrics, providerSnapshot)
 
@@ -433,8 +437,8 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 		TotalConnections:          totalConnections,
 		TotalBytesDownloaded:      globalTotalBytesDownloaded,
 		TotalBytesUploaded:        globalTotalBytesUploaded,
-		TotalArticlesRetrieved:    0,                                   // Will be calculated from connections if needed
-		TotalArticlesPosted:       0,                                   // Will be calculated from connections if needed
+		TotalArticlesRetrieved:    globalArticlesRetrieved,             // Will be calculated from connections if needed
+		TotalArticlesPosted:       globalArticlesPosted,                // Will be calculated from connections if needed
 		DownloadSpeed:             recentDownloadSpeed,                 // Use recent speed (current activity)
 		UploadSpeed:               recentUploadSpeed,                   // Use recent speed (current activity)
 		HistoricalDownloadSpeed:   historicalDownloadSpeed,             // Historical average since pool start
