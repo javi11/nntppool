@@ -6,7 +6,7 @@ require (
 	github.com/avast/retry-go/v4 v4.6.1
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/jackc/puddle/v2 v2.2.2
-	github.com/javi11/nntpcli v1.1.0
+	github.com/javi11/nntpcli v1.1.1
 	github.com/stretchr/testify v1.10.0
 	go.uber.org/mock v0.5.2
 	golang.org/x/text v0.27.0
