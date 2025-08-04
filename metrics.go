@@ -1,8 +1,11 @@
 package nntppool
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/javi11/nntpcli"
 )
 
 // PoolMetrics provides high-performance metrics for the entire connection pool
@@ -29,6 +32,10 @@ type PoolMetrics struct {
 
 	// Timing
 	startTime int64 // Pool start time (Unix nanoseconds)
+
+	// Active connections registry (thread-safe map)
+	// Key: connection identifier, Value: nntpcli.Connection with metrics
+	activeConnections sync.Map // map[string]nntpcli.Connection
 }
 
 // NewPoolMetrics creates a new metrics instance
@@ -158,6 +165,86 @@ func (m *PoolMetrics) GetAverageAcquireWaitTime() time.Duration {
 func (m *PoolMetrics) GetUptime() time.Duration {
 	startTime := atomic.LoadInt64(&m.startTime)
 	return time.Duration(time.Now().UnixNano() - startTime)
+}
+
+// RegisterActiveConnection registers a connection as active for metrics tracking
+// This should be called when a connection is acquired from the pool
+func (m *PoolMetrics) RegisterActiveConnection(connectionID string, conn nntpcli.Connection) {
+	m.activeConnections.Store(connectionID, conn)
+}
+
+// UnregisterActiveConnection removes a connection from active tracking
+// This should be called when a connection is released back to the pool or destroyed
+func (m *PoolMetrics) UnregisterActiveConnection(connectionID string) {
+	m.activeConnections.Delete(connectionID)
+}
+
+// GetActiveConnectionsCount returns the number of actively tracked connections
+func (m *PoolMetrics) GetActiveConnectionsCount() int {
+	count := 0
+	m.activeConnections.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+// ActiveConnectionMetrics represents metrics for active connections only
+type ActiveConnectionMetrics struct {
+	Count                int           `json:"count"`
+	TotalBytesDownloaded int64         `json:"total_bytes_downloaded"`
+	TotalBytesUploaded   int64         `json:"total_bytes_uploaded"`
+	TotalCommands        int64         `json:"total_commands"`
+	TotalCommandErrors   int64         `json:"total_command_errors"`
+	SuccessRate          float64       `json:"success_rate_percent"`
+	AverageConnectionAge time.Duration `json:"average_connection_age"`
+}
+
+// GetActiveConnectionMetrics returns real-time metrics for currently active connections
+func (m *PoolMetrics) GetActiveConnectionMetrics() ActiveConnectionMetrics {
+	var totalBytesDownloaded, totalBytesUploaded int64
+	var totalCommands, totalCommandErrors int64
+	var totalConnectionAge time.Duration
+	var count int
+
+	m.activeConnections.Range(func(key, value interface{}) bool {
+		conn, ok := value.(nntpcli.Connection)
+		if !ok || conn == nil {
+			return true // Continue iteration
+		}
+
+		metrics := conn.GetMetrics()
+		if metrics != nil {
+			snapshot := metrics.GetSnapshot()
+			totalBytesDownloaded += snapshot.BytesDownloaded
+			totalBytesUploaded += snapshot.BytesUploaded
+			totalCommands += snapshot.TotalCommands
+			totalCommandErrors += snapshot.CommandErrors
+			totalConnectionAge += metrics.GetConnectionAge()
+			count++
+		}
+		return true // Continue iteration
+	})
+
+	var successRate float64
+	if totalCommands > 0 {
+		successRate = float64(totalCommands-totalCommandErrors) / float64(totalCommands) * 100
+	}
+
+	var averageConnectionAge time.Duration
+	if count > 0 {
+		averageConnectionAge = totalConnectionAge / time.Duration(count)
+	}
+
+	return ActiveConnectionMetrics{
+		Count:                count,
+		TotalBytesDownloaded: totalBytesDownloaded,
+		TotalBytesUploaded:   totalBytesUploaded,
+		TotalCommands:        totalCommands,
+		TotalCommandErrors:   totalCommandErrors,
+		SuccessRate:          successRate,
+		AverageConnectionAge: averageConnectionAge,
+	}
 }
 
 // PoolMetricsSnapshot provides a comprehensive view of pool metrics
@@ -326,6 +413,7 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 }
 
 // aggregateConnectionMetrics aggregates metrics from all connections in a provider pool
+// This includes both idle connections and active connections for complete visibility
 func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) struct {
 	TotalBytesDownloaded   int64
 	TotalBytesUploaded     int64
@@ -334,7 +422,12 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) struct {
 	SuccessRate            float64
 	AverageConnectionAge   time.Duration
 } {
-	// Acquire all idle connections to read their metrics
+	var totalBytesDownloaded, totalBytesUploaded int64
+	var totalCommands, totalCommandErrors int64
+	var totalConnectionAge time.Duration
+	var connectionCount int
+
+	// First, collect metrics from idle connections
 	idleResources := pool.connectionPool.AcquireAllIdle()
 	defer func() {
 		// Release all idle connections back to the pool
@@ -343,10 +436,7 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) struct {
 		}
 	}()
 	
-	var totalBytesDownloaded, totalBytesUploaded int64
-	var totalCommands, totalCommandErrors int64
-	var totalConnectionAge time.Duration
-	connectionCount := len(idleResources)
+	connectionCount += len(idleResources)
 	
 	for _, res := range idleResources {
 		conn := res.Value()
@@ -362,6 +452,26 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) struct {
 			}
 		}
 	}
+
+	// Second, collect metrics from active connections
+	m.activeConnections.Range(func(key, value interface{}) bool {
+		conn, ok := value.(nntpcli.Connection)
+		if !ok || conn == nil {
+			return true // Continue iteration
+		}
+
+		metrics := conn.GetMetrics()
+		if metrics != nil {
+			snapshot := metrics.GetSnapshot()
+			totalBytesDownloaded += snapshot.BytesDownloaded
+			totalBytesUploaded += snapshot.BytesUploaded
+			totalCommands += snapshot.TotalCommands
+			totalCommandErrors += snapshot.CommandErrors
+			totalConnectionAge += metrics.GetConnectionAge()
+			connectionCount++
+		}
+		return true // Continue iteration
+	})
 	
 	var successRate float64
 	if totalCommands > 0 {

@@ -5,7 +5,9 @@ package nntppool
 
 import (
 	"fmt"
+	"strconv"
 	"time"
+	"unsafe"
 
 	"github.com/jackc/puddle/v2"
 	"github.com/javi11/nntpcli"
@@ -40,6 +42,11 @@ type pooledConnection struct {
 	metrics  *PoolMetrics
 }
 
+// connectionID generates a unique identifier for this connection
+func (p pooledConnection) connectionID() string {
+	return strconv.FormatUint(uint64(uintptr(unsafe.Pointer(p.resource))), 16)
+}
+
 // Close destroys the connection and removes it from the pool.
 // This method should be used when the connection is known to be in a bad state
 // and should not be reused. It implements proper panic recovery to handle
@@ -57,12 +64,13 @@ func (p pooledConnection) Close() error {
 		}
 	}()
 
-	p.resource.Destroy()
-
-	// Record connection destruction
+	// Unregister from active connections before destroying
 	if p.metrics != nil {
+		p.metrics.UnregisterActiveConnection(p.connectionID())
 		p.metrics.RecordConnectionDestroyed()
 	}
+
+	p.resource.Destroy()
 
 	return resultErr
 }
@@ -84,12 +92,13 @@ func (p pooledConnection) Free() error {
 		}
 	}()
 
-	p.resource.Release()
-
-	// Record connection release
+	// Unregister from active connections before releasing
 	if p.metrics != nil {
+		p.metrics.UnregisterActiveConnection(p.connectionID())
 		p.metrics.RecordRelease()
 	}
+
+	p.resource.Release()
 
 	return resultErr
 }

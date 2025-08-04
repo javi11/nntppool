@@ -33,12 +33,22 @@ func ExampleMetricsUsage() {
 
 	// Get real-time metrics
 	metrics := pool.GetMetrics()
+	activeMetrics := metrics.GetActiveConnectionMetrics()
 
 	fmt.Printf("Active connections: %d\n", metrics.GetActiveConnections())
+	fmt.Printf("Tracked active connections: %d\n", activeMetrics.Count)
 	fmt.Printf("Total acquires: %d\n", metrics.GetTotalAcquires())
 	fmt.Printf("Total bytes downloaded: %d\n", metrics.GetTotalBytesDownloaded())
 	fmt.Printf("Total bytes uploaded: %d\n", metrics.GetTotalBytesUploaded())
 	fmt.Printf("Pool uptime: %v\n", metrics.GetUptime())
+
+	// Show active connection specific metrics
+	fmt.Printf("\n=== Active Connection Metrics ===\n")
+	fmt.Printf("Active connections count: %d\n", activeMetrics.Count)
+	fmt.Printf("Active bytes downloaded: %d\n", activeMetrics.TotalBytesDownloaded)
+	fmt.Printf("Active bytes uploaded: %d\n", activeMetrics.TotalBytesUploaded)
+	fmt.Printf("Active commands: %d\n", activeMetrics.TotalCommands)
+	fmt.Printf("Active success rate: %.2f%%\n", activeMetrics.SuccessRate)
 
 	// Get comprehensive snapshot
 	snapshot := pool.GetMetricsSnapshot()
@@ -107,14 +117,16 @@ func MonitoringExample() {
 				return
 			case <-ticker.C:
 				metrics := pool.GetMetrics()
+				activeMetrics := metrics.GetActiveConnectionMetrics()
 
 				// Monitor key performance indicators
 				activeConns := metrics.GetActiveConnections()
+				trackedActiveConns := activeMetrics.Count
 				errorRate := float64(metrics.GetTotalErrors()) / float64(metrics.GetTotalAcquires()) * 100
 				avgWaitTime := metrics.GetAverageAcquireWaitTime()
 
-				fmt.Printf("[%v] Active: %d, Error Rate: %.2f%%, Avg Wait: %v\n",
-					time.Now().Format("15:04:05"), activeConns, errorRate, avgWaitTime)
+				fmt.Printf("[%v] Active: %d (tracked: %d), Error Rate: %.2f%%, Avg Wait: %v, Active Cmds: %d\n",
+					time.Now().Format("15:04:05"), activeConns, trackedActiveConns, errorRate, avgWaitTime, activeMetrics.TotalCommands)
 
 				// Alert on high error rates
 				if errorRate > 5.0 {
