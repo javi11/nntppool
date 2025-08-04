@@ -38,9 +38,12 @@ func ExampleMetricsUsage() {
 	fmt.Printf("Active connections: %d\n", metrics.GetActiveConnections())
 	fmt.Printf("Tracked active connections: %d\n", activeMetrics.Count)
 	fmt.Printf("Total acquires: %d\n", metrics.GetTotalAcquires())
-	fmt.Printf("Total bytes downloaded: %d\n", metrics.GetTotalBytesDownloaded())
-	fmt.Printf("Total bytes uploaded: %d\n", metrics.GetTotalBytesUploaded())
 	fmt.Printf("Pool uptime: %v\n", metrics.GetUptime())
+	
+	// Get traffic data from snapshot instead
+	snapshot := pool.GetMetricsSnapshot()
+	fmt.Printf("Total bytes downloaded: %d\n", snapshot.TotalBytesDownloaded)
+	fmt.Printf("Total bytes uploaded: %d\n", snapshot.TotalBytesUploaded)
 
 	// Show active connection specific metrics
 	fmt.Printf("\n=== Active Connection Metrics ===\n")
@@ -50,8 +53,7 @@ func ExampleMetricsUsage() {
 	fmt.Printf("Active commands: %d\n", activeMetrics.TotalCommands)
 	fmt.Printf("Active success rate: %.2f%%\n", activeMetrics.SuccessRate)
 
-	// Get comprehensive snapshot
-	snapshot := pool.GetMetricsSnapshot()
+	// Use the same snapshot for comprehensive view
 
 	fmt.Printf("\n=== Pool Metrics Snapshot ===\n")
 	fmt.Printf("Timestamp: %v\n", snapshot.Timestamp)

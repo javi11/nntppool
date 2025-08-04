@@ -69,36 +69,30 @@ func TestPoolMetrics_ErrorsAndRetries(t *testing.T) {
 }
 
 func TestPoolMetrics_TrafficMetrics(t *testing.T) {
+	// Traffic metrics are now aggregated from connections, not tracked at pool level
+	// This test verifies the architectural change where pool only tracks pool operations
 	metrics := NewPoolMetrics()
 
-	// Test traffic metrics
-	metrics.RecordBytesDownloaded(1024)
-	metrics.RecordBytesDownloaded(2048)
-	assert.Equal(t, int64(3072), metrics.GetTotalBytesDownloaded())
-
-	metrics.RecordBytesUploaded(512)
-	metrics.RecordBytesUploaded(256)
-	assert.Equal(t, int64(768), metrics.GetTotalBytesUploaded())
-
-	metrics.RecordArticleRetrieved()
-	metrics.RecordArticleRetrieved()
-	assert.Equal(t, int64(2), metrics.GetTotalArticlesRetrieved())
-
-	metrics.RecordArticlePosted()
-	assert.Equal(t, int64(1), metrics.GetTotalArticlesPosted())
+	// Pool-level metrics should only track pool operations
+	assert.Equal(t, int64(0), metrics.GetTotalConnectionsCreated())
+	assert.Equal(t, int64(0), metrics.GetTotalAcquires())
+	assert.Equal(t, int64(0), metrics.GetTotalErrors())
+	
+	// Connection operations should not be tracked at pool level anymore
+	// Traffic metrics will come from connection aggregation in GetSnapshot()
 }
 
 func TestPoolMetrics_CommandMetrics(t *testing.T) {
+	// Command metrics are now aggregated from connections, not tracked at pool level
+	// This test verifies the architectural change where pool only tracks pool operations
 	metrics := NewPoolMetrics()
 
-	// Test command metrics
-	metrics.RecordCommand()
-	metrics.RecordCommand()
-	metrics.RecordCommand()
-	assert.Equal(t, int64(3), metrics.GetTotalCommandCount())
-
-	metrics.RecordCommandError()
-	assert.Equal(t, int64(1), metrics.GetTotalCommandErrors())
+	// Pool-level metrics should only track pool operations
+	assert.Equal(t, int64(0), metrics.GetTotalConnectionsCreated())
+	assert.Equal(t, int64(0), metrics.GetTotalAcquires())
+	assert.Equal(t, int64(0), metrics.GetTotalErrors())
+	
+	// Command metrics will come from connection aggregation in GetSnapshot()
 }
 
 func TestPoolMetrics_AcquireWaitTime(t *testing.T) {
@@ -143,14 +137,10 @@ func TestPoolMetrics_ConcurrentAccess(t *testing.T) {
 			for j := 0; j < 100; j++ {
 				metrics.RecordConnectionCreated()
 				metrics.RecordAcquire()
-				metrics.RecordBytesDownloaded(int64(j))
-				metrics.RecordCommand()
 
 				// Read metrics
 				_ = metrics.GetTotalConnectionsCreated()
 				_ = metrics.GetTotalAcquires()
-				_ = metrics.GetTotalBytesDownloaded()
-				_ = metrics.GetTotalCommandCount()
 			}
 		}()
 	}
@@ -163,8 +153,6 @@ func TestPoolMetrics_ConcurrentAccess(t *testing.T) {
 	// Verify final state
 	assert.Equal(t, int64(1000), metrics.GetTotalConnectionsCreated())
 	assert.Equal(t, int64(1000), metrics.GetTotalAcquires())
-	assert.Equal(t, int64(49500), metrics.GetTotalBytesDownloaded()) // Sum of 0+1+...+99 = 4950, times 10 = 49500
-	assert.Equal(t, int64(1000), metrics.GetTotalCommandCount())
 }
 
 func TestPoolMetrics_EmptySnapshot(t *testing.T) {
@@ -185,12 +173,7 @@ func TestPoolMetrics_EmptySnapshot(t *testing.T) {
 func TestPoolMetrics_SnapshotCalculations(t *testing.T) {
 	metrics := NewPoolMetrics()
 
-	// Add some metrics data
-	metrics.RecordBytesDownloaded(1000)
-	metrics.RecordBytesUploaded(500)
-	metrics.RecordCommand()
-	metrics.RecordCommand()
-	metrics.RecordCommandError()
+	// Add some pool-level metrics data
 	metrics.RecordAcquire()
 	metrics.RecordError()
 
@@ -200,12 +183,12 @@ func TestPoolMetrics_SnapshotCalculations(t *testing.T) {
 	snapshot := metrics.GetSnapshot(nil)
 
 	// Verify calculated fields
-	assert.True(t, snapshot.DownloadSpeed > 0)                // Should be bytes/second
-	assert.True(t, snapshot.UploadSpeed > 0)                  // Should be bytes/second
-	assert.Equal(t, float64(50), snapshot.CommandSuccessRate) // 1 success out of 2 commands = 50%
-	assert.Equal(t, float64(100), snapshot.ErrorRate)         // 1 error out of 1 acquire = 100%
-	assert.Equal(t, int64(1000), snapshot.TotalBytesDownloaded)
-	assert.Equal(t, int64(500), snapshot.TotalBytesUploaded)
+	assert.Equal(t, float64(0), snapshot.DownloadSpeed)        // No connection data = 0
+	assert.Equal(t, float64(0), snapshot.UploadSpeed)          // No connection data = 0
+	assert.Equal(t, float64(0), snapshot.CommandSuccessRate)   // No connection data = 0
+	assert.Equal(t, float64(100), snapshot.ErrorRate)          // 1 error out of 1 acquire = 100%
+	assert.Equal(t, int64(0), snapshot.TotalBytesDownloaded)   // No connection data = 0
+	assert.Equal(t, int64(0), snapshot.TotalBytesUploaded)     // No connection data = 0
 }
 
 // Benchmark tests to ensure minimal performance overhead
@@ -218,22 +201,22 @@ func BenchmarkPoolMetrics_RecordConnectionCreated(b *testing.B) {
 	}
 }
 
-func BenchmarkPoolMetrics_RecordBytesDownloaded(b *testing.B) {
+func BenchmarkPoolMetrics_RecordAcquire(b *testing.B) {
 	metrics := NewPoolMetrics()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		metrics.RecordBytesDownloaded(1024)
+		metrics.RecordAcquire()
 	}
 }
 
-func BenchmarkPoolMetrics_GetTotalBytesDownloaded(b *testing.B) {
+func BenchmarkPoolMetrics_GetTotalAcquires(b *testing.B) {
 	metrics := NewPoolMetrics()
-	metrics.RecordBytesDownloaded(1024)
+	metrics.RecordAcquire()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = metrics.GetTotalBytesDownloaded()
+		_ = metrics.GetTotalAcquires()
 	}
 }
 
@@ -244,9 +227,9 @@ func BenchmarkPoolMetrics_ConcurrentOperations(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			metrics.RecordConnectionCreated()
-			metrics.RecordBytesDownloaded(1024)
+			metrics.RecordAcquire()
 			_ = metrics.GetTotalConnectionsCreated()
-			_ = metrics.GetTotalBytesDownloaded()
+			_ = metrics.GetTotalAcquires()
 		}
 	})
 }

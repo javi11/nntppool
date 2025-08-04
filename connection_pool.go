@@ -457,14 +457,10 @@ func (p *connectionPool) Body(
 		n, err := nntpConn.BodyDecoded(msgID, w, written)
 		if err != nil && ctx.Err() == nil {
 			written += n
-			p.metrics.RecordCommandError()
 			return fmt.Errorf("error downloading body: %w", err)
 		}
 
 		bytesWritten = n
-		p.metrics.RecordCommand()
-		p.metrics.RecordBytesDownloaded(n)
-		p.metrics.RecordArticleRetrieved()
 
 		_ = conn.Free()
 
@@ -608,11 +604,8 @@ func (p *connectionPool) BodyReader(
 
 		reader, err = nntpConn.BodyReader(msgID)
 		if err != nil && ctx.Err() == nil {
-			p.metrics.RecordCommandError()
 			return fmt.Errorf("error getting body reader: %w", err)
 		}
-
-		p.metrics.RecordCommand()
 
 		// Don't free the connection here since the reader needs it
 		// The connection will be managed by a wrapper reader
@@ -731,12 +724,8 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 
 		err = nntpConn.Post(r)
 		if err != nil {
-			p.metrics.RecordCommandError()
 			return fmt.Errorf("error posting article: %w", err)
 		}
-
-		p.metrics.RecordCommand()
-		p.metrics.RecordArticlePosted()
 
 		_ = conn.Free()
 
@@ -876,11 +865,8 @@ func (p *connectionPool) Stat(
 
 		res, err = nntpConn.Stat(msgID)
 		if err != nil && ctx.Err() == nil {
-			p.metrics.RecordCommandError()
 			return fmt.Errorf("error checking article: %w", err)
 		}
-
-		p.metrics.RecordCommand()
 
 		_ = conn.Free()
 
