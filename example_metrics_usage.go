@@ -31,8 +31,12 @@ func ExampleMetricsUsage() {
 	}
 	defer pool.Quit()
 
-	// Get real-time metrics
+	// Configure speed calculation (optional)
 	metrics := pool.GetMetrics()
+	metrics.SetSpeedWindowDuration(30 * time.Second) // Use 30-second window instead of default 60
+	metrics.SetSpeedCacheDuration(2 * time.Second)   // Cache speed calculations for 2 seconds
+	
+	// Get real-time metrics
 	activeMetrics := metrics.GetActiveConnectionMetrics()
 
 	fmt.Printf("Active connections: %d\n", metrics.GetActiveConnections())
@@ -44,6 +48,16 @@ func ExampleMetricsUsage() {
 	snapshot := pool.GetMetricsSnapshot()
 	fmt.Printf("Total bytes downloaded: %d\n", snapshot.TotalBytesDownloaded)
 	fmt.Printf("Total bytes uploaded: %d\n", snapshot.TotalBytesUploaded)
+	
+	// Show new speed metrics
+	fmt.Printf("\n=== Speed Metrics ===\n")
+	fmt.Printf("Current download speed: %.2f bytes/sec\n", snapshot.DownloadSpeed)
+	fmt.Printf("Current upload speed: %.2f bytes/sec\n", snapshot.UploadSpeed)
+	fmt.Printf("Historical download speed: %.2f bytes/sec\n", snapshot.HistoricalDownloadSpeed)
+	fmt.Printf("Historical upload speed: %.2f bytes/sec\n", snapshot.HistoricalUploadSpeed)
+	fmt.Printf("Speed calculation window: %.0f seconds\n", snapshot.SpeedCalculationWindow)
+	fmt.Printf("Speed cache duration: %.0f seconds\n", snapshot.SpeedCacheDuration)
+	fmt.Printf("Speed cache age: %.2f seconds\n", snapshot.SpeedCacheAge)
 
 	// Show active connection specific metrics
 	fmt.Printf("\n=== Active Connection Metrics ===\n")

@@ -8,6 +8,15 @@ import (
 	"github.com/javi11/nntpcli"
 )
 
+// speedCache holds cached speed calculation results
+type speedCache struct {
+	mu                sync.RWMutex
+	lastCalculated    time.Time
+	downloadSpeed     float64
+	uploadSpeed       float64
+	cacheDuration     time.Duration
+}
+
 // PoolMetrics provides high-performance metrics for the entire connection pool
 // All operations use atomic operations for thread-safety and minimal overhead
 type PoolMetrics struct {
@@ -28,12 +37,22 @@ type PoolMetrics struct {
 	// Active connections registry (thread-safe map)
 	// Key: connection identifier, Value: nntpcli.Connection with metrics
 	activeConnections sync.Map // map[string]nntpcli.Connection
+
+	// Speed calculation configuration
+	speedWindowDuration time.Duration // Time window for speed calculations (default: 60 seconds)
+	
+	// Cached speed calculations to avoid blocking pool operations
+	speedCache speedCache
 }
 
 // NewPoolMetrics creates a new metrics instance
 func NewPoolMetrics() *PoolMetrics {
 	return &PoolMetrics{
-		startTime: time.Now().UnixNano(),
+		startTime:           time.Now().UnixNano(),
+		speedWindowDuration: 60 * time.Second, // Default 60 second window for speed calculations
+		speedCache: speedCache{
+			cacheDuration: 5 * time.Second, // Default 5 second cache duration
+		},
 	}
 }
 
@@ -109,6 +128,42 @@ func (m *PoolMetrics) GetAverageAcquireWaitTime() time.Duration {
 func (m *PoolMetrics) GetUptime() time.Duration {
 	startTime := atomic.LoadInt64(&m.startTime)
 	return time.Duration(time.Now().UnixNano() - startTime)
+}
+
+// SetSpeedWindowDuration configures the time window used for speed calculations
+func (m *PoolMetrics) SetSpeedWindowDuration(duration time.Duration) {
+	if duration <= 0 {
+		duration = 60 * time.Second // Default fallback
+	}
+	m.speedWindowDuration = duration
+}
+
+// SetSpeedCacheDuration configures how long speed calculations are cached
+// This reduces performance impact by avoiding frequent expensive calculations
+func (m *PoolMetrics) SetSpeedCacheDuration(duration time.Duration) {
+	if duration <= 0 {
+		duration = 5 * time.Second // Default fallback
+	}
+	m.speedCache.mu.Lock()
+	m.speedCache.cacheDuration = duration
+	m.speedCache.mu.Unlock()
+}
+
+// getSpeedCacheDuration returns the current cache duration (thread-safe)
+func (m *PoolMetrics) getSpeedCacheDuration() time.Duration {
+	m.speedCache.mu.RLock()
+	defer m.speedCache.mu.RUnlock()
+	return m.speedCache.cacheDuration
+}
+
+// getSpeedCacheAge returns the age of the current cached values (thread-safe)
+func (m *PoolMetrics) getSpeedCacheAge() time.Duration {
+	m.speedCache.mu.RLock()
+	defer m.speedCache.mu.RUnlock()
+	if m.speedCache.lastCalculated.IsZero() {
+		return 0
+	}
+	return time.Since(m.speedCache.lastCalculated)
 }
 
 // RegisterActiveConnection registers a connection as active for metrics tracking
@@ -211,12 +266,17 @@ type PoolMetricsSnapshot struct {
 	TotalConnections    int32 `json:"total_connections"`
 
 	// Traffic metrics
-	TotalBytesDownloaded   int64   `json:"total_bytes_downloaded"`
-	TotalBytesUploaded     int64   `json:"total_bytes_uploaded"`
-	TotalArticlesRetrieved int64   `json:"total_articles_retrieved"`
-	TotalArticlesPosted    int64   `json:"total_articles_posted"`
-	DownloadSpeed          float64 `json:"download_speed_bytes_per_sec"`
-	UploadSpeed            float64 `json:"upload_speed_bytes_per_sec"`
+	TotalBytesDownloaded       int64   `json:"total_bytes_downloaded"`
+	TotalBytesUploaded         int64   `json:"total_bytes_uploaded"`
+	TotalArticlesRetrieved     int64   `json:"total_articles_retrieved"`
+	TotalArticlesPosted        int64   `json:"total_articles_posted"`
+	DownloadSpeed              float64 `json:"download_speed_bytes_per_sec"`              // Recent speed (based on time window)
+	UploadSpeed                float64 `json:"upload_speed_bytes_per_sec"`                // Recent speed (based on time window)
+	HistoricalDownloadSpeed    float64 `json:"historical_download_speed_bytes_per_sec"`   // Average since pool start
+	HistoricalUploadSpeed      float64 `json:"historical_upload_speed_bytes_per_sec"`     // Average since pool start
+	SpeedCalculationWindow     float64 `json:"speed_calculation_window_seconds"`          // Time window used for recent speed
+	SpeedCacheDuration         float64 `json:"speed_cache_duration_seconds"`              // Cache duration for speed calculations
+	SpeedCacheAge              float64 `json:"speed_cache_age_seconds"`                   // Age of current cached speed values
 
 	// Performance metrics
 	TotalCommandCount      int64         `json:"total_command_count"`
@@ -288,12 +348,15 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 		globalTotalCommandErrors += aggregated.TotalCommandErrors
 	}
 
-	// Calculate speed metrics from aggregated connection data
+	// Calculate speed metrics using recent activity within the time window
+	recentDownloadSpeed, recentUploadSpeed := m.calculateRecentSpeeds(pools)
+	
+	// Also provide historical average speeds for comparison
 	uptimeSeconds := uptime.Seconds()
-	var downloadSpeed, uploadSpeed float64
+	var historicalDownloadSpeed, historicalUploadSpeed float64
 	if uptimeSeconds > 0 {
-		downloadSpeed = float64(globalTotalBytesDownloaded) / uptimeSeconds
-		uploadSpeed = float64(globalTotalBytesUploaded) / uptimeSeconds
+		historicalDownloadSpeed = float64(globalTotalBytesDownloaded) / uptimeSeconds
+		historicalUploadSpeed = float64(globalTotalBytesUploaded) / uptimeSeconds
 	}
 
 	// Calculate success rates from aggregated connection data
@@ -363,8 +426,13 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 		TotalBytesUploaded:        globalTotalBytesUploaded,
 		TotalArticlesRetrieved:    0, // Will be calculated from connections if needed
 		TotalArticlesPosted:       0, // Will be calculated from connections if needed  
-		DownloadSpeed:             downloadSpeed,
-		UploadSpeed:               uploadSpeed,
+		DownloadSpeed:             recentDownloadSpeed,     // Use recent speed (current activity)
+		UploadSpeed:               recentUploadSpeed,       // Use recent speed (current activity)
+		HistoricalDownloadSpeed:   historicalDownloadSpeed, // Historical average since pool start
+		HistoricalUploadSpeed:     historicalUploadSpeed,   // Historical average since pool start
+		SpeedCalculationWindow:    m.speedWindowDuration.Seconds(), // Time window used
+		SpeedCacheDuration:        m.getSpeedCacheDuration().Seconds(), // Cache duration
+		SpeedCacheAge:             m.getSpeedCacheAge().Seconds(), // Cache age
 		TotalCommandCount:         globalTotalCommands,
 		TotalCommandErrors:        globalTotalCommandErrors,
 		CommandSuccessRate:        commandSuccessRate,
@@ -448,4 +516,130 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) AggregatedM
 		SuccessRate:          successRate,
 		AverageConnectionAge: averageConnectionAge,
 	}
+}
+
+// calculateRecentSpeeds calculates current upload/download speeds with caching to avoid blocking pool operations
+// This method uses cached values when available to minimize performance impact on the connection pool
+func (m *PoolMetrics) calculateRecentSpeeds(pools []*providerPool) (downloadSpeed, uploadSpeed float64) {
+	now := time.Now()
+	
+	// Check if we have fresh cached values first
+	m.speedCache.mu.RLock()
+	if !m.speedCache.lastCalculated.IsZero() && 
+		now.Sub(m.speedCache.lastCalculated) < m.speedCache.cacheDuration {
+		// Return cached values
+		downloadSpeed = m.speedCache.downloadSpeed
+		uploadSpeed = m.speedCache.uploadSpeed
+		m.speedCache.mu.RUnlock()
+		return downloadSpeed, uploadSpeed
+	}
+	m.speedCache.mu.RUnlock()
+	
+	// Cache is stale or empty, calculate fresh values
+	downloadSpeed, uploadSpeed = m.calculateRecentSpeedsUncached(pools)
+	
+	// Update cache with new values
+	m.speedCache.mu.Lock()
+	m.speedCache.lastCalculated = now
+	m.speedCache.downloadSpeed = downloadSpeed
+	m.speedCache.uploadSpeed = uploadSpeed
+	m.speedCache.mu.Unlock()
+	
+	return downloadSpeed, uploadSpeed
+}
+
+// calculateRecentSpeedsUncached performs the actual speed calculation without caching
+// This method focuses on active connections to minimize pool interference
+func (m *PoolMetrics) calculateRecentSpeedsUncached(pools []*providerPool) (downloadSpeed, uploadSpeed float64) {
+	now := time.Now()
+	windowStart := now.Add(-m.speedWindowDuration)
+	
+	var recentBytesDownloaded, recentBytesUploaded int64
+	var connectionsWithRecentActivity int
+	
+	// Primary strategy: Use active connections (no pool blocking)
+	m.activeConnections.Range(func(key, value interface{}) bool {
+		conn, ok := value.(nntpcli.Connection)
+		if !ok || conn == nil {
+			return true
+		}
+		
+		metrics := conn.GetMetrics()
+		if metrics != nil {
+			// Active connections are by definition recently active
+			snapshot := metrics.GetSnapshot()
+			connectionAge := metrics.GetConnectionAge()
+			
+			if connectionAge <= m.speedWindowDuration {
+				// Connection is newer than window, count all bytes
+				recentBytesDownloaded += snapshot.BytesDownloaded
+				recentBytesUploaded += snapshot.BytesUploaded
+			} else {
+				// For active connections, assume more recent activity
+				windowRatio := float64(m.speedWindowDuration) / float64(connectionAge)
+				// More generous estimation for active connections
+				recentBytesDownloaded += int64(float64(snapshot.BytesDownloaded) * windowRatio * 0.7)
+				recentBytesUploaded += int64(float64(snapshot.BytesUploaded) * windowRatio * 0.7)
+			}
+			connectionsWithRecentActivity++
+		}
+		return true
+	})
+	
+	// Fallback strategy: Sample idle connections non-blockingly if we have few active connections
+	if connectionsWithRecentActivity < 3 && len(pools) > 0 {
+		// Try to get a few idle connections from the first pool only to minimize impact
+		// This is a compromise between accuracy and performance
+		if firstPool := pools[0]; firstPool != nil {
+			idleResources := firstPool.connectionPool.AcquireAllIdle()
+			
+			// Limit sampling to reduce blocking time
+			sampleSize := len(idleResources)
+			if sampleSize > 5 {
+				sampleSize = 5 // Sample at most 5 idle connections
+			}
+			
+			for i := 0; i < sampleSize; i++ {
+				res := idleResources[i]
+				conn := res.Value()
+				if conn.nntp != nil {
+					metrics := conn.nntp.GetMetrics()
+					if metrics != nil {
+						connectionAge := metrics.GetConnectionAge()
+						lastActivityTime := now.Add(-connectionAge)
+						
+						// Only count if connection was active within our window
+						if lastActivityTime.After(windowStart) {
+							snapshot := metrics.GetSnapshot()
+							if connectionAge <= m.speedWindowDuration {
+								// Connection is newer than window, count all bytes
+								recentBytesDownloaded += snapshot.BytesDownloaded
+								recentBytesUploaded += snapshot.BytesUploaded
+							} else {
+								// Conservative estimate for idle connections
+								windowRatio := float64(m.speedWindowDuration) / float64(connectionAge)
+								recentBytesDownloaded += int64(float64(snapshot.BytesDownloaded) * windowRatio * 0.2)
+								recentBytesUploaded += int64(float64(snapshot.BytesUploaded) * windowRatio * 0.2)
+							}
+							connectionsWithRecentActivity++
+						}
+					}
+				}
+			}
+			
+			// Release all idle connections back to the pool immediately
+			for _, res := range idleResources {
+				res.ReleaseUnused()
+			}
+		}
+	}
+	
+	// Calculate speeds based on recent activity
+	windowSeconds := m.speedWindowDuration.Seconds()
+	if windowSeconds > 0 && connectionsWithRecentActivity > 0 {
+		downloadSpeed = float64(recentBytesDownloaded) / windowSeconds
+		uploadSpeed = float64(recentBytesUploaded) / windowSeconds
+	}
+	
+	return downloadSpeed, uploadSpeed
 }

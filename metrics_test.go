@@ -183,12 +183,218 @@ func TestPoolMetrics_SnapshotCalculations(t *testing.T) {
 	snapshot := metrics.GetSnapshot(nil)
 
 	// Verify calculated fields
-	assert.Equal(t, float64(0), snapshot.DownloadSpeed)        // No connection data = 0
-	assert.Equal(t, float64(0), snapshot.UploadSpeed)          // No connection data = 0
-	assert.Equal(t, float64(0), snapshot.CommandSuccessRate)   // No connection data = 0
-	assert.Equal(t, float64(100), snapshot.ErrorRate)          // 1 error out of 1 acquire = 100%
-	assert.Equal(t, int64(0), snapshot.TotalBytesDownloaded)   // No connection data = 0
-	assert.Equal(t, int64(0), snapshot.TotalBytesUploaded)     // No connection data = 0
+	assert.Equal(t, float64(0), snapshot.DownloadSpeed)            // No connection data = 0
+	assert.Equal(t, float64(0), snapshot.UploadSpeed)              // No connection data = 0
+	assert.Equal(t, float64(0), snapshot.HistoricalDownloadSpeed)  // No connection data = 0
+	assert.Equal(t, float64(0), snapshot.HistoricalUploadSpeed)    // No connection data = 0
+	assert.Equal(t, float64(0), snapshot.CommandSuccessRate)       // No connection data = 0
+	assert.Equal(t, float64(100), snapshot.ErrorRate)              // 1 error out of 1 acquire = 100%
+	assert.Equal(t, int64(0), snapshot.TotalBytesDownloaded)       // No connection data = 0
+	assert.Equal(t, int64(0), snapshot.TotalBytesUploaded)         // No connection data = 0
+	assert.Equal(t, 60.0, snapshot.SpeedCalculationWindow)         // Default 60 second window
+}
+
+func TestPoolMetrics_SpeedCalculationWindow(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Test default window
+	assert.Equal(t, 60*time.Second, metrics.speedWindowDuration)
+	
+	// Test setting custom window
+	metrics.SetSpeedWindowDuration(30 * time.Second)
+	assert.Equal(t, 30*time.Second, metrics.speedWindowDuration)
+	
+	// Test invalid duration defaults to 60 seconds
+	metrics.SetSpeedWindowDuration(-5 * time.Second)
+	assert.Equal(t, 60*time.Second, metrics.speedWindowDuration)
+	
+	metrics.SetSpeedWindowDuration(0)
+	assert.Equal(t, 60*time.Second, metrics.speedWindowDuration)
+}
+
+func TestPoolMetrics_RecentSpeedCalculation(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Set a short window for testing
+	metrics.SetSpeedWindowDuration(5 * time.Second)
+	
+	// Test with no pools - should return 0 speed
+	downloadSpeed, uploadSpeed := metrics.calculateRecentSpeeds(nil)
+	assert.Equal(t, float64(0), downloadSpeed)
+	assert.Equal(t, float64(0), uploadSpeed)
+	
+	// Test with empty pools slice
+	emptyPools := []*providerPool{}
+	downloadSpeed, uploadSpeed = metrics.calculateRecentSpeeds(emptyPools)
+	assert.Equal(t, float64(0), downloadSpeed)
+	assert.Equal(t, float64(0), uploadSpeed)
+}
+
+func TestPoolMetrics_SnapshotSpeedFields(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Set a custom window duration
+	metrics.SetSpeedWindowDuration(30 * time.Second)
+	
+	// Wait a bit for measurable uptime
+	time.Sleep(10 * time.Millisecond)
+	
+	snapshot := metrics.GetSnapshot(nil)
+	
+	// Verify new speed fields are present and correct
+	assert.Equal(t, float64(0), snapshot.DownloadSpeed)              // Recent speed
+	assert.Equal(t, float64(0), snapshot.UploadSpeed)                // Recent speed  
+	assert.Equal(t, float64(0), snapshot.HistoricalDownloadSpeed)    // Historical average
+	assert.Equal(t, float64(0), snapshot.HistoricalUploadSpeed)      // Historical average
+	assert.Equal(t, 30.0, snapshot.SpeedCalculationWindow)           // Custom window duration
+	
+	// Verify timestamp and uptime are still working
+	assert.True(t, snapshot.Timestamp.After(time.Now().Add(-1*time.Second)))
+	assert.True(t, snapshot.Uptime > 10*time.Millisecond)
+	assert.True(t, snapshot.Uptime < 1*time.Second)
+}
+
+func TestPoolMetrics_SpeedFieldsInSnapshot(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Add some pool-level activity to ensure uptime calculation works
+	metrics.RecordAcquire()
+	metrics.RecordConnectionCreated()
+	
+	// Wait to ensure measurable uptime
+	time.Sleep(20 * time.Millisecond)
+	
+	snapshot := metrics.GetSnapshot(nil)
+	
+	// Should have both recent and historical speeds (both 0 with no connections)
+	assert.Equal(t, float64(0), snapshot.DownloadSpeed)
+	assert.Equal(t, float64(0), snapshot.UploadSpeed) 
+	assert.Equal(t, float64(0), snapshot.HistoricalDownloadSpeed)
+	assert.Equal(t, float64(0), snapshot.HistoricalUploadSpeed)
+	
+	// Should have speed calculation window and cache info
+	assert.Equal(t, 60.0, snapshot.SpeedCalculationWindow)
+	assert.Equal(t, 5.0, snapshot.SpeedCacheDuration)              // Default 5 second cache
+	assert.True(t, snapshot.SpeedCacheAge >= 0)                    // Cache age should be non-negative
+	
+	// Other metrics should still work
+	assert.Equal(t, int64(1), snapshot.TotalAcquires)
+	assert.Equal(t, int64(1), snapshot.TotalConnectionsCreated)
+	assert.True(t, snapshot.Uptime > 20*time.Millisecond)
+}
+
+func TestPoolMetrics_CachedSpeedCalculation(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Set short cache duration for testing
+	metrics.SetSpeedCacheDuration(100 * time.Millisecond)
+	
+	// First call should calculate and cache
+	downloadSpeed1, uploadSpeed1 := metrics.calculateRecentSpeeds(nil)
+	assert.Equal(t, float64(0), downloadSpeed1)
+	assert.Equal(t, float64(0), uploadSpeed1)
+	
+	// Second call immediately after should return cached values
+	start := time.Now()
+	downloadSpeed2, uploadSpeed2 := metrics.calculateRecentSpeeds(nil)
+	elapsed := time.Since(start)
+	
+	assert.Equal(t, downloadSpeed1, downloadSpeed2)
+	assert.Equal(t, uploadSpeed1, uploadSpeed2)
+	assert.True(t, elapsed < 50*time.Microsecond) // Should be very fast (cached)
+	
+	// Wait for cache to expire
+	time.Sleep(150 * time.Millisecond)
+	
+	// Third call should recalculate
+	downloadSpeed3, uploadSpeed3 := metrics.calculateRecentSpeeds(nil)
+	assert.Equal(t, float64(0), downloadSpeed3) // Still 0 with no connections
+	assert.Equal(t, float64(0), uploadSpeed3)
+}
+
+func TestPoolMetrics_SpeedCacheConfiguration(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Test default cache duration
+	assert.Equal(t, 5*time.Second, metrics.getSpeedCacheDuration())
+	
+	// Test setting cache duration
+	metrics.SetSpeedCacheDuration(10 * time.Second)
+	assert.Equal(t, 10*time.Second, metrics.getSpeedCacheDuration())
+	
+	// Test invalid duration defaults to 5 seconds
+	metrics.SetSpeedCacheDuration(-1 * time.Second)
+	assert.Equal(t, 5*time.Second, metrics.getSpeedCacheDuration())
+	
+	metrics.SetSpeedCacheDuration(0)
+	assert.Equal(t, 5*time.Second, metrics.getSpeedCacheDuration())
+}
+
+func TestPoolMetrics_SpeedCacheAge(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Initially no cache, age should be 0
+	assert.Equal(t, time.Duration(0), metrics.getSpeedCacheAge())
+	
+	// After first calculation, should have some age
+	metrics.calculateRecentSpeeds(nil)
+	age1 := metrics.getSpeedCacheAge()
+	assert.True(t, age1 >= 0)
+	assert.True(t, age1 < 10*time.Millisecond)
+	
+	// Wait a bit and check age increased
+	time.Sleep(10 * time.Millisecond)
+	age2 := metrics.getSpeedCacheAge()
+	assert.True(t, age2 > age1)
+	assert.True(t, age2 >= 10*time.Millisecond)
+}
+
+func TestPoolMetrics_SnapshotCacheFields(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Set custom cache duration
+	metrics.SetSpeedCacheDuration(3 * time.Second)
+	
+	// Get snapshot (this will trigger speed calculation)
+	snapshot := metrics.GetSnapshot(nil)
+	
+	// Verify cache fields are populated
+	assert.Equal(t, 3.0, snapshot.SpeedCacheDuration)
+	assert.True(t, snapshot.SpeedCacheAge >= 0)
+	assert.True(t, snapshot.SpeedCacheAge < 1.0) // Should be very recent
+	
+	// Wait a bit and get another snapshot
+	time.Sleep(50 * time.Millisecond)
+	snapshot2 := metrics.GetSnapshot(nil)
+	
+	// Cache age should have increased (cached values used)
+	assert.True(t, snapshot2.SpeedCacheAge > snapshot.SpeedCacheAge)
+	assert.True(t, snapshot2.SpeedCacheAge >= 0.05) // At least 50ms old
+}
+
+func TestPoolMetrics_NonBlockingSpeedCalculation(t *testing.T) {
+	metrics := NewPoolMetrics()
+	
+	// Test that speed calculation doesn't panic with nil pools
+	downloadSpeed, uploadSpeed := metrics.calculateRecentSpeeds(nil)
+	assert.Equal(t, float64(0), downloadSpeed)
+	assert.Equal(t, float64(0), uploadSpeed)
+	
+	// Test with empty pool slice
+	emptyPools := []*providerPool{}
+	downloadSpeed, uploadSpeed = metrics.calculateRecentSpeeds(emptyPools)
+	assert.Equal(t, float64(0), downloadSpeed)
+	assert.Equal(t, float64(0), uploadSpeed)
+	
+	// Test performance - should be fast even when called repeatedly
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		metrics.calculateRecentSpeeds(nil)
+	}
+	elapsed := time.Since(start)
+	
+	// Should be very fast due to caching
+	assert.True(t, elapsed < 10*time.Millisecond, "100 cached calls took %v", elapsed)
 }
 
 // Benchmark tests to ensure minimal performance overhead
@@ -415,5 +621,45 @@ func BenchmarkPoolMetrics_GetActiveConnectionMetrics(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = metrics.GetActiveConnectionMetrics()
+	}
+}
+
+func BenchmarkPoolMetrics_CalculateRecentSpeeds(b *testing.B) {
+	metrics := NewPoolMetrics()
+	
+	// Test with empty pools (cached performance)
+	emptyPools := []*providerPool{}
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = metrics.calculateRecentSpeeds(emptyPools)
+	}
+}
+
+func BenchmarkPoolMetrics_CalculateRecentSpeedsUncached(b *testing.B) {
+	metrics := NewPoolMetrics()
+	
+	// Set cache duration to 0 to force recalculation every time
+	metrics.SetSpeedCacheDuration(1 * time.Nanosecond)
+	
+	// Test with empty pools (uncached performance)
+	emptyPools := []*providerPool{}
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = metrics.calculateRecentSpeeds(emptyPools)
+	}
+}
+
+func BenchmarkPoolMetrics_GetSnapshotWithSpeedCalculation(b *testing.B) {
+	metrics := NewPoolMetrics()
+	
+	// Add some basic metrics to ensure snapshot calculation works
+	metrics.RecordConnectionCreated()
+	metrics.RecordAcquire()
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = metrics.GetSnapshot(nil)
 	}
 }
