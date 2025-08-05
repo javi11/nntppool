@@ -2,6 +2,7 @@ package nntppool
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -17,6 +18,9 @@ func TestProviderStateString(t *testing.T) {
 		{ProviderStateDraining, "draining"},
 		{ProviderStateMigrating, "migrating"},
 		{ProviderStateRemoving, "removing"},
+		{ProviderStateOffline, "offline"},
+		{ProviderStateReconnecting, "reconnecting"},
+		{ProviderStateAuthenticationFailed, "authentication_failed"},
 		{ProviderState(999), "unknown"},
 	}
 
@@ -69,6 +73,22 @@ func TestProviderPoolStateManagement(t *testing.T) {
 	pool.SetState(ProviderStateRemoving)
 	if pool.IsAcceptingConnections() {
 		t.Error("removing provider should not accept connections")
+	}
+
+	// Test new offline states
+	pool.SetState(ProviderStateOffline)
+	if pool.IsAcceptingConnections() {
+		t.Error("offline provider should not accept connections")
+	}
+
+	pool.SetState(ProviderStateReconnecting)
+	if pool.IsAcceptingConnections() {
+		t.Error("reconnecting provider should not accept connections")
+	}
+
+	pool.SetState(ProviderStateAuthenticationFailed)
+	if pool.IsAcceptingConnections() {
+		t.Error("authentication failed provider should not accept connections")
 	}
 }
 
@@ -285,4 +305,150 @@ func TestProviderPoolIntegration(t *testing.T) {
 
 	// Clean up
 	puddlePool.Close()
+}
+
+// Test new provider connection tracking methods
+func TestProviderConnectionTracking(t *testing.T) {
+	provider := UsenetProviderConfig{
+		Host:           "test.example.com",
+		Username:       "testuser",
+		MaxConnections: 5,
+	}
+
+	pool := &providerPool{
+		provider: provider,
+		state:    ProviderStateActive,
+	}
+
+	// Test initial state
+	lastAttempt, lastSuccess, nextRetry, reason, retries := pool.GetConnectionStatus()
+	if !lastAttempt.IsZero() {
+		t.Error("initial last attempt should be zero")
+	}
+	if !lastSuccess.IsZero() {
+		t.Error("initial last success should be zero")
+	}
+	if !nextRetry.IsZero() {
+		t.Error("initial next retry should be zero")
+	}
+	if reason != "" {
+		t.Error("initial failure reason should be empty")
+	}
+	if retries != 0 {
+		t.Error("initial retry count should be 0")
+	}
+
+	// Test successful connection
+	pool.SetConnectionAttempt(nil)
+	lastAttempt, lastSuccess, _, reason, retries = pool.GetConnectionStatus()
+	if lastAttempt.IsZero() {
+		t.Error("last attempt should be set after successful connection")
+	}
+	if lastSuccess.IsZero() {
+		t.Error("last success should be set after successful connection")
+	}
+	if reason != "" {
+		t.Error("failure reason should be empty after successful connection")
+	}
+	if retries != 0 {
+		t.Error("retry count should be 0 after successful connection")
+	}
+
+	// Test failed connection
+	testErr := errors.New("test connection failure")
+	pool.SetConnectionAttempt(testErr)
+	_, _, _, reason, retries = pool.GetConnectionStatus()
+	if reason != testErr.Error() {
+		t.Errorf("expected failure reason %q, got %q", testErr.Error(), reason)
+	}
+	if retries != 1 {
+		t.Errorf("expected retry count 1, got %d", retries)
+	}
+}
+
+func TestProviderCanRetryLogic(t *testing.T) {
+	provider := UsenetProviderConfig{
+		Host:           "test.example.com",
+		Username:       "testuser",
+		MaxConnections: 5,
+	}
+
+	pool := &providerPool{
+		provider: provider,
+		state:    ProviderStateActive,
+	}
+
+	// Test states that can retry
+	retryableStates := []ProviderState{
+		ProviderStateActive,
+		ProviderStateOffline,
+		ProviderStateReconnecting,
+		ProviderStateDraining,
+		ProviderStateMigrating,
+		ProviderStateRemoving,
+	}
+
+	for _, state := range retryableStates {
+		pool.SetState(state)
+		if !pool.CanRetry() {
+			t.Errorf("state %s should allow retry", state)
+		}
+	}
+
+	// Test state that cannot retry
+	pool.SetState(ProviderStateAuthenticationFailed)
+	if pool.CanRetry() {
+		t.Error("authentication failed state should not allow retry")
+	}
+}
+
+func TestProviderShouldRetryNowLogic(t *testing.T) {
+	provider := UsenetProviderConfig{
+		Host:           "test.example.com",
+		Username:       "testuser",
+		MaxConnections: 5,
+	}
+
+	pool := &providerPool{
+		provider: provider,
+		state:    ProviderStateOffline,
+	}
+
+	// Should retry when no next retry time is set
+	if !pool.ShouldRetryNow() {
+		t.Error("should retry when no next retry time is set")
+	}
+
+	// Should not retry when next retry time is in the future
+	pool.SetNextRetryAt(time.Now().Add(1 * time.Hour))
+	if pool.ShouldRetryNow() {
+		t.Error("should not retry when next retry time is in the future")
+	}
+
+	// Should retry when next retry time is in the past
+	pool.SetNextRetryAt(time.Now().Add(-1 * time.Hour))
+	if !pool.ShouldRetryNow() {
+		t.Error("should retry when next retry time is in the past")
+	}
+}
+
+func TestProviderSetNextRetryAt(t *testing.T) {
+	provider := UsenetProviderConfig{
+		Host:           "test.example.com",
+		Username:       "testuser",
+		MaxConnections: 5,
+	}
+
+	pool := &providerPool{
+		provider: provider,
+		state:    ProviderStateOffline,
+	}
+
+	testTime := time.Now().Add(30 * time.Minute)
+	pool.SetNextRetryAt(testTime)
+
+	_, _, nextRetry, _, _ := pool.GetConnectionStatus()
+	if !nextRetry.Equal(testTime) {
+		t.Errorf("expected next retry time %v, got %v", testTime, nextRetry)
+	}
 }

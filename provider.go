@@ -12,10 +12,13 @@ import (
 type ProviderState int
 
 const (
-	ProviderStateActive   ProviderState = iota // Normal operation
-	ProviderStateDraining                      // Accepting no new connections, existing connections finishing
-	ProviderStateMigrating                     // In process of updating configuration
-	ProviderStateRemoving                      // Being removed from pool
+	ProviderStateActive               ProviderState = iota // Normal operation
+	ProviderStateDraining                                  // Accepting no new connections, existing connections finishing
+	ProviderStateMigrating                                 // In process of updating configuration
+	ProviderStateRemoving                                  // Being removed from pool
+	ProviderStateOffline                                   // Provider is offline/unreachable
+	ProviderStateReconnecting                              // Currently attempting to reconnect
+	ProviderStateAuthenticationFailed                      // Authentication failed, won't retry
 )
 
 func (ps ProviderState) String() string {
@@ -28,6 +31,12 @@ func (ps ProviderState) String() string {
 		return "migrating"
 	case ProviderStateRemoving:
 		return "removing"
+	case ProviderStateOffline:
+		return "offline"
+	case ProviderStateReconnecting:
+		return "reconnecting"
+	case ProviderStateAuthenticationFailed:
+		return "authentication_failed"
 	default:
 		return "unknown"
 	}
@@ -51,6 +60,12 @@ type ProviderInfo struct {
 	UsedConnections          int           `json:"usedConnections"`
 	MaxConnections           int           `json:"maxConnections"`
 	MaxConnectionIdleTimeout time.Duration `json:"maxConnectionIdleTimeout"`
+	State                    ProviderState `json:"state"`
+	LastConnectionAttempt    time.Time     `json:"lastConnectionAttempt"`
+	LastSuccessfulConnect    time.Time     `json:"lastSuccessfulConnect"`
+	FailureReason            string        `json:"failureReason"`
+	RetryCount               int           `json:"retryCount"`
+	NextRetryAt              time.Time     `json:"nextRetryAt"`
 }
 
 func (p ProviderInfo) ID() string {
@@ -58,12 +73,17 @@ func (p ProviderInfo) ID() string {
 }
 
 type providerPool struct {
-	connectionPool *puddle.Pool[*internalConnection]
-	provider       UsenetProviderConfig
-	state          ProviderState
-	stateMu        sync.RWMutex  // Protects state changes
-	drainStarted   time.Time     // When draining started
-	migrationID    string        // ID for tracking migration operations
+	connectionPool        *puddle.Pool[*internalConnection]
+	provider              UsenetProviderConfig
+	state                 ProviderState
+	stateMu               sync.RWMutex // Protects state changes
+	drainStarted          time.Time    // When draining started
+	migrationID           string       // ID for tracking migration operations
+	lastConnectionAttempt time.Time    // Last time connection was attempted
+	lastSuccessfulConnect time.Time    // Last successful connection
+	failureReason         string       // Reason for last failure
+	retryCount            int          // Number of retry attempts
+	nextRetryAt           time.Time    // When next retry should happen
 }
 
 func providerID(host, username string) string {
@@ -94,10 +114,10 @@ func (pp *providerPool) GetState() ProviderState {
 func (pp *providerPool) SetState(state ProviderState) {
 	pp.stateMu.Lock()
 	defer pp.stateMu.Unlock()
-	
+
 	oldState := pp.state
 	pp.state = state
-	
+
 	// Track drain start time
 	if state == ProviderStateDraining && oldState != ProviderStateDraining {
 		pp.drainStarted = time.Now()
@@ -112,7 +132,7 @@ func (pp *providerPool) IsAcceptingConnections() bool {
 func (pp *providerPool) GetDrainDuration() time.Duration {
 	pp.stateMu.RLock()
 	defer pp.stateMu.RUnlock()
-	
+
 	if pp.state != ProviderStateDraining || pp.drainStarted.IsZero() {
 		return 0
 	}
@@ -129,4 +149,47 @@ func (pp *providerPool) GetMigrationID() string {
 	pp.stateMu.RLock()
 	defer pp.stateMu.RUnlock()
 	return pp.migrationID
+}
+
+// SetConnectionAttempt records a connection attempt
+func (pp *providerPool) SetConnectionAttempt(err error) {
+	pp.stateMu.Lock()
+	defer pp.stateMu.Unlock()
+
+	pp.lastConnectionAttempt = time.Now()
+	if err != nil {
+		pp.failureReason = err.Error()
+		pp.retryCount++
+	} else {
+		pp.lastSuccessfulConnect = time.Now()
+		pp.failureReason = ""
+		pp.retryCount = 0
+	}
+}
+
+// SetNextRetryAt sets when the next retry should happen
+func (pp *providerPool) SetNextRetryAt(retryAt time.Time) {
+	pp.stateMu.Lock()
+	defer pp.stateMu.Unlock()
+	pp.nextRetryAt = retryAt
+}
+
+// GetConnectionStatus returns connectivity status information
+func (pp *providerPool) GetConnectionStatus() (lastAttempt, lastSuccess, nextRetry time.Time, reason string, retries int) {
+	pp.stateMu.RLock()
+	defer pp.stateMu.RUnlock()
+	return pp.lastConnectionAttempt, pp.lastSuccessfulConnect, pp.nextRetryAt, pp.failureReason, pp.retryCount
+}
+
+// CanRetry returns true if the provider can be retried (not authentication failed)
+func (pp *providerPool) CanRetry() bool {
+	state := pp.GetState()
+	return state != ProviderStateAuthenticationFailed
+}
+
+// ShouldRetryNow returns true if enough time has passed for a retry
+func (pp *providerPool) ShouldRetryNow() bool {
+	pp.stateMu.RLock()
+	defer pp.stateMu.RUnlock()
+	return time.Now().After(pp.nextRetryAt)
 }

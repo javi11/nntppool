@@ -7,7 +7,7 @@ import (
 
 // Budget manages connection limits per provider to prevent exceeding NNTP server quotas
 type Budget struct {
-	mu            sync.RWMutex
+	mu             sync.RWMutex
 	providerLimits map[string]int // providerID -> max connections
 	providerUsage  map[string]int // providerID -> current connections
 }
@@ -24,9 +24,9 @@ func New() *Budget {
 func (cb *Budget) SetProviderLimit(providerID string, maxConnections int) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	
+
 	cb.providerLimits[providerID] = maxConnections
-	
+
 	// Initialize usage if not exists
 	if _, exists := cb.providerUsage[providerID]; !exists {
 		cb.providerUsage[providerID] = 0
@@ -37,12 +37,12 @@ func (cb *Budget) SetProviderLimit(providerID string, maxConnections int) {
 func (cb *Budget) CanAcquireConnection(providerID string) bool {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	
+
 	limit, hasLimit := cb.providerLimits[providerID]
 	if !hasLimit {
 		return false // No limit set, can't acquire
 	}
-	
+
 	usage := cb.providerUsage[providerID]
 	return usage < limit
 }
@@ -51,17 +51,17 @@ func (cb *Budget) CanAcquireConnection(providerID string) bool {
 func (cb *Budget) AcquireConnection(providerID string) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	
+
 	limit, hasLimit := cb.providerLimits[providerID]
 	if !hasLimit {
 		return fmt.Errorf("no connection limit set for provider %s", providerID)
 	}
-	
+
 	usage := cb.providerUsage[providerID]
 	if usage >= limit {
 		return fmt.Errorf("connection limit exceeded for provider %s (%d/%d)", providerID, usage, limit)
 	}
-	
+
 	cb.providerUsage[providerID]++
 	return nil
 }
@@ -70,7 +70,7 @@ func (cb *Budget) AcquireConnection(providerID string) error {
 func (cb *Budget) ReleaseConnection(providerID string) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	
+
 	if usage := cb.providerUsage[providerID]; usage > 0 {
 		cb.providerUsage[providerID]--
 	}
@@ -80,12 +80,12 @@ func (cb *Budget) ReleaseConnection(providerID string) {
 func (cb *Budget) GetProviderUsage(providerID string) (current, limit int, exists bool) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	
+
 	limit, hasLimit := cb.providerLimits[providerID]
 	if !hasLimit {
 		return 0, 0, false
 	}
-	
+
 	current = cb.providerUsage[providerID]
 	return current, limit, true
 }
@@ -94,12 +94,12 @@ func (cb *Budget) GetProviderUsage(providerID string) (current, limit int, exist
 func (cb *Budget) GetAvailableSlots(providerID string) int {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	
+
 	limit, hasLimit := cb.providerLimits[providerID]
 	if !hasLimit {
 		return 0
 	}
-	
+
 	usage := cb.providerUsage[providerID]
 	available := limit - usage
 	if available < 0 {
@@ -112,12 +112,12 @@ func (cb *Budget) GetAvailableSlots(providerID string) int {
 func (cb *Budget) GetTotalBudget() (totalUsed, totalLimit int) {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	
+
 	for providerID, limit := range cb.providerLimits {
 		totalLimit += limit
 		totalUsed += cb.providerUsage[providerID]
 	}
-	
+
 	return totalUsed, totalLimit
 }
 
@@ -125,7 +125,7 @@ func (cb *Budget) GetTotalBudget() (totalUsed, totalLimit int) {
 func (cb *Budget) RemoveProvider(providerID string) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	
+
 	delete(cb.providerLimits, providerID)
 	delete(cb.providerUsage, providerID)
 }
@@ -135,21 +135,21 @@ func (cb *Budget) RemoveProvider(providerID string) {
 func (cb *Budget) CanMigrateConnection(providerID string) bool {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	
+
 	limit, hasLimit := cb.providerLimits[providerID]
 	if !hasLimit {
 		return false
 	}
-	
+
 	usage := cb.providerUsage[providerID]
-	
+
 	// During migration, we might need extra slots temporarily
 	// Reserve at least 1 slot for migration if possible
 	migrationBuffer := 1
 	if limit <= migrationBuffer {
 		migrationBuffer = 0
 	}
-	
+
 	return usage < (limit - migrationBuffer)
 }
 
@@ -166,16 +166,16 @@ type Stats struct {
 func (cb *Budget) GetProviderStats() map[string]Stats {
 	cb.mu.RLock()
 	defer cb.mu.RUnlock()
-	
+
 	stats := make(map[string]Stats)
-	
+
 	for providerID, limit := range cb.providerLimits {
 		usage := cb.providerUsage[providerID]
 		available := limit - usage
 		if available < 0 {
 			available = 0
 		}
-		
+
 		stats[providerID] = Stats{
 			ProviderID:         providerID,
 			CurrentConnections: usage,
@@ -184,6 +184,6 @@ func (cb *Budget) GetProviderStats() map[string]Stats {
 			UtilizationPercent: float64(usage) / float64(limit) * 100,
 		}
 	}
-	
+
 	return stats
 }

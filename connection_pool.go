@@ -101,6 +101,7 @@ type UsenetConnectionPool interface {
 	Post(ctx context.Context, r io.Reader) error
 	Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error)
 	GetProvidersInfo() []ProviderInfo
+	GetProviderStatus(providerID string) (*ProviderInfo, bool)
 	Reconfigure(...Config) error
 	GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool)
 	GetActiveReconfigurations() map[string]*ReconfigurationStatus
@@ -126,7 +127,7 @@ type connectionPool struct {
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 	config := mergeWithDefault(c...)
 	log := config.Logger
-	
+
 	// Create metrics early so we can pass it to pool creation
 	metrics := NewPoolMetrics()
 
@@ -135,17 +136,15 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 		return nil, err
 	}
 
-	if !config.SkipProvidersVerificationOnCreation {
-		log.Info("verifying providers...")
+	log.Info("verifying providers...")
 
-		if err := verifyProviders(pools, log); err != nil {
-			log.Error(fmt.Sprintf("failed to verify providers: %v", err))
+	if err := verifyProviders(pools, log); err != nil {
+		log.Error(fmt.Sprintf("failed to verify providers: %v", err))
 
-			return nil, err
-		}
-
-		log.Info("providers verified")
+		return nil, err
 	}
+
+	log.Info("providers verified")
 
 	// Initialize connection budget
 	budgetManager := budget.New()
@@ -175,6 +174,10 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 	pool.wg.Add(1)
 	go pool.connectionHealCheck(healthCheckInterval)
 
+	// Start provider reconnection system
+	pool.wg.Add(1)
+	go pool.providerReconnectionSystem()
+
 	return pool, nil
 }
 
@@ -182,10 +185,7 @@ func (p *connectionPool) Quit() {
 	p.shutdownOnce.Do(func() {
 		atomic.StoreInt32(&p.isShutdown, 1)
 
-		p.shutdownMu.Lock()
-		defer p.shutdownMu.Unlock()
-
-		// Signal shutdown to health checker
+		// Signal shutdown to health checker and reconnection system FIRST
 		select {
 		case p.closeChan <- struct{}{}:
 		default:
@@ -193,7 +193,7 @@ func (p *connectionPool) Quit() {
 		}
 		close(p.closeChan)
 
-		// Wait for health checker to finish with timeout
+		// Wait for background goroutines to finish with timeout
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -206,6 +206,10 @@ func (p *connectionPool) Quit() {
 		case <-time.After(p.config.ShutdownTimeout):
 			p.log.Warn("Shutdown timeout exceeded, forcing close")
 		}
+
+		// Now acquire the lock to do cleanup
+		p.shutdownMu.Lock()
+		defer p.shutdownMu.Unlock()
 
 		// Shutdown migration manager first to cancel any ongoing migrations
 		if p.migrationManager != nil {
@@ -288,16 +292,62 @@ func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
 	pi := make([]ProviderInfo, 0)
 
 	for _, pool := range p.connPools {
+		lastAttempt, lastSuccess, nextRetry, reason, retries := pool.GetConnectionStatus()
+
 		pi = append(pi, ProviderInfo{
 			Host:                     pool.provider.Host,
 			Username:                 pool.provider.Username,
 			MaxConnections:           pool.provider.MaxConnections,
 			UsedConnections:          int(pool.connectionPool.Stat().TotalResources()),
 			MaxConnectionIdleTimeout: time.Duration(pool.provider.MaxConnectionIdleTimeInSeconds) * time.Second,
+			State:                    pool.GetState(),
+			LastConnectionAttempt:    lastAttempt,
+			LastSuccessfulConnect:    lastSuccess,
+			FailureReason:            reason,
+			RetryCount:               retries,
+			NextRetryAt:              nextRetry,
 		})
 	}
 
 	return pi
+}
+
+// GetProviderStatus returns detailed status for a specific provider
+func (p *connectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bool) {
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		return nil, false
+	}
+
+	p.shutdownMu.RLock()
+	defer p.shutdownMu.RUnlock()
+
+	if p.connPools == nil {
+		return nil, false
+	}
+
+	for _, pool := range p.connPools {
+		if pool.provider.ID() == providerID {
+			lastAttempt, lastSuccess, nextRetry, reason, retries := pool.GetConnectionStatus()
+
+			providerInfo := &ProviderInfo{
+				Host:                     pool.provider.Host,
+				Username:                 pool.provider.Username,
+				MaxConnections:           pool.provider.MaxConnections,
+				UsedConnections:          int(pool.connectionPool.Stat().TotalResources()),
+				MaxConnectionIdleTimeout: time.Duration(pool.provider.MaxConnectionIdleTimeInSeconds) * time.Second,
+				State:                    pool.GetState(),
+				LastConnectionAttempt:    lastAttempt,
+				LastSuccessfulConnect:    lastSuccess,
+				FailureReason:            reason,
+				RetryCount:               retries,
+				NextRetryAt:              nextRetry,
+			}
+
+			return providerInfo, true
+		}
+	}
+
+	return nil, false
 }
 
 func (p *connectionPool) Reconfigure(c ...Config) error {
@@ -335,8 +385,10 @@ func (p *connectionPool) Reconfigure(c ...Config) error {
 		return fmt.Errorf("failed to start migration: %w", err)
 	}
 
-	// Update pool configuration
+	// Update pool configuration with proper synchronization
+	p.shutdownMu.Lock()
 	p.config = newConfig
+	p.shutdownMu.Unlock()
 
 	p.log.Info("incremental migration started", "migration_id", diff.MigrationID)
 	return nil
@@ -1077,4 +1129,169 @@ func (p *connectionPool) checkMinConns(ctx context.Context) error {
 
 func (p *connectionPool) isExpired(res *puddle.Resource[*internalConnection]) bool {
 	return time.Now().After(res.Value().nntp.MaxAgeTime())
+}
+
+// providerReconnectionSystem runs indefinitely trying to reconnect failed providers
+func (p *connectionPool) providerReconnectionSystem() {
+	// Read the interval with proper synchronization
+	p.shutdownMu.RLock()
+	interval := p.config.ProviderReconnectInterval
+	p.shutdownMu.RUnlock()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	defer p.wg.Done()
+
+	// Create a context that can be cancelled for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for {
+		select {
+		case <-p.closeChan:
+			cancel()
+			return
+		case <-ticker.C:
+			p.attemptProviderReconnections(ctx)
+		}
+	}
+}
+
+// attemptProviderReconnections tries to reconnect offline providers
+func (p *connectionPool) attemptProviderReconnections(ctx context.Context) {
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		return
+	}
+
+	p.shutdownMu.RLock()
+	defer p.shutdownMu.RUnlock()
+
+	if p.connPools == nil {
+		return
+	}
+
+	for _, pool := range p.connPools {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.closeChan:
+			return
+		default:
+		}
+
+		state := pool.GetState()
+
+		// Skip providers that are active or authentication failed
+		if state == ProviderStateActive || state == ProviderStateAuthenticationFailed {
+			continue
+		}
+
+		// Check if it's time to retry
+		if !pool.ShouldRetryNow() {
+			continue
+		}
+
+		// Skip if provider can't be retried (authentication failed)
+		if !pool.CanRetry() {
+			continue
+		}
+
+		// Try to reconnect
+		p.attemptProviderReconnection(ctx, pool)
+	}
+}
+
+// attemptProviderReconnection tries to reconnect a single provider
+func (p *connectionPool) attemptProviderReconnection(ctx context.Context, pool *providerPool) {
+	// Set state to reconnecting
+	pool.SetState(ProviderStateReconnecting)
+
+	p.log.Debug(fmt.Sprintf("attempting to reconnect provider %s", pool.provider.Host))
+
+	// Create a timeout context for this reconnection attempt
+	reconCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Try to acquire a connection to test connectivity
+	c, err := pool.connectionPool.Acquire(reconCtx)
+	if err != nil {
+		p.handleReconnectionFailure(pool, err)
+		return
+	}
+
+	defer c.Release()
+
+	// Test the connection by getting capabilities
+	conn := c.Value()
+	caps, err := conn.nntp.Capabilities()
+	if err != nil {
+		p.handleReconnectionFailure(pool, err)
+		return
+	}
+
+	// Verify capabilities if needed
+	if len(pool.provider.VerifyCapabilities) > 0 {
+		for _, cap := range pool.provider.VerifyCapabilities {
+			if !slices.Contains(caps, cap) {
+				err := fmt.Errorf("provider %s does not support capability %s", pool.provider.Host, cap)
+				p.handleReconnectionFailure(pool, err)
+				return
+			}
+		}
+	}
+
+	// Success! Mark as active and record the successful connection
+	// We preserve the retry count to show how many attempts were made
+	pool.stateMu.Lock()
+	pool.lastConnectionAttempt = time.Now()
+	pool.lastSuccessfulConnect = time.Now()
+	pool.failureReason = ""
+	// Don't reset retryCount here - preserve it to show reconnection attempts
+	retryCount := pool.retryCount
+	pool.stateMu.Unlock()
+
+	pool.SetState(ProviderStateActive)
+
+	p.log.Info(fmt.Sprintf("successfully reconnected to provider %s after %d attempts", pool.provider.Host, retryCount))
+}
+
+// handleReconnectionFailure handles failed reconnection attempts
+func (p *connectionPool) handleReconnectionFailure(pool *providerPool, err error) {
+	// Check if this is an authentication error
+	if isAuthenticationError(err) {
+		pool.SetState(ProviderStateAuthenticationFailed)
+		pool.SetConnectionAttempt(err)
+		p.log.Error(fmt.Sprintf("authentication failed for provider %s, stopping reconnection attempts", pool.provider.Host))
+		return
+	}
+
+	// Mark as offline and record the failure
+	pool.SetState(ProviderStateOffline)
+	pool.SetConnectionAttempt(err)
+
+	// Calculate exponential backoff for next retry
+	_, _, _, _, retryCount := pool.GetConnectionStatus()
+	nextDelay := p.calculateBackoffDelay(retryCount)
+	pool.SetNextRetryAt(time.Now().Add(nextDelay))
+
+	p.log.Debug(fmt.Sprintf("failed to reconnect to provider %s (attempt %d): %v, next retry in %v",
+		pool.provider.Host, retryCount, err, nextDelay))
+}
+
+// calculateBackoffDelay calculates exponential backoff delay with a maximum cap
+func (p *connectionPool) calculateBackoffDelay(retryCount int) time.Duration {
+	// Start with the base interval
+	delay := p.config.ProviderReconnectInterval
+
+	// Apply exponential backoff: delay = base * 2^retryCount
+	for i := 0; i < retryCount && delay < p.config.ProviderMaxReconnectInterval; i++ {
+		delay *= 2
+	}
+
+	// Cap at maximum interval
+	if delay > p.config.ProviderMaxReconnectInterval {
+		delay = p.config.ProviderMaxReconnectInterval
+	}
+
+	return delay
 }

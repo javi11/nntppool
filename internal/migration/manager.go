@@ -14,40 +14,40 @@ type Manager struct {
 	pool                   PoolInterface
 	activeReconfigurations map[string]*Status // migrationID -> status
 	migrationTimeout       time.Duration
-	drainTimeout          time.Duration
-	shutdownCtx           context.Context
-	shutdownCancel        context.CancelFunc
+	drainTimeout           time.Duration
+	shutdownCtx            context.Context
+	shutdownCancel         context.CancelFunc
 }
 
 // Status tracks the progress of a configuration reconfiguration
 type Status struct {
-	ID          string                       `json:"id"`
-	StartTime   time.Time                    `json:"start_time"`
-	Status      string                       `json:"status"` // "running", "completed", "failed", "rolled_back"
-	Changes     []ProviderChange             `json:"changes"`
-	Progress    map[string]ProviderStatus    `json:"progress"` // providerID -> status
-	Error       string                       `json:"error,omitempty"`
-	CompletedAt *time.Time                   `json:"completed_at,omitempty"`
+	ID          string                    `json:"id"`
+	StartTime   time.Time                 `json:"start_time"`
+	Status      string                    `json:"status"` // "running", "completed", "failed", "rolled_back"
+	Changes     []ProviderChange          `json:"changes"`
+	Progress    map[string]ProviderStatus `json:"progress"` // providerID -> status
+	Error       string                    `json:"error,omitempty"`
+	CompletedAt *time.Time                `json:"completed_at,omitempty"`
 }
 
 // ProviderStatus tracks the migration status of a single provider
 type ProviderStatus struct {
-	ProviderID      string    `json:"provider_id"`
-	Status          string    `json:"status"` // "pending", "migrating", "completed", "failed"
-	ConnectionsOld  int       `json:"connections_old"`
-	ConnectionsNew  int       `json:"connections_new"`
-	StartTime       time.Time `json:"start_time"`
-	CompletedAt     *time.Time `json:"completed_at,omitempty"`
-	Error           string    `json:"error,omitempty"`
+	ProviderID     string     `json:"provider_id"`
+	Status         string     `json:"status"` // "pending", "migrating", "completed", "failed"
+	ConnectionsOld int        `json:"connections_old"`
+	ConnectionsNew int        `json:"connections_new"`
+	StartTime      time.Time  `json:"start_time"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	Error          string     `json:"error,omitempty"`
 }
 
 // ProviderChange represents a change to be made to a provider during migration
 type ProviderChange struct {
-	ID         string                 `json:"id"`
-	ChangeType ProviderChangeType     `json:"change_type"`
-	OldConfig  ProviderConfig         `json:"old_config,omitempty"`
-	NewConfig  ProviderConfig         `json:"new_config,omitempty"`
-	Priority   int                    `json:"priority"` // Migration priority (0 = highest)
+	ID         string             `json:"id"`
+	ChangeType ProviderChangeType `json:"change_type"`
+	OldConfig  ProviderConfig     `json:"old_config,omitempty"`
+	NewConfig  ProviderConfig     `json:"new_config,omitempty"`
+	Priority   int                `json:"priority"` // Migration priority (0 = highest)
 }
 
 // ProviderChangeType represents the type of change for a provider
@@ -158,10 +158,10 @@ type ConnectionBudgetInterface interface {
 type ProviderState int
 
 const (
-	ProviderStateActive   ProviderState = iota // Normal operation
-	ProviderStateDraining                      // Accepting no new connections, existing connections finishing
-	ProviderStateMigrating                     // In process of updating configuration
-	ProviderStateRemoving                      // Being removed from pool
+	ProviderStateActive    ProviderState = iota // Normal operation
+	ProviderStateDraining                       // Accepting no new connections, existing connections finishing
+	ProviderStateMigrating                      // In process of updating configuration
+	ProviderStateRemoving                       // Being removed from pool
 )
 
 // PoolStats represents connection pool statistics
@@ -185,9 +185,9 @@ func New(pool PoolInterface) *Manager {
 		pool:                   pool,
 		activeReconfigurations: make(map[string]*Status),
 		migrationTimeout:       5 * time.Minute,
-		drainTimeout:          2 * time.Minute,
-		shutdownCtx:           shutdownCtx,
-		shutdownCancel:        shutdownCancel,
+		drainTimeout:           2 * time.Minute,
+		shutdownCtx:            shutdownCtx,
+		shutdownCancel:         shutdownCancel,
 	}
 }
 
@@ -239,7 +239,7 @@ func (mm *Manager) StartMigration(ctx context.Context, diff ConfigDiff) error {
 			}
 		}()
 	}
-	
+
 	go mm.runMigration(migrationCtx, diff, status)
 
 	return nil
@@ -247,14 +247,27 @@ func (mm *Manager) StartMigration(ctx context.Context, diff ConfigDiff) error {
 
 // runMigration executes the migration steps
 func (mm *Manager) runMigration(ctx context.Context, diff ConfigDiff, status *Status) {
+	var migrationError error
+	var migrationSuccess bool
+
 	defer func() {
 		mm.mu.Lock()
+		defer mm.mu.Unlock()
+
+		// Only update status if it's still running (avoid race with shutdown)
 		if status.Status == "running" {
-			status.Status = "completed"
+			if migrationError != nil {
+				status.Status = "failed"
+				status.Error = migrationError.Error()
+			} else if migrationSuccess {
+				status.Status = "completed"
+			} else {
+				status.Status = "failed"
+				status.Error = "migration cancelled"
+			}
 			now := time.Now()
 			status.CompletedAt = &now
 		}
-		mm.mu.Unlock()
 	}()
 
 	// Process changes in priority order
@@ -275,7 +288,6 @@ func (mm *Manager) runMigration(ctx context.Context, diff ConfigDiff, status *St
 		var err error
 		switch change.ChangeType {
 		case ProviderChangeKeep:
-			// No action needed
 			mm.updateProviderStatus(status, change.ID, "completed", "")
 		case ProviderChangeRemove:
 			err = mm.removeProvider(ctx, change)
@@ -292,13 +304,14 @@ func (mm *Manager) runMigration(ctx context.Context, diff ConfigDiff, status *St
 				"error", err,
 			)
 			mm.updateProviderStatus(status, change.ID, "failed", err.Error())
-			mm.setMigrationError(status, fmt.Sprintf("failed to migrate provider %s: %v", change.ID, err))
+			migrationError = fmt.Errorf("failed to migrate provider %s: %v", change.ID, err)
 			return
 		}
 
 		mm.updateProviderStatus(status, change.ID, "completed", "")
 	}
 
+	migrationSuccess = true
 	mm.pool.GetLogger().Info("Migration completed successfully", "migration_id", diff.MigrationID)
 }
 
@@ -310,16 +323,16 @@ func (mm *Manager) removeProvider(ctx context.Context, change ProviderChange) er
 		return fmt.Errorf("migration cancelled due to shutdown")
 	default:
 	}
-	
+
 	// Find the provider pool with read lock to prevent race with shutdown
 	shutdownMu := mm.pool.GetShutdownMutex()
 	shutdownMu.RLock()
 	defer shutdownMu.RUnlock()
-	
+
 	if atomic.LoadInt32(mm.pool.GetIsShutdown()) == 1 {
 		return fmt.Errorf("migration cancelled due to shutdown")
 	}
-	
+
 	var targetPool ProviderPoolInterface
 	for _, pool := range mm.pool.GetProviderPools() {
 		if pool.GetProvider().ID() == change.ID {
@@ -346,6 +359,7 @@ func (mm *Manager) removeProvider(ctx context.Context, change ProviderChange) er
 			// Force close remaining connections
 			mm.forceCloseProviderConnections(targetPool)
 			mm.pool.GetLogger().Warn("Provider drain timeout, forced close", "provider", change.ID)
+			return mm.finalizeProviderRemoval(change.ID)
 		case <-time.After(5 * time.Second):
 			// Check if all connections are drained
 			stats := targetPool.GetConnectionPool().Stat()
@@ -423,10 +437,10 @@ func (mm *Manager) setMigrationError(status *Status, errorMsg string) {
 // Shutdown cancels all active migrations and cleanup
 func (mm *Manager) Shutdown() {
 	mm.shutdownCancel()
-	
+
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
-	
+
 	// Mark all active migrations as cancelled
 	for _, status := range mm.activeReconfigurations {
 		if status.Status == "running" {
@@ -447,16 +461,16 @@ func (mm *Manager) GetReconfigurationStatus(migrationID string) (*Status, bool) 
 	if !exists {
 		return nil, false
 	}
-	
+
 	// Return a deep copy to prevent race conditions
 	statusCopy := *status
-	
+
 	// Deep copy CompletedAt pointer
 	if status.CompletedAt != nil {
 		timeVal := *status.CompletedAt
 		statusCopy.CompletedAt = &timeVal
 	}
-	
+
 	// Deep copy Progress map
 	statusCopy.Progress = make(map[string]ProviderStatus)
 	for k, v := range status.Progress {
@@ -468,11 +482,11 @@ func (mm *Manager) GetReconfigurationStatus(migrationID string) (*Status, bool) 
 		}
 		statusCopy.Progress[k] = providerStatusCopy
 	}
-	
+
 	// Deep copy Changes slice
 	statusCopy.Changes = make([]ProviderChange, len(status.Changes))
 	copy(statusCopy.Changes, status.Changes)
-	
+
 	return &statusCopy, true
 }
 
@@ -485,13 +499,13 @@ func (mm *Manager) GetActiveReconfigurations() map[string]*Status {
 	for k, status := range mm.activeReconfigurations {
 		// Create a deep copy to prevent race conditions
 		statusCopy := *status
-		
+
 		// Deep copy CompletedAt pointer
 		if status.CompletedAt != nil {
 			timeVal := *status.CompletedAt
 			statusCopy.CompletedAt = &timeVal
 		}
-		
+
 		// Deep copy Progress map
 		statusCopy.Progress = make(map[string]ProviderStatus)
 		for progKey, progVal := range status.Progress {
@@ -503,11 +517,11 @@ func (mm *Manager) GetActiveReconfigurations() map[string]*Status {
 			}
 			statusCopy.Progress[progKey] = providerStatusCopy
 		}
-		
+
 		// Deep copy Changes slice
 		statusCopy.Changes = make([]ProviderChange, len(status.Changes))
 		copy(statusCopy.Changes, status.Changes)
-		
+
 		result[k] = &statusCopy
 	}
 	return result

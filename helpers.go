@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/textproto"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
@@ -92,12 +95,27 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 	defer cancel()
 
 	wg := multierror.Group{}
+	var offlineProviders []string
 
 	for _, pool := range pools {
+		poolCopy := pool // Capture the loop variable
 		wg.Go(func() error {
-			c, err := pool.connectionPool.Acquire(ctx)
+			c, err := poolCopy.connectionPool.Acquire(ctx)
 			if err != nil {
-				return fmt.Errorf("failed to verify download provider %s: %w", pool.provider.Host, err)
+				log.Warn(fmt.Sprintf("failed to verify provider %s, marking as offline: %v", poolCopy.provider.Host, err))
+
+				// Determine if this is an authentication error
+				if isAuthenticationError(err) {
+					poolCopy.SetState(ProviderStateAuthenticationFailed)
+					log.Error(fmt.Sprintf("authentication failed for provider %s", poolCopy.provider.Host))
+				} else {
+					poolCopy.SetState(ProviderStateOffline)
+				}
+
+				poolCopy.SetConnectionAttempt(err)
+				offlineProviders = append(offlineProviders, poolCopy.provider.Host)
+
+				return nil
 			}
 
 			defer c.Release()
@@ -105,21 +123,122 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 			conn := c.Value()
 			caps, _ := conn.nntp.Capabilities()
 
-			log.Info(fmt.Sprintf("capabilities for provider %s: %v", pool.provider.Host, caps))
+			log.Info(fmt.Sprintf("capabilities for provider %s: %v", poolCopy.provider.Host, caps))
 
-			if len(pool.provider.VerifyCapabilities) > 0 {
-				for _, cap := range pool.provider.VerifyCapabilities {
+			if len(poolCopy.provider.VerifyCapabilities) > 0 {
+				for _, cap := range poolCopy.provider.VerifyCapabilities {
 					if !slices.Contains(caps, cap) {
-						return fmt.Errorf("provider %s does not support capability %s", pool.provider.Host, cap)
+						err := fmt.Errorf("provider %s does not support capability %s", poolCopy.provider.Host, cap)
+						log.Warn(fmt.Sprintf("capability check failed for provider %s, marking as offline: %v", poolCopy.provider.Host, err))
+						poolCopy.SetState(ProviderStateOffline)
+						poolCopy.SetConnectionAttempt(err)
+						offlineProviders = append(offlineProviders, poolCopy.provider.Host)
+
+						return nil
 					}
 				}
 			}
+
+			// Mark as successfully connected
+			poolCopy.SetConnectionAttempt(nil)
+			poolCopy.SetState(ProviderStateActive)
+			log.Info(fmt.Sprintf("provider %s verified successfully", poolCopy.provider.Host))
 
 			return nil
 		})
 	}
 
-	return wg.Wait().ErrorOrNil()
+	err := wg.Wait().ErrorOrNil()
+
+	if len(offlineProviders) > 0 {
+		log.Info(fmt.Sprintf("pool created with %d offline providers: %v", len(offlineProviders), offlineProviders))
+	}
+
+	return err
+}
+
+// isAuthenticationError checks if the error is related to authentication failure
+func isAuthenticationError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// Check for common authentication error messages
+	if strings.Contains(errStr, "authentication") ||
+		strings.Contains(errStr, "unauthorized") ||
+		strings.Contains(errStr, "invalid username") ||
+		strings.Contains(errStr, "invalid password") ||
+		strings.Contains(errStr, "wrong username") ||
+		strings.Contains(errStr, "wrong password") ||
+		strings.Contains(errStr, "bad username") ||
+		strings.Contains(errStr, "bad password") ||
+		strings.Contains(errStr, "login failed") ||
+		strings.Contains(errStr, "access denied") {
+		return true
+	}
+
+	// Check for NNTP error codes related to authentication
+	var nntpErr *textproto.Error
+	if errors.As(err, &nntpErr) {
+		// 401 Authentication Required, 403 Forbidden, 480 Authentication Failed
+		return nntpErr.Code == AuthenticationRequiredCode ||
+			nntpErr.Code == AuthenticationFailedCode ||
+			nntpErr.Code == InvalidUsernamePasswordCode
+	}
+
+	return false
+}
+
+// TestProviderConnectivity tests connectivity to a provider without requiring a pool
+// This is a standalone utility function that can be used independently
+// If client is nil, a default NNTP client will be created
+func TestProviderConnectivity(ctx context.Context, config UsenetProviderConfig, logger Logger, client nntpcli.Client) error {
+	if client == nil {
+		client = nntpcli.New()
+	}
+
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	logger.Debug(fmt.Sprintf("testing connectivity to provider %s:%d", config.Host, config.Port))
+
+	// Create connection using the same dialNNTP function used internally
+	conn, err := dialNNTP(ctx, client, config, logger)
+	if err != nil {
+		if isAuthenticationError(err) {
+			return fmt.Errorf("authentication failed for provider %s: %w", config.Host, err)
+		}
+		return fmt.Errorf("failed to connect to provider %s: %w", config.Host, err)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	// Test the connection by getting capabilities
+	caps, err := conn.Capabilities()
+	if err != nil {
+		if isAuthenticationError(err) {
+			return fmt.Errorf("authentication failed during capabilities check for provider %s: %w", config.Host, err)
+		}
+		return fmt.Errorf("failed to get capabilities from provider %s: %w", config.Host, err)
+	}
+
+	logger.Debug(fmt.Sprintf("capabilities for provider %s: %v", config.Host, caps))
+
+	// Verify required capabilities if specified
+	if len(config.VerifyCapabilities) > 0 {
+		for _, requiredCap := range config.VerifyCapabilities {
+			if !slices.Contains(caps, requiredCap) {
+				return fmt.Errorf("provider %s does not support required capability %s", config.Host, requiredCap)
+			}
+		}
+	}
+
+	logger.Info(fmt.Sprintf("connectivity test successful for provider %s", config.Host))
+	return nil
 }
 
 func dialNNTP(

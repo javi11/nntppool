@@ -3,7 +3,7 @@ package nntppool
 import (
 	"io"
 	"sync"
-	
+
 	"github.com/javi11/nntpcli"
 )
 
@@ -28,10 +28,10 @@ func (r *pooledBodyReader) Read(p []byte) (n int, err error) {
 
 func (r *pooledBodyReader) Close() error {
 	var closeErr error
-	
+
 	r.closeOnce.Do(func() {
 		r.closed = true
-		
+
 		// Close the reader first
 		if r.reader != nil {
 			closeErr = r.reader.Close()

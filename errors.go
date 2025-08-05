@@ -24,6 +24,9 @@ const (
 	ToManyConnectionsErrCode    = 502
 	ArticleNotFoundErrCode      = 430
 	CanNotJoinGroup             = 411
+	AuthenticationRequiredCode  = 401
+	AuthenticationFailedCode    = 403
+	InvalidUsernamePasswordCode = 480
 )
 
 var retirableErrors = []int{

@@ -10,10 +10,10 @@ import (
 type State int
 
 const (
-	StateActive   State = iota // Normal operation
-	StateDraining              // Accepting no new connections, existing connections finishing
-	StateMigrating             // In process of updating configuration
-	StateRemoving              // Being removed from pool
+	StateActive    State = iota // Normal operation
+	StateDraining               // Accepting no new connections, existing connections finishing
+	StateMigrating              // In process of updating configuration
+	StateRemoving               // Being removed from pool
 )
 
 func (ps State) String() string {
@@ -65,9 +65,9 @@ type Pool struct {
 	connectionPool ConnectionPoolInterface
 	provider       Config
 	state          State
-	stateMu        sync.RWMutex  // Protects state changes
-	drainStarted   time.Time     // When draining started
-	migrationID    string        // ID for tracking migration operations
+	stateMu        sync.RWMutex // Protects state changes
+	drainStarted   time.Time    // When draining started
+	migrationID    string       // ID for tracking migration operations
 }
 
 // NewPool creates a new provider pool
@@ -105,10 +105,10 @@ func (pp *Pool) GetState() State {
 func (pp *Pool) SetState(state State) {
 	pp.stateMu.Lock()
 	defer pp.stateMu.Unlock()
-	
+
 	oldState := pp.state
 	pp.state = state
-	
+
 	// Track drain start time
 	if state == StateDraining && oldState != StateDraining {
 		pp.drainStarted = time.Now()
@@ -125,7 +125,7 @@ func (pp *Pool) IsAcceptingConnections() bool {
 func (pp *Pool) GetDrainDuration() time.Duration {
 	pp.stateMu.RLock()
 	defer pp.stateMu.RUnlock()
-	
+
 	if pp.state != StateDraining || pp.drainStarted.IsZero() {
 		return 0
 	}
