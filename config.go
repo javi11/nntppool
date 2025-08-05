@@ -33,18 +33,21 @@ const (
 )
 
 type Config struct {
-	delayTypeFn                         retry.DelayTypeFunc
-	Logger                              Logger
-	NntpCli                             nntpcli.Client
-	Providers                           []UsenetProviderConfig
-	HealthCheckInterval                 time.Duration
-	MinConnections                      int
-	MaxRetries                          uint
-	DelayType                           DelayType
+	delayTypeFn         retry.DelayTypeFunc
+	Logger              Logger
+	NntpCli             nntpcli.Client
+	Providers           []UsenetProviderConfig
+	HealthCheckInterval time.Duration
+	MinConnections      int
+	MaxRetries          uint
+	DelayType           DelayType
+	// Deprecated: now is always false
 	SkipProvidersVerificationOnCreation bool
 	RetryDelay                          time.Duration
 	ShutdownTimeout                     time.Duration
 	DefaultConnectionLease              time.Duration
+	ProviderReconnectInterval           time.Duration
+	ProviderMaxReconnectInterval        time.Duration
 }
 
 // Adapter methods for internal package interfaces
@@ -109,12 +112,14 @@ type Option func(*Config)
 
 var (
 	configDefault = Config{
-		HealthCheckInterval:    1 * time.Minute,
-		MinConnections:         5,
-		MaxRetries:             4,
-		RetryDelay:             5 * time.Second,
-		ShutdownTimeout:        30 * time.Second,
-		DefaultConnectionLease: 10 * time.Minute,
+		HealthCheckInterval:          1 * time.Minute,
+		MinConnections:               5,
+		MaxRetries:                   4,
+		RetryDelay:                   5 * time.Second,
+		ShutdownTimeout:              30 * time.Second,
+		DefaultConnectionLease:       10 * time.Minute,
+		ProviderReconnectInterval:    30 * time.Second,
+		ProviderMaxReconnectInterval: 5 * time.Minute,
 	}
 	providerConfigDefault = UsenetProviderConfig{
 		MaxConnections:                 10,
@@ -160,6 +165,14 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.DefaultConnectionLease == 0 {
 		cfg.DefaultConnectionLease = configDefault.DefaultConnectionLease
+	}
+
+	if cfg.ProviderReconnectInterval == 0 {
+		cfg.ProviderReconnectInterval = configDefault.ProviderReconnectInterval
+	}
+
+	if cfg.ProviderMaxReconnectInterval == 0 {
+		cfg.ProviderMaxReconnectInterval = configDefault.ProviderMaxReconnectInterval
 	}
 
 	for i, p := range cfg.Providers {

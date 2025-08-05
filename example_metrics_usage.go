@@ -35,7 +35,7 @@ func ExampleMetricsUsage() {
 	metrics := pool.GetMetrics()
 	metrics.SetSpeedWindowDuration(30 * time.Second) // Use 30-second window instead of default 60
 	metrics.SetSpeedCacheDuration(2 * time.Second)   // Cache speed calculations for 2 seconds
-	
+
 	// Get real-time metrics
 	activeMetrics := metrics.GetActiveConnectionMetrics()
 
@@ -43,12 +43,12 @@ func ExampleMetricsUsage() {
 	fmt.Printf("Tracked active connections: %d\n", activeMetrics.Count)
 	fmt.Printf("Total acquires: %d\n", metrics.GetTotalAcquires())
 	fmt.Printf("Pool uptime: %v\n", metrics.GetUptime())
-	
+
 	// Get traffic data from snapshot instead
 	snapshot := pool.GetMetricsSnapshot()
 	fmt.Printf("Total bytes downloaded: %d\n", snapshot.TotalBytesDownloaded)
 	fmt.Printf("Total bytes uploaded: %d\n", snapshot.TotalBytesUploaded)
-	
+
 	// Show new speed metrics
 	fmt.Printf("\n=== Speed Metrics ===\n")
 	fmt.Printf("Current download speed: %.2f bytes/sec\n", snapshot.DownloadSpeed)

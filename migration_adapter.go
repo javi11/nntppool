@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/puddle/v2"
-	
+
 	"github.com/javi11/nntppool/internal/budget"
 	"github.com/javi11/nntppool/internal/migration"
 )
@@ -178,7 +178,7 @@ func convertToInternalStatus(internal *migration.Status) *ReconfigurationStatus 
 			ChangeType: ProviderChangeType(change.ChangeType),
 			Priority:   change.Priority,
 		}
-		
+
 		// Convert provider configs if they exist
 		if change.OldConfig != nil {
 			if oldConfig, ok := change.OldConfig.(*UsenetProviderConfig); ok {
@@ -200,15 +200,15 @@ func convertToInternalStatus(internal *migration.Status) *ReconfigurationStatus 
 			timeVal := *v.CompletedAt
 			completedAtCopy = &timeVal
 		}
-		
+
 		progress[k] = ProviderStatus{
-			ProviderID:      v.ProviderID,
-			Status:          v.Status,
-			ConnectionsOld:  v.ConnectionsOld,
-			ConnectionsNew:  v.ConnectionsNew,
-			StartTime:       v.StartTime,
-			CompletedAt:     completedAtCopy,
-			Error:           v.Error,
+			ProviderID:     v.ProviderID,
+			Status:         v.Status,
+			ConnectionsOld: v.ConnectionsOld,
+			ConnectionsNew: v.ConnectionsNew,
+			StartTime:      v.StartTime,
+			CompletedAt:    completedAtCopy,
+			Error:          v.Error,
 		}
 	}
 

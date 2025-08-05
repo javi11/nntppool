@@ -129,6 +129,21 @@ func (mr *MockUsenetConnectionPoolMockRecorder) GetMetricsSnapshot() *gomock.Cal
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMetricsSnapshot", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetMetricsSnapshot))
 }
 
+// GetProviderStatus mocks base method.
+func (m *MockUsenetConnectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bool) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetProviderStatus", providerID)
+	ret0, _ := ret[0].(*ProviderInfo)
+	ret1, _ := ret[1].(bool)
+	return ret0, ret1
+}
+
+// GetProviderStatus indicates an expected call of GetProviderStatus.
+func (mr *MockUsenetConnectionPoolMockRecorder) GetProviderStatus(providerID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetProviderStatus", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetProviderStatus), providerID)
+}
+
 // GetProvidersInfo mocks base method.
 func (m *MockUsenetConnectionPool) GetProvidersInfo() []ProviderInfo {
 	m.ctrl.T.Helper()

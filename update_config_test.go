@@ -10,10 +10,10 @@ import (
 
 func TestNewReconfigurationBehavior(t *testing.T) {
 	// Test the new incremental Reconfigure behavior
-	
+
 	// Create initial configuration
 	initialConfig := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -119,7 +119,7 @@ func TestNewReconfigurationBehavior(t *testing.T) {
 
 func TestReconfigureWithShutdownPool(t *testing.T) {
 	config := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -151,7 +151,7 @@ func TestReconfigureWithShutdownPool(t *testing.T) {
 
 func TestReconfigureEmptyProviders(t *testing.T) {
 	config := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -184,7 +184,7 @@ func TestReconfigureEmptyProviders(t *testing.T) {
 
 func TestReconfigureMultipleConcurrentAttempts(t *testing.T) {
 	config := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -204,7 +204,7 @@ func TestReconfigureMultipleConcurrentAttempts(t *testing.T) {
 
 	// Prepare different configurations with actual changes
 	config1 := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -217,7 +217,7 @@ func TestReconfigureMultipleConcurrentAttempts(t *testing.T) {
 	}
 
 	config2 := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -243,7 +243,7 @@ func TestReconfigureMultipleConcurrentAttempts(t *testing.T) {
 
 	// Try second migration immediately
 	err2 := pool.Reconfigure(config2)
-	
+
 	// One of these might fail if there's already a migration in progress
 	// The exact behavior depends on the migration manager implementation
 	if err1 == nil && err2 != nil {
@@ -261,7 +261,7 @@ func TestReconfigureMultipleConcurrentAttempts(t *testing.T) {
 func TestReconfigureAsynchronousNature(t *testing.T) {
 	// Test that Reconfigure returns immediately and doesn't block
 	config := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -281,7 +281,7 @@ func TestReconfigureAsynchronousNature(t *testing.T) {
 
 	// Create config with actual changes
 	newConfig := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -316,7 +316,7 @@ func TestReconfigureAsynchronousNature(t *testing.T) {
 
 func TestMigrationStatusTracking(t *testing.T) {
 	config := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
@@ -336,7 +336,7 @@ func TestMigrationStatusTracking(t *testing.T) {
 
 	// Start migration with actual changes
 	newConfig := Config{
-		Logger: slog.Default(),
+		Logger:  slog.Default(),
 		NntpCli: nntpcli.New(),
 		Providers: []UsenetProviderConfig{
 			{
