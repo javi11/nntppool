@@ -1308,12 +1308,15 @@ func (p *connectionPool) dropAllProviderConnections(pool *providerPool) {
 	initialTotal := int(pool.connectionPool.Stat().TotalResources())
 	initialAcquired := int(pool.connectionPool.Stat().AcquiredResources())
 
-	// First, acquire all idle connections and destroy them
+	// Acquire all idle connections and destroy them safely
 	idle := pool.connectionPool.AcquireAllIdle()
 	destroyedIdle := 0
 	for _, res := range idle {
-		res.Destroy()
-		destroyedIdle++
+		// Only destroy if the resource is still valid
+		if res != nil && res.Value() != nil {
+			res.Destroy()
+			destroyedIdle++
+		}
 	}
 
 	// For active connections, we can't forcibly destroy them as they're in use,

@@ -85,7 +85,7 @@ func TestProviderHealthCheckStateFiltering(t *testing.T) {
 
 	// Test multiple cycles to verify filtering behavior
 	foundProviders := make(map[string]bool)
-	
+
 	// Check several cycles to verify the behavior is consistent
 	for i := 0; i < 3; i++ { // Reduced iterations to avoid timeout
 		providersToCheck := cp.getProvidersToHealthCheck()
