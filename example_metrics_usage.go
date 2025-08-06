@@ -257,7 +257,7 @@ func HealthCheckExample() bool {
 
 	// Check provider states
 	for _, provider := range snapshot.ProviderMetrics {
-		if provider.State != "active" {
+		if provider.State != ProviderStateActive {
 			issues = append(issues, fmt.Sprintf("Provider %s is %s", provider.Host, provider.State))
 		}
 	}

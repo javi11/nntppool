@@ -142,6 +142,7 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 			// Mark as successfully connected
 			poolCopy.SetConnectionAttempt(nil)
 			poolCopy.SetState(ProviderStateActive)
+			
 			log.Info(fmt.Sprintf("provider %s verified successfully", poolCopy.provider.Host))
 
 			return nil

@@ -122,6 +122,11 @@ func (pp *providerPool) SetState(state ProviderState) {
 	if state == ProviderStateDraining && oldState != ProviderStateDraining {
 		pp.drainStarted = time.Now()
 	}
+	
+	// Reset retry scheduling when state changes
+	if oldState != state {
+		pp.nextRetryAt = time.Time{}
+	}
 }
 
 func (pp *providerPool) IsAcceptingConnections() bool {
