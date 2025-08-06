@@ -294,10 +294,10 @@ type PoolMetricsSnapshot struct {
 
 // ProviderMetricsSnapshot contains metrics for a specific provider
 type ProviderMetricsSnapshot struct {
-	ProviderID string `json:"provider_id"`
-	Host       string `json:"host"`
-	Username   string `json:"username"`
-	State      string `json:"state"`
+	ProviderID string        `json:"provider_id"`
+	Host       string        `json:"host"`
+	Username   string        `json:"username"`
+	State      ProviderState `json:"state"`
 
 	// Pool statistics from puddle
 	MaxConnections          int32         `json:"max_connections"`
@@ -392,7 +392,7 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 			ProviderID:              pool.provider.ID(),
 			Host:                    pool.provider.Host,
 			Username:                pool.provider.Username,
-			State:                   pool.GetState().String(),
+			State:                   pool.GetState(),
 			MaxConnections:          stat.MaxResources(),
 			TotalConnections:        stat.TotalResources(),
 			AcquiredConnections:     stat.AcquiredResources(),
