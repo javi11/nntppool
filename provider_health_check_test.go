@@ -179,6 +179,96 @@ func TestProviderHealthCheckResetsRetrySchedule(t *testing.T) {
 	pool.Quit()
 }
 
+func TestProviderStateChangeResetsRetrySchedule(t *testing.T) {
+	provider := UsenetProviderConfig{
+		Host:           "test.example.com",
+		Username:       "testuser",
+		MaxConnections: 5,
+	}
+
+	pool := &providerPool{
+		provider: provider,
+		state:    ProviderStateActive,
+	}
+
+	// Set a future retry time
+	futureTime := time.Now().Add(30 * time.Minute)
+	pool.SetNextRetryAt(futureTime)
+
+	// Verify retry is scheduled
+	_, _, nextRetry, _, _ := pool.GetConnectionStatus()
+	assert.Equal(t, futureTime, nextRetry, "nextRetryAt should be set to future time")
+	assert.False(t, pool.ShouldRetryNow(), "should not retry when nextRetryAt is in future")
+
+	// Test various state changes
+	testCases := []struct {
+		name     string
+		newState ProviderState
+	}{
+		{"Active to Offline", ProviderStateOffline},
+		{"Offline to Reconnecting", ProviderStateReconnecting},
+		{"Reconnecting to Active", ProviderStateActive},
+		{"Active to AuthenticationFailed", ProviderStateAuthenticationFailed},
+		{"AuthenticationFailed to Offline", ProviderStateOffline},
+		{"Offline to Draining", ProviderStateDraining},
+		{"Draining to Migrating", ProviderStateMigrating},
+		{"Migrating to Removing", ProviderStateRemoving},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set a future retry time before state change
+			futureTime := time.Now().Add(30 * time.Minute)
+			pool.SetNextRetryAt(futureTime)
+
+			// Verify retry is scheduled
+			_, _, nextRetry, _, _ := pool.GetConnectionStatus()
+			assert.Equal(t, futureTime, nextRetry, "nextRetryAt should be set to future time before state change")
+			assert.False(t, pool.ShouldRetryNow(), "should not retry before state change")
+
+			// Change state
+			pool.SetState(tc.newState)
+
+			// Verify nextRetryAt is reset (zero time means immediate retry)
+			_, _, nextRetry, _, _ = pool.GetConnectionStatus()
+			assert.True(t, nextRetry.IsZero(), "nextRetryAt should be reset to zero time after state change")
+			assert.True(t, pool.ShouldRetryNow(), "should be able to retry immediately after state change")
+
+			// Verify state actually changed
+			assert.Equal(t, tc.newState, pool.GetState(), "state should have changed")
+		})
+	}
+}
+
+func TestProviderStateNoChangeDoesNotResetRetry(t *testing.T) {
+	provider := UsenetProviderConfig{
+		Host:           "test.example.com",
+		Username:       "testuser",
+		MaxConnections: 5,
+	}
+
+	pool := &providerPool{
+		provider: provider,
+		state:    ProviderStateActive,
+	}
+
+	// Set a future retry time
+	futureTime := time.Now().Add(30 * time.Minute)
+	pool.SetNextRetryAt(futureTime)
+
+	// Verify retry is scheduled
+	_, _, nextRetry, _, _ := pool.GetConnectionStatus()
+	assert.Equal(t, futureTime, nextRetry, "nextRetryAt should be set to future time")
+
+	// Set the same state (no change)
+	pool.SetState(ProviderStateActive)
+
+	// Verify nextRetryAt is NOT reset when state doesn't change
+	_, _, nextRetry, _, _ = pool.GetConnectionStatus()
+	assert.Equal(t, futureTime, nextRetry, "nextRetryAt should remain unchanged when state doesn't change")
+	assert.False(t, pool.ShouldRetryNow(), "should still not retry when state doesn't change")
+}
+
 func TestProviderHealthCheckSuccessHandling(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

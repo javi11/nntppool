@@ -1264,9 +1264,6 @@ func (p *connectionPool) attemptProviderReconnection(ctx context.Context, pool *
 
 	pool.SetState(ProviderStateActive)
 
-	// Reset retry scheduling since provider is now active
-	pool.SetNextRetryAt(time.Time{})
-
 	p.log.Info(fmt.Sprintf("successfully reconnected to provider %s after %d attempts", pool.provider.Host, retryCount))
 }
 
@@ -1492,9 +1489,6 @@ func (p *connectionPool) handleProviderHealthCheckSuccess(pool *providerPool, cu
 	case ProviderStateOffline, ProviderStateReconnecting:
 		pool.SetState(ProviderStateActive)
 		pool.SetConnectionAttempt(nil) // Clear failure reason
-
-		// Reset retry scheduling since provider is now active
-		pool.SetNextRetryAt(time.Time{})
 
 		p.log.Info(fmt.Sprintf("provider %s marked as active after successful health check", pool.provider.Host))
 	case ProviderStateActive:
