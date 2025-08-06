@@ -1200,6 +1200,8 @@ func (p *connectionPool) attemptProviderReconnections(ctx context.Context) {
 
 		// Check if it's time to retry
 		if !pool.ShouldRetryNow() {
+			_, _, nextRetry, _, _ := pool.GetConnectionStatus()
+			p.log.Debug(fmt.Sprintf("provider %s not ready for retry, next retry scheduled at %s", pool.provider.Host, nextRetry.Format(time.RFC3339)))
 			continue
 		}
 
