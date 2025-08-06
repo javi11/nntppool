@@ -111,17 +111,20 @@ type UsenetConnectionPool interface {
 }
 
 type connectionPool struct {
-	closeChan        chan struct{}
-	connPools        []*providerPool
-	log              Logger
-	config           Config
-	wg               sync.WaitGroup
-	shutdownMu       sync.RWMutex       // Protects shutdown operations
-	isShutdown       int32              // Atomic flag for shutdown state
-	shutdownOnce     sync.Once          // Ensures single shutdown
-	connectionBudget *budget.Budget     // Tracks connection limits per provider
-	migrationManager *migration.Manager // Handles incremental migrations
-	metrics          *PoolMetrics       // High-performance metrics collection
+	closeChan               chan struct{}
+	connPools               []*providerPool
+	log                     Logger
+	config                  Config
+	wg                      sync.WaitGroup
+	shutdownMu              sync.RWMutex       // Protects shutdown operations
+	isShutdown              int32              // Atomic flag for shutdown state
+	shutdownOnce            sync.Once          // Ensures single shutdown
+	connectionBudget        *budget.Budget     // Tracks connection limits per provider
+	migrationManager        *migration.Manager // Handles incremental migrations
+	metrics                 *PoolMetrics       // High-performance metrics collection
+	providerHealthCheckIdx  int                // Index for round-robin provider health checks
+	lastProviderHealthCheck time.Time          // Last time provider health check was performed
+	providerHealthCheckMu   sync.Mutex         // Protects provider health check state
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
@@ -1051,6 +1054,13 @@ func (p *connectionPool) connectionHealCheck(healthCheckInterval time.Duration) 
 }
 
 func (p *connectionPool) checkHealth(ctx context.Context) {
+	// First, perform proactive provider health checks if enabled
+	providersToCheck := p.getProvidersToHealthCheck()
+	if len(providersToCheck) > 0 {
+		p.checkProviderHealth(ctx, providersToCheck)
+	}
+
+	// Then perform the existing connection pool health checks
 	for {
 		// If checkMinConns failed we don't destroy any connections since we couldn't
 		// even get to minConns
@@ -1294,4 +1304,193 @@ func (p *connectionPool) calculateBackoffDelay(retryCount int) time.Duration {
 	}
 
 	return delay
+}
+
+// performLightweightProviderCheck performs a connectivity test to a provider using the connection pool
+// to respect connection limits and prevent exceeding provider quotas
+func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, pool *providerPool) error {
+	// Create a timeout context for this specific check
+	checkCtx, cancel := context.WithTimeout(ctx, p.config.ProviderHealthCheckTimeout)
+	defer cancel()
+
+	// Try to acquire a connection from the pool to respect connection limits
+	c, err := pool.connectionPool.Acquire(checkCtx)
+	if err != nil {
+		// If we can't acquire a connection, it could mean:
+		// 1. Provider is offline/unreachable
+		// 2. Provider is at max connections (busy but healthy)
+		// 3. Pool creation failed
+
+		// Check if this is a timeout/context error (likely busy)
+		if checkCtx.Err() == context.DeadlineExceeded {
+			// Provider is likely busy but healthy - treat as success
+			p.log.Debug(fmt.Sprintf("provider %s health check timeout - treating as busy but healthy", pool.provider.Host))
+			return nil
+		}
+
+		return fmt.Errorf("failed to acquire connection for provider %s: %w", pool.provider.Host, err)
+	}
+	defer c.ReleaseUnused()
+
+	// Get the underlying connection
+	conn := c.Value()
+	if conn == nil || conn.nntp == nil {
+		return fmt.Errorf("provider %s has invalid connection", pool.provider.Host)
+	}
+
+	// Test basic NNTP command to ensure the server is responsive
+	_, err = conn.nntp.Capabilities()
+	if err != nil {
+		return fmt.Errorf("capabilities check failed for provider %s: %w", pool.provider.Host, err)
+	}
+
+	return nil
+}
+
+// getProvidersToHealthCheck returns a list of providers that should be checked in this cycle
+// using round-robin staggered checking to distribute load
+func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
+	p.providerHealthCheckMu.Lock()
+	defer p.providerHealthCheckMu.Unlock()
+
+	if len(p.connPools) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+
+	// Check if enough time has passed since last provider health check
+	if now.Sub(p.lastProviderHealthCheck) < p.config.ProviderHealthCheckStagger {
+		return nil
+	}
+
+	p.lastProviderHealthCheck = now
+
+	// Calculate how many providers to check per cycle to stagger over the health check interval
+	totalProviders := len(p.connPools)
+	if totalProviders == 0 {
+		return nil
+	}
+
+	// Determine how many providers to check this cycle
+	// We want to check all providers over multiple cycles within the health check interval
+	checkInterval := p.config.HealthCheckInterval
+	staggerInterval := p.config.ProviderHealthCheckStagger
+	cyclesPerHealthCheck := checkInterval / staggerInterval
+
+	providersPerCycle := 1
+	if cyclesPerHealthCheck > 0 {
+		providersPerCycle = int(cyclesPerHealthCheck)
+		if totalProviders < providersPerCycle {
+			providersPerCycle = totalProviders
+		}
+	}
+
+	// Select providers using round-robin
+	var providersToCheck []*providerPool
+	for i := 0; i < providersPerCycle && len(providersToCheck) < totalProviders; i++ {
+		idx := (p.providerHealthCheckIdx + i) % totalProviders
+		pool := p.connPools[idx]
+
+		// Only check active providers (offline/reconnecting providers are handled by reconnection worker)
+		state := pool.GetState()
+		if state == ProviderStateActive {
+			providersToCheck = append(providersToCheck, pool)
+		}
+	}
+
+	// Advance the index for next cycle
+	p.providerHealthCheckIdx = (p.providerHealthCheckIdx + providersPerCycle) % totalProviders
+
+	return providersToCheck
+}
+
+// checkProviderHealth performs proactive health checking on selected providers
+func (p *connectionPool) checkProviderHealth(ctx context.Context, providersToCheck []*providerPool) {
+	if len(providersToCheck) == 0 {
+		return
+	}
+
+	p.log.Debug(fmt.Sprintf("performing health check on %d providers", len(providersToCheck)))
+
+	for _, pool := range providersToCheck {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.closeChan:
+			return
+		default:
+		}
+
+		// Skip if provider is being migrated or removed
+		state := pool.GetState()
+		if state == ProviderStateMigrating || state == ProviderStateRemoving || state == ProviderStateDraining {
+			continue
+		}
+
+		// Skip authentication failed providers
+		if state == ProviderStateAuthenticationFailed {
+			continue
+		}
+
+		p.performProviderHealthCheck(ctx, pool)
+	}
+}
+
+// performProviderHealthCheck checks a single provider's health and updates its state
+func (p *connectionPool) performProviderHealthCheck(ctx context.Context, pool *providerPool) {
+	currentState := pool.GetState()
+
+	err := p.performLightweightProviderCheck(ctx, pool)
+	if err != nil {
+		// Health check failed
+		p.handleProviderHealthCheckFailure(pool, err, currentState)
+	} else {
+		// Health check succeeded
+		p.handleProviderHealthCheckSuccess(pool, currentState)
+	}
+}
+
+// handleProviderHealthCheckFailure handles a failed provider health check
+func (p *connectionPool) handleProviderHealthCheckFailure(pool *providerPool, err error, currentState ProviderState) {
+	// Check if this is an authentication error
+	if isAuthenticationError(err) {
+		if currentState != ProviderStateAuthenticationFailed {
+			pool.SetState(ProviderStateAuthenticationFailed)
+			pool.SetConnectionAttempt(err)
+			p.log.Error(fmt.Sprintf("provider %s authentication failed during health check", pool.provider.Host))
+		}
+		return
+	}
+
+	// Mark as offline if it's currently active
+	if currentState == ProviderStateActive {
+		pool.SetState(ProviderStateOffline)
+		pool.SetConnectionAttempt(err)
+
+		// Calculate backoff for reconnection system
+		_, _, _, _, retryCount := pool.GetConnectionStatus()
+		nextDelay := p.calculateBackoffDelay(retryCount)
+		pool.SetNextRetryAt(time.Now().Add(nextDelay))
+
+		p.log.Warn(fmt.Sprintf("provider %s marked as offline due to health check failure: %v", pool.provider.Host, err))
+	} else {
+		// Update failure tracking for offline providers
+		pool.SetConnectionAttempt(err)
+	}
+}
+
+// handleProviderHealthCheckSuccess handles a successful provider health check
+func (p *connectionPool) handleProviderHealthCheckSuccess(pool *providerPool, currentState ProviderState) {
+	// If provider was offline, mark it as active
+	switch currentState {
+	case ProviderStateOffline, ProviderStateReconnecting:
+		pool.SetState(ProviderStateActive)
+		pool.SetConnectionAttempt(nil) // Clear failure reason
+
+		p.log.Info(fmt.Sprintf("provider %s marked as active after successful health check", pool.provider.Host))
+	case ProviderStateActive:
+		// Update successful connection time for active providers
+		pool.SetConnectionAttempt(nil)
+	}
 }
