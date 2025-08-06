@@ -1283,6 +1283,9 @@ func (p *connectionPool) handleReconnectionFailure(pool *providerPool, err error
 	pool.SetState(ProviderStateOffline)
 	pool.SetConnectionAttempt(err)
 
+	// Drop all connections from the offline provider
+	p.dropAllProviderConnections(pool)
+
 	// Calculate exponential backoff for next retry
 	_, _, _, _, retryCount := pool.GetConnectionStatus()
 	nextDelay := p.calculateBackoffDelay(retryCount)
@@ -1290,6 +1293,32 @@ func (p *connectionPool) handleReconnectionFailure(pool *providerPool, err error
 
 	p.log.Debug(fmt.Sprintf("failed to reconnect to provider %s (attempt %d): %v, next retry in %v",
 		pool.provider.Host, retryCount, err, nextDelay))
+}
+
+// dropAllProviderConnections drops all connections (both idle and active) from a provider pool
+func (p *connectionPool) dropAllProviderConnections(pool *providerPool) {
+	if pool == nil || pool.connectionPool == nil {
+		return
+	}
+
+	// Get current stats before dropping connections
+	initialTotal := int(pool.connectionPool.Stat().TotalResources())
+	initialAcquired := int(pool.connectionPool.Stat().AcquiredResources())
+	
+	// First, acquire all idle connections and destroy them
+	idle := pool.connectionPool.AcquireAllIdle()
+	destroyedIdle := 0
+	for _, res := range idle {
+		res.Destroy()
+		destroyedIdle++
+	}
+
+	// For active connections, we can't forcibly destroy them as they're in use,
+	// but they will be closed when returned to the pool since provider is offline
+	activeConnections := initialAcquired
+	
+	p.log.Info(fmt.Sprintf("dropped connections for offline provider %s: %d idle destroyed, %d active (total was %d)",
+		pool.provider.Host, destroyedIdle, activeConnections, initialTotal))
 }
 
 // calculateBackoffDelay calculates exponential backoff delay with a maximum cap
@@ -1471,6 +1500,9 @@ func (p *connectionPool) handleProviderHealthCheckFailure(pool *providerPool, er
 	if currentState == ProviderStateActive {
 		pool.SetState(ProviderStateOffline)
 		pool.SetConnectionAttempt(err)
+
+		// Drop all connections from the offline provider
+		p.dropAllProviderConnections(pool)
 
 		// Calculate backoff for reconnection system
 		_, _, _, _, retryCount := pool.GetConnectionStatus()

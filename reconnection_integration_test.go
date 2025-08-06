@@ -365,3 +365,235 @@ func TestGetConnectionWithOfflineProviders(t *testing.T) {
 		_ = conn.Close()
 	}()
 }
+
+func TestConnectionsDroppedWhenProviderGoesOffline(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockClient := nntpcli.NewMockClient(ctrl)
+
+	// Create mock connections that will be dropped
+	var connCount int
+	var createdConnections []*nntpcli.MockConnection
+	var mu sync.Mutex
+
+	mockClient.EXPECT().Dial(gomock.Any(), "test.example.com", 119, gomock.Any()).
+		DoAndReturn(func(ctx context.Context, host string, port int, config nntpcli.DialConfig) (nntpcli.Connection, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			connCount++
+
+			mockConn := nntpcli.NewMockConnection(ctrl)
+			mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil).AnyTimes()
+			mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil).AnyTimes()
+			mockConn.EXPECT().Close().AnyTimes()
+			mockConn.EXPECT().MaxAgeTime().Return(time.Now().Add(time.Hour)).AnyTimes()
+			
+			createdConnections = append(createdConnections, mockConn)
+			return mockConn, nil
+		}).AnyTimes()
+
+	config := Config{
+		Logger:  logger,
+		NntpCli: mockClient,
+		Providers: []UsenetProviderConfig{
+			{
+				Host:           "test.example.com",
+				Port:           119,
+				Username:       "testuser",
+				Password:       "testpass",
+				MaxConnections: 5,
+			},
+		},
+		MinConnections:                0, // Don't create initial connections automatically
+		ProviderReconnectInterval:     100 * time.Millisecond,
+		ProviderMaxReconnectInterval:  5 * time.Second,
+		ProviderHealthCheckTimeout:    1 * time.Second,
+		ProviderHealthCheckStagger:    50 * time.Millisecond,
+	}
+
+	pool, err := NewConnectionPool(config)
+	require.NoError(t, err)
+	require.NotNil(t, pool)
+	defer pool.Quit()
+
+	// Cast to internal type to access internal methods
+	cp := pool.(*connectionPool)
+
+	// Get the provider pool
+	require.Len(t, cp.connPools, 1)
+	providerPool := cp.connPools[0]
+
+	// Verify provider starts as active
+	assert.Equal(t, ProviderStateActive, providerPool.GetState())
+
+	// Manually create and release some connections to make them idle
+	ctx := context.Background()
+	var testConnections []PooledConnection
+	for i := 0; i < 3; i++ {
+		conn, err := pool.GetConnection(ctx, []string{}, false)
+		require.NoError(t, err)
+		testConnections = append(testConnections, conn)
+	}
+
+	// Release all connections to make them idle
+	for _, conn := range testConnections {
+		err := conn.Free()
+		require.NoError(t, err)
+	}
+
+	// Wait a moment for connections to be released and become idle
+	time.Sleep(50 * time.Millisecond)
+
+	// Check that we have idle connections
+	initialTotal := int(providerPool.connectionPool.Stat().TotalResources())
+	initialIdle := len(providerPool.connectionPool.AcquireAllIdle())
+	
+	// Release the acquired idle connections back (since AcquireAllIdle acquires them)
+	idle := providerPool.connectionPool.AcquireAllIdle()
+	for _, res := range idle {
+		res.ReleaseUnused()
+	}
+
+	assert.Greater(t, initialTotal, 0, "should have some total connections")
+	assert.Greater(t, initialIdle, 0, "should have some idle connections")
+
+	// Simulate provider going offline by calling handleReconnectionFailure
+	testError := errors.New("connection failed")
+	cp.handleReconnectionFailure(providerPool, testError)
+
+	// Verify provider is marked as offline
+	assert.Equal(t, ProviderStateOffline, providerPool.GetState())
+
+	// Wait a moment for any async destruction
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that idle connections were dropped
+	remainingIdle := len(providerPool.connectionPool.AcquireAllIdle())
+	assert.Less(t, remainingIdle, initialIdle, "idle connections should be dropped when provider goes offline")
+
+	// Release any remaining idle connections we acquired
+	remaining := providerPool.connectionPool.AcquireAllIdle()
+	for _, res := range remaining {
+		res.ReleaseUnused()
+	}
+
+	// Try to get connection from offline provider (should fail)
+	_, err = pool.GetConnection(ctx, []string{}, false)
+	assert.Error(t, err, "should fail to get connection from offline provider")
+}
+
+func TestConnectionsDroppedWhenProviderFailsHealthCheck(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockClient := nntpcli.NewMockClient(ctrl)
+
+	// Track connection creation
+	var connCount int
+	var mu sync.Mutex
+
+	mockClient.EXPECT().Dial(gomock.Any(), "test.example.com", 119, gomock.Any()).
+		DoAndReturn(func(ctx context.Context, host string, port int, config nntpcli.DialConfig) (nntpcli.Connection, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			connCount++
+
+			mockConn := nntpcli.NewMockConnection(ctrl)
+			mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil).AnyTimes()
+			mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil).AnyTimes()
+			mockConn.EXPECT().Close().AnyTimes()
+			mockConn.EXPECT().MaxAgeTime().Return(time.Now().Add(time.Hour)).AnyTimes()
+			
+			return mockConn, nil
+		}).AnyTimes()
+
+	config := Config{
+		Logger:  logger,
+		NntpCli: mockClient,
+		Providers: []UsenetProviderConfig{
+			{
+				Host:           "test.example.com",
+				Port:           119,
+				Username:       "testuser",
+				Password:       "testpass",
+				MaxConnections: 3,
+			},
+		},
+		MinConnections:                0, // Don't create initial connections automatically
+		ProviderReconnectInterval:     100 * time.Millisecond,
+		ProviderMaxReconnectInterval:  5 * time.Second,
+		ProviderHealthCheckTimeout:    1 * time.Second,
+		ProviderHealthCheckStagger:    50 * time.Millisecond,
+	}
+
+	pool, err := NewConnectionPool(config)
+	require.NoError(t, err)
+	require.NotNil(t, pool)
+	defer pool.Quit()
+
+	// Cast to internal type
+	cp := pool.(*connectionPool)
+
+	// Get the provider pool
+	require.Len(t, cp.connPools, 1)
+	providerPool := cp.connPools[0]
+
+	// Verify provider starts as active
+	assert.Equal(t, ProviderStateActive, providerPool.GetState())
+
+	// Manually create and release some connections to make them idle
+	ctx := context.Background()
+	var testConnections []PooledConnection
+	for i := 0; i < 2; i++ {
+		conn, err := pool.GetConnection(ctx, []string{}, false)
+		require.NoError(t, err)
+		testConnections = append(testConnections, conn)
+	}
+
+	// Release all connections to make them idle
+	for _, conn := range testConnections {
+		err := conn.Free()
+		require.NoError(t, err)
+	}
+
+	// Wait a moment for connections to be released and become idle
+	time.Sleep(50 * time.Millisecond)
+
+	// Check that we have idle connections
+	initialIdle := len(providerPool.connectionPool.AcquireAllIdle())
+	
+	// Release the acquired idle connections back
+	idle := providerPool.connectionPool.AcquireAllIdle()
+	for _, res := range idle {
+		res.ReleaseUnused()
+	}
+
+	assert.Greater(t, initialIdle, 0, "should have some idle connections")
+
+	// Simulate health check failure
+	testError := errors.New("health check failed")
+	cp.handleProviderHealthCheckFailure(providerPool, testError, ProviderStateActive)
+
+	// Verify provider is marked as offline
+	assert.Equal(t, ProviderStateOffline, providerPool.GetState())
+
+	// Wait a moment for any async destruction
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that idle connections were dropped
+	remainingIdle := len(providerPool.connectionPool.AcquireAllIdle())
+	assert.Less(t, remainingIdle, initialIdle, "idle connections should be dropped when provider fails health check")
+
+	// Release any remaining idle connections we acquired
+	remaining := providerPool.connectionPool.AcquireAllIdle()
+	for _, res := range remaining {
+		res.ReleaseUnused()
+	}
+
+	// Try to get connection from offline provider (should fail)
+	_, err = pool.GetConnection(ctx, []string{}, false)
+	assert.Error(t, err, "should fail to get connection from offline provider")
+}
