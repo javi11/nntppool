@@ -1196,6 +1196,8 @@ func (p *connectionPool) attemptProviderReconnections(ctx context.Context) {
 			continue
 		}
 
+		p.log.Debug(fmt.Sprintf("checking provider %s for reconnection", pool.provider.Host), "shouldRetry", pool.ShouldRetryNow(), "canRetry", pool.CanRetry())
+
 		// Check if it's time to retry
 		if !pool.ShouldRetryNow() {
 			continue
@@ -1261,7 +1263,7 @@ func (p *connectionPool) attemptProviderReconnection(ctx context.Context, pool *
 	pool.stateMu.Unlock()
 
 	pool.SetState(ProviderStateActive)
-	
+
 	// Reset retry scheduling since provider is now active
 	pool.SetNextRetryAt(time.Time{})
 
@@ -1490,7 +1492,7 @@ func (p *connectionPool) handleProviderHealthCheckSuccess(pool *providerPool, cu
 	case ProviderStateOffline, ProviderStateReconnecting:
 		pool.SetState(ProviderStateActive)
 		pool.SetConnectionAttempt(nil) // Clear failure reason
-		
+
 		// Reset retry scheduling since provider is now active
 		pool.SetNextRetryAt(time.Time{})
 
