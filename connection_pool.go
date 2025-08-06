@@ -1196,7 +1196,7 @@ func (p *connectionPool) attemptProviderReconnections(ctx context.Context) {
 			continue
 		}
 
-		p.log.Debug(fmt.Sprintf("checking provider %s for reconnection", pool.provider.Host))
+		p.log.Debug(fmt.Sprintf("checking provider %s for reconnection", pool.provider.Host), "shouldRetry", pool.ShouldRetryNow(), "canRetry", pool.CanRetry())
 
 		// Check if it's time to retry
 		if !pool.ShouldRetryNow() {
