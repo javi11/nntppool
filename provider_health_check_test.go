@@ -112,6 +112,73 @@ func TestProviderHealthCheckStateFiltering(t *testing.T) {
 	assert.False(t, foundProviders["authfailed.example.com"], "Auth failed provider should not be selected for health check")
 }
 
+func TestProviderHealthCheckResetsRetrySchedule(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := nntpcli.NewMockClient(ctrl)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockConn := nntpcli.NewMockConnection(ctrl)
+
+	mockConn.EXPECT().Close().AnyTimes()
+	mockConn.EXPECT().MaxAgeTime().Return(time.Now().Add(time.Hour)).AnyTimes()
+
+	providers := []UsenetProviderConfig{
+		{Host: "test.example.com", Port: 119, MaxConnections: 1, MaxConnectionTTLInSeconds: 2400},
+	}
+
+	mockClient.EXPECT().Dial(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(mockConn, nil).AnyTimes()
+	mockConn.EXPECT().Capabilities().Return([]string{}, nil).AnyTimes()
+
+	pool, err := NewConnectionPool(Config{
+		Providers:                  providers,
+		NntpCli:                    mockClient,
+		Logger:                     logger,
+		HealthCheckInterval:        100 * time.Millisecond,
+		ProviderHealthCheckStagger: 10 * time.Millisecond,
+	})
+	assert.NoError(t, err)
+
+	// Cast to access internal methods
+	cp := pool.(*connectionPool)
+	provider := cp.connPools[0]
+
+	testCases := []struct {
+		name         string
+		initialState ProviderState
+	}{
+		{"offline provider becomes active", ProviderStateOffline},
+		{"reconnecting provider becomes active", ProviderStateReconnecting},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set initial state and schedule a retry
+			provider.SetState(tc.initialState)
+			futureTime := time.Now().Add(30 * time.Minute)
+			provider.SetNextRetryAt(futureTime)
+
+			// Verify retry is scheduled
+			_, _, nextRetry, _, _ := provider.GetConnectionStatus()
+			assert.Equal(t, futureTime, nextRetry, "nextRetryAt should be set to future time")
+			assert.False(t, provider.ShouldRetryNow(), "should not retry when nextRetryAt is in future")
+
+			// Simulate successful health check
+			cp.handleProviderHealthCheckSuccess(provider, tc.initialState)
+
+			// Verify state is now active
+			assert.Equal(t, ProviderStateActive, provider.GetState())
+
+			// Verify nextRetryAt is reset (zero time means immediate retry)
+			_, _, nextRetry, _, _ = provider.GetConnectionStatus()
+			assert.True(t, nextRetry.IsZero(), "nextRetryAt should be reset to zero time")
+			assert.True(t, provider.ShouldRetryNow(), "should be able to retry immediately after reset")
+		})
+	}
+
+	pool.Quit()
+}
+
 func TestProviderHealthCheckSuccessHandling(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

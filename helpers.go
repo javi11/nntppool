@@ -142,6 +142,10 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 			// Mark as successfully connected
 			poolCopy.SetConnectionAttempt(nil)
 			poolCopy.SetState(ProviderStateActive)
+			
+			// Reset retry scheduling since provider is now active
+			poolCopy.SetNextRetryAt(time.Time{})
+			
 			log.Info(fmt.Sprintf("provider %s verified successfully", poolCopy.provider.Host))
 
 			return nil
