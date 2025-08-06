@@ -1301,10 +1301,13 @@ func (p *connectionPool) dropAllProviderConnections(pool *providerPool) {
 		return
 	}
 
+	// Log the drop action
+	p.log.Info(fmt.Sprintf("dropping all connections for offline provider %s", pool.provider.Host))
+
 	// Get current stats before dropping connections
 	initialTotal := int(pool.connectionPool.Stat().TotalResources())
 	initialAcquired := int(pool.connectionPool.Stat().AcquiredResources())
-	
+
 	// First, acquire all idle connections and destroy them
 	idle := pool.connectionPool.AcquireAllIdle()
 	destroyedIdle := 0
@@ -1316,7 +1319,7 @@ func (p *connectionPool) dropAllProviderConnections(pool *providerPool) {
 	// For active connections, we can't forcibly destroy them as they're in use,
 	// but they will be closed when returned to the pool since provider is offline
 	activeConnections := initialAcquired
-	
+
 	p.log.Info(fmt.Sprintf("dropped connections for offline provider %s: %d idle destroyed, %d active (total was %d)",
 		pool.provider.Host, destroyedIdle, activeConnections, initialTotal))
 }

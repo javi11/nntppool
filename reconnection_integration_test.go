@@ -389,7 +389,7 @@ func TestConnectionsDroppedWhenProviderGoesOffline(t *testing.T) {
 			mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil).AnyTimes()
 			mockConn.EXPECT().Close().AnyTimes()
 			mockConn.EXPECT().MaxAgeTime().Return(time.Now().Add(time.Hour)).AnyTimes()
-			
+
 			createdConnections = append(createdConnections, mockConn)
 			return mockConn, nil
 		}).AnyTimes()
@@ -406,11 +406,11 @@ func TestConnectionsDroppedWhenProviderGoesOffline(t *testing.T) {
 				MaxConnections: 5,
 			},
 		},
-		MinConnections:                0, // Don't create initial connections automatically
-		ProviderReconnectInterval:     100 * time.Millisecond,
-		ProviderMaxReconnectInterval:  5 * time.Second,
-		ProviderHealthCheckTimeout:    1 * time.Second,
-		ProviderHealthCheckStagger:    50 * time.Millisecond,
+		MinConnections:               0, // Don't create initial connections automatically
+		ProviderReconnectInterval:    100 * time.Millisecond,
+		ProviderMaxReconnectInterval: 5 * time.Second,
+		ProviderHealthCheckTimeout:   1 * time.Second,
+		ProviderHealthCheckStagger:   50 * time.Millisecond,
 	}
 
 	pool, err := NewConnectionPool(config)
@@ -449,7 +449,7 @@ func TestConnectionsDroppedWhenProviderGoesOffline(t *testing.T) {
 	// Check that we have idle connections
 	initialTotal := int(providerPool.connectionPool.Stat().TotalResources())
 	initialIdle := len(providerPool.connectionPool.AcquireAllIdle())
-	
+
 	// Release the acquired idle connections back (since AcquireAllIdle acquires them)
 	idle := providerPool.connectionPool.AcquireAllIdle()
 	for _, res := range idle {
@@ -506,7 +506,7 @@ func TestConnectionsDroppedWhenProviderFailsHealthCheck(t *testing.T) {
 			mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil).AnyTimes()
 			mockConn.EXPECT().Close().AnyTimes()
 			mockConn.EXPECT().MaxAgeTime().Return(time.Now().Add(time.Hour)).AnyTimes()
-			
+
 			return mockConn, nil
 		}).AnyTimes()
 
@@ -522,11 +522,11 @@ func TestConnectionsDroppedWhenProviderFailsHealthCheck(t *testing.T) {
 				MaxConnections: 3,
 			},
 		},
-		MinConnections:                0, // Don't create initial connections automatically
-		ProviderReconnectInterval:     100 * time.Millisecond,
-		ProviderMaxReconnectInterval:  5 * time.Second,
-		ProviderHealthCheckTimeout:    1 * time.Second,
-		ProviderHealthCheckStagger:    50 * time.Millisecond,
+		MinConnections:               0, // Don't create initial connections automatically
+		ProviderReconnectInterval:    100 * time.Millisecond,
+		ProviderMaxReconnectInterval: 5 * time.Second,
+		ProviderHealthCheckTimeout:   1 * time.Second,
+		ProviderHealthCheckStagger:   50 * time.Millisecond,
 	}
 
 	pool, err := NewConnectionPool(config)
@@ -564,7 +564,7 @@ func TestConnectionsDroppedWhenProviderFailsHealthCheck(t *testing.T) {
 
 	// Check that we have idle connections
 	initialIdle := len(providerPool.connectionPool.AcquireAllIdle())
-	
+
 	// Release the acquired idle connections back
 	idle := providerPool.connectionPool.AcquireAllIdle()
 	for _, res := range idle {
