@@ -39,7 +39,7 @@ func ExampleMetricsUsage() {
 	// Get real-time metrics
 	activeMetrics := metrics.GetActiveConnectionMetrics()
 
-	fmt.Printf("Active connections: %d\n", metrics.GetActiveConnections())
+	fmt.Printf("Active connections: %d\n", metrics.GetTotalActiveConnections())
 	fmt.Printf("Tracked active connections: %d\n", activeMetrics.Count)
 	fmt.Printf("Total acquires: %d\n", metrics.GetTotalAcquires())
 	fmt.Printf("Pool uptime: %v\n", metrics.GetUptime())
@@ -136,7 +136,7 @@ func MonitoringExample() {
 				activeMetrics := metrics.GetActiveConnectionMetrics()
 
 				// Monitor key performance indicators
-				activeConns := metrics.GetActiveConnections()
+				activeConns := metrics.GetTotalActiveConnections()
 				trackedActiveConns := activeMetrics.Count
 				errorRate := float64(metrics.GetTotalErrors()) / float64(metrics.GetTotalAcquires()) * 100
 				avgWaitTime := metrics.GetAverageAcquireWaitTime()

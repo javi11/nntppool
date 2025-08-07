@@ -1,6 +1,7 @@
 package nntppool
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,74 @@ type speedCache struct {
 	downloadSpeed  float64
 	uploadSpeed    float64
 	cacheDuration  time.Duration
+}
+
+// MetricRetentionConfig defines how long different types of metrics are retained
+type MetricRetentionConfig struct {
+	// How long to keep detailed metrics before rotation
+	DetailedRetentionDuration time.Duration
+
+	// How often to perform metric rotation
+	RotationInterval time.Duration
+
+	// Maximum number of historical windows to keep
+	MaxHistoricalWindows int
+
+	// Memory threshold (bytes) that triggers aggressive cleanup
+	MemoryThresholdBytes uint64
+
+	// Enable automatic cleanup when memory thresholds are exceeded
+	AutoCleanupEnabled bool
+}
+
+// MetricWindow represents metrics for a specific time window
+type MetricWindow struct {
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+
+	// Core metrics for this window
+	ConnectionsCreated   int64 `json:"connections_created"`
+	ConnectionsDestroyed int64 `json:"connections_destroyed"`
+	Acquires             int64 `json:"acquires"`
+	Releases             int64 `json:"releases"`
+	Errors               int64 `json:"errors"`
+	Retries              int64 `json:"retries"`
+	AcquireWaitTime      int64 `json:"acquire_wait_time_ns"`
+
+	// Traffic metrics
+	BytesDownloaded   int64 `json:"bytes_downloaded"`
+	BytesUploaded     int64 `json:"bytes_uploaded"`
+	ArticlesRetrieved int64 `json:"articles_retrieved"`
+	ArticlesPosted    int64 `json:"articles_posted"`
+	CommandCount      int64 `json:"command_count"`
+	CommandErrors     int64 `json:"command_errors"`
+}
+
+// RollingMetrics manages metrics across multiple time windows
+type RollingMetrics struct {
+	mu sync.RWMutex
+
+	// Current active window (receiving new metrics)
+	currentWindow *MetricWindow
+
+	// Historical windows (completed time periods)
+	historicalWindows []*MetricWindow
+
+	// Configuration
+	config MetricRetentionConfig
+
+	// Memory usage tracking
+	lastMemoryCheck     time.Time
+	memoryCheckInterval time.Duration
+}
+
+// ConnectionCleanupTracker tracks connections for automatic cleanup
+type ConnectionCleanupTracker struct {
+	mu                sync.RWMutex
+	connections       map[string]time.Time // connectionID -> last seen time
+	cleanupInterval   time.Duration
+	connectionTimeout time.Duration
+	lastCleanup       time.Time
 }
 
 // PoolMetrics provides high-performance metrics for the entire connection pool
@@ -43,15 +112,47 @@ type PoolMetrics struct {
 
 	// Cached speed calculations to avoid blocking pool operations
 	speedCache speedCache
+
+	// Rolling metrics for memory management
+	rollingMetrics *RollingMetrics
+
+	// Connection cleanup tracking
+	cleanupTracker *ConnectionCleanupTracker
 }
 
 // NewPoolMetrics creates a new metrics instance
 func NewPoolMetrics() *PoolMetrics {
+	now := time.Now()
+
+	// Default retention configuration
+	defaultConfig := MetricRetentionConfig{
+		DetailedRetentionDuration: 24 * time.Hour,    // Keep detailed metrics for 24 hours
+		RotationInterval:          1 * time.Hour,     // Rotate metrics every hour
+		MaxHistoricalWindows:      168,               // Keep 7 days of hourly windows (7*24=168)
+		MemoryThresholdBytes:      100 * 1024 * 1024, // 100MB threshold
+		AutoCleanupEnabled:        true,
+	}
+
 	return &PoolMetrics{
-		startTime:           time.Now().UnixNano(),
+		startTime:           now.UnixNano(),
 		speedWindowDuration: 60 * time.Second, // Default 60 second window for speed calculations
 		speedCache: speedCache{
 			cacheDuration: 5 * time.Second, // Default 5 second cache duration
+		},
+		rollingMetrics: &RollingMetrics{
+			currentWindow: &MetricWindow{
+				StartTime: now,
+				EndTime:   now.Add(defaultConfig.RotationInterval),
+			},
+			historicalWindows:   make([]*MetricWindow, 0, defaultConfig.MaxHistoricalWindows),
+			config:              defaultConfig,
+			memoryCheckInterval: 5 * time.Minute, // Check memory every 5 minutes
+		},
+		cleanupTracker: &ConnectionCleanupTracker{
+			connections:       make(map[string]time.Time),
+			cleanupInterval:   30 * time.Second, // Check for stale connections every 30 seconds
+			connectionTimeout: 5 * time.Minute,  // Consider connections stale after 5 minutes
+			lastCleanup:       now,
 		},
 	}
 }
@@ -59,31 +160,206 @@ func NewPoolMetrics() *PoolMetrics {
 // Connection lifecycle metrics
 func (m *PoolMetrics) RecordConnectionCreated() {
 	atomic.AddInt64(&m.totalConnectionsCreated, 1)
+	m.recordToCurrentWindow("connectionsCreated", 1)
 }
 
 func (m *PoolMetrics) RecordConnectionDestroyed() {
 	atomic.AddInt64(&m.totalConnectionsDestroyed, 1)
+	m.recordToCurrentWindow("connectionsDestroyed", 1)
 }
 
 func (m *PoolMetrics) RecordAcquire() {
 	atomic.AddInt64(&m.totalAcquires, 1)
+	m.recordToCurrentWindow("acquires", 1)
 }
 
 func (m *PoolMetrics) RecordRelease() {
 	atomic.AddInt64(&m.totalReleases, 1)
+	m.recordToCurrentWindow("releases", 1)
 }
 
 func (m *PoolMetrics) RecordError() {
 	atomic.AddInt64(&m.totalErrors, 1)
+	m.recordToCurrentWindow("errors", 1)
 }
 
 func (m *PoolMetrics) RecordRetry() {
 	atomic.AddInt64(&m.totalRetries, 1)
+	m.recordToCurrentWindow("retries", 1)
 }
 
 // Performance metrics
 func (m *PoolMetrics) RecordAcquireWaitTime(duration time.Duration) {
 	atomic.AddInt64(&m.totalAcquireWaitTime, int64(duration))
+	m.recordToCurrentWindow("acquireWaitTime", int64(duration))
+}
+
+// recordToCurrentWindow safely records a metric to the current window
+func (m *PoolMetrics) recordToCurrentWindow(metricType string, value int64) {
+	if m.rollingMetrics == nil {
+		return
+	}
+
+	now := time.Now()
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	// Check if we need to rotate the current window
+	if m.rollingMetrics.currentWindow != nil && now.After(m.rollingMetrics.currentWindow.EndTime) {
+		m.rotateCurrentWindow(now)
+	}
+
+	// Ensure we have a current window
+	if m.rollingMetrics.currentWindow == nil {
+		m.createNewCurrentWindow(now)
+	}
+
+	// Record the metric to the current window
+	switch metricType {
+	case "connectionsCreated":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.ConnectionsCreated, value)
+	case "connectionsDestroyed":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.ConnectionsDestroyed, value)
+	case "acquires":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.Acquires, value)
+	case "releases":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.Releases, value)
+	case "errors":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.Errors, value)
+	case "retries":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.Retries, value)
+	case "acquireWaitTime":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.AcquireWaitTime, value)
+	}
+}
+
+// rotateCurrentWindow moves the current window to historical and creates a new one
+func (m *PoolMetrics) rotateCurrentWindow(now time.Time) {
+	if m.rollingMetrics.currentWindow == nil {
+		return
+	}
+
+	// Complete the current window
+	m.rollingMetrics.currentWindow.EndTime = now
+
+	// Add to historical windows
+	m.rollingMetrics.historicalWindows = append(m.rollingMetrics.historicalWindows, m.rollingMetrics.currentWindow)
+
+	// Trim historical windows if we exceed the limit
+	maxWindows := m.rollingMetrics.config.MaxHistoricalWindows
+	if len(m.rollingMetrics.historicalWindows) > maxWindows {
+		// Remove oldest windows
+		excess := len(m.rollingMetrics.historicalWindows) - maxWindows
+		m.rollingMetrics.historicalWindows = m.rollingMetrics.historicalWindows[excess:]
+	}
+
+	// Create new current window
+	m.createNewCurrentWindow(now)
+}
+
+// createNewCurrentWindow creates a new current window starting at the given time
+func (m *PoolMetrics) createNewCurrentWindow(startTime time.Time) {
+	m.rollingMetrics.currentWindow = &MetricWindow{
+		StartTime: startTime,
+		EndTime:   startTime.Add(m.rollingMetrics.config.RotationInterval),
+	}
+}
+
+// PerformRotationCheck checks if metric rotation is needed and performs memory cleanup
+func (m *PoolMetrics) PerformRotationCheck() {
+	if m.rollingMetrics == nil {
+		return
+	}
+
+	now := time.Now()
+
+	// Check if rotation is needed
+	m.rollingMetrics.mu.Lock()
+	needsRotation := m.rollingMetrics.currentWindow != nil && now.After(m.rollingMetrics.currentWindow.EndTime)
+	if needsRotation {
+		m.rotateCurrentWindow(now)
+	}
+	m.rollingMetrics.mu.Unlock()
+
+	// Check memory usage and perform cleanup if needed
+	if m.rollingMetrics.config.AutoCleanupEnabled {
+		m.checkMemoryUsageAndCleanup(now)
+	}
+
+	// Perform connection cleanup
+	m.performConnectionCleanup(now)
+}
+
+// checkMemoryUsageAndCleanup monitors memory usage and triggers cleanup when thresholds are exceeded
+func (m *PoolMetrics) checkMemoryUsageAndCleanup(now time.Time) {
+	// Only check memory periodically to avoid overhead
+	if now.Sub(m.rollingMetrics.lastMemoryCheck) < m.rollingMetrics.memoryCheckInterval {
+		return
+	}
+
+	m.rollingMetrics.lastMemoryCheck = now
+
+	// Get current memory stats
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	// If we're exceeding the threshold, perform aggressive cleanup
+	if memStats.Alloc > m.rollingMetrics.config.MemoryThresholdBytes {
+		m.performAggressiveCleanup()
+	}
+}
+
+// performAggressiveCleanup removes old historical windows and resets counters if memory is high
+func (m *PoolMetrics) performAggressiveCleanup() {
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	// Reduce historical windows to 50% of max when under memory pressure
+	maxWindows := m.rollingMetrics.config.MaxHistoricalWindows / 2
+	if len(m.rollingMetrics.historicalWindows) > maxWindows {
+		// Keep only the most recent windows
+		keepCount := maxWindows
+		if keepCount < 12 { // Always keep at least 12 hours of data
+			keepCount = 12
+		}
+		m.rollingMetrics.historicalWindows = m.rollingMetrics.historicalWindows[len(m.rollingMetrics.historicalWindows)-keepCount:]
+	}
+}
+
+// performConnectionCleanup removes stale connections from the active tracking
+func (m *PoolMetrics) performConnectionCleanup(now time.Time) {
+	if m.cleanupTracker == nil {
+		return
+	}
+
+	// Only perform cleanup at specified intervals
+	if now.Sub(m.cleanupTracker.lastCleanup) < m.cleanupTracker.cleanupInterval {
+		return
+	}
+
+	m.cleanupTracker.mu.Lock()
+	m.cleanupTracker.lastCleanup = now
+
+	// Clean up stale connections from activeConnections sync.Map
+	staleConnections := make([]string, 0)
+
+	// First, identify connections that haven't been seen recently
+	for connectionID, lastSeen := range m.cleanupTracker.connections {
+		if now.Sub(lastSeen) > m.cleanupTracker.connectionTimeout {
+			staleConnections = append(staleConnections, connectionID)
+		}
+	}
+	m.cleanupTracker.mu.Unlock()
+
+	// Remove stale connections from both maps
+	for _, connectionID := range staleConnections {
+		m.activeConnections.Delete(connectionID)
+
+		m.cleanupTracker.mu.Lock()
+		delete(m.cleanupTracker.connections, connectionID)
+		m.cleanupTracker.mu.Unlock()
+	}
 }
 
 // Fast getters (single atomic load each)
@@ -93,10 +369,6 @@ func (m *PoolMetrics) GetTotalConnectionsCreated() int64 {
 
 func (m *PoolMetrics) GetTotalConnectionsDestroyed() int64 {
 	return atomic.LoadInt64(&m.totalConnectionsDestroyed)
-}
-
-func (m *PoolMetrics) GetActiveConnections() int64 {
-	return m.GetTotalConnectionsCreated() - m.GetTotalConnectionsDestroyed()
 }
 
 func (m *PoolMetrics) GetTotalAcquires() int64 {
@@ -168,23 +440,326 @@ func (m *PoolMetrics) getSpeedCacheAge() time.Duration {
 // RegisterActiveConnection registers a connection as active for metrics tracking
 // This should be called when a connection is acquired from the pool
 func (m *PoolMetrics) RegisterActiveConnection(connectionID string, conn nntpcli.Connection) {
+	now := time.Now()
 	m.activeConnections.Store(connectionID, conn)
+
+	// Update cleanup tracker
+	if m.cleanupTracker != nil {
+		m.cleanupTracker.mu.Lock()
+		m.cleanupTracker.connections[connectionID] = now
+		m.cleanupTracker.mu.Unlock()
+	}
 }
 
 // UnregisterActiveConnection removes a connection from active tracking
 // This should be called when a connection is released back to the pool or destroyed
 func (m *PoolMetrics) UnregisterActiveConnection(connectionID string) {
 	m.activeConnections.Delete(connectionID)
+
+	// Remove from cleanup tracker
+	if m.cleanupTracker != nil {
+		m.cleanupTracker.mu.Lock()
+		delete(m.cleanupTracker.connections, connectionID)
+		m.cleanupTracker.mu.Unlock()
+	}
 }
 
-// GetActiveConnectionsCount returns the number of actively tracked connections
-func (m *PoolMetrics) GetActiveConnectionsCount() int {
-	count := 0
+// GetTotalActiveConnections returns the number of actively tracked connections
+func (m *PoolMetrics) GetTotalActiveConnections() int64 {
+	var count int64
 	m.activeConnections.Range(func(key, value interface{}) bool {
 		count++
 		return true
 	})
+
 	return count
+}
+
+// UpdateConnectionActivity updates the last-seen time for an active connection
+// This should be called when a connection is used to prevent it from being cleaned up as stale
+func (m *PoolMetrics) UpdateConnectionActivity(connectionID string) {
+	if m.cleanupTracker != nil {
+		now := time.Now()
+		m.cleanupTracker.mu.Lock()
+		m.cleanupTracker.connections[connectionID] = now
+		m.cleanupTracker.mu.Unlock()
+	}
+}
+
+// ConnectionCleanupStats represents statistics about connection cleanup
+type ConnectionCleanupStats struct {
+	TrackedConnections int           `json:"tracked_connections"`
+	LastCleanupTime    time.Time     `json:"last_cleanup_time"`
+	CleanupInterval    time.Duration `json:"cleanup_interval"`
+	ConnectionTimeout  time.Duration `json:"connection_timeout"`
+	NextCleanupTime    time.Time     `json:"next_cleanup_time"`
+}
+
+// GetConnectionCleanupStats returns statistics about the connection cleanup system
+func (m *PoolMetrics) GetConnectionCleanupStats() ConnectionCleanupStats {
+	if m.cleanupTracker == nil {
+		return ConnectionCleanupStats{}
+	}
+
+	m.cleanupTracker.mu.RLock()
+	defer m.cleanupTracker.mu.RUnlock()
+
+	return ConnectionCleanupStats{
+		TrackedConnections: len(m.cleanupTracker.connections),
+		LastCleanupTime:    m.cleanupTracker.lastCleanup,
+		CleanupInterval:    m.cleanupTracker.cleanupInterval,
+		ConnectionTimeout:  m.cleanupTracker.connectionTimeout,
+		NextCleanupTime:    m.cleanupTracker.lastCleanup.Add(m.cleanupTracker.cleanupInterval),
+	}
+}
+
+// SetConnectionCleanupConfig updates the connection cleanup configuration
+func (m *PoolMetrics) SetConnectionCleanupConfig(cleanupInterval, connectionTimeout time.Duration) {
+	if m.cleanupTracker == nil {
+		return
+	}
+
+	m.cleanupTracker.mu.Lock()
+	defer m.cleanupTracker.mu.Unlock()
+
+	if cleanupInterval > 0 {
+		m.cleanupTracker.cleanupInterval = cleanupInterval
+	}
+	if connectionTimeout > 0 {
+		m.cleanupTracker.connectionTimeout = connectionTimeout
+	}
+}
+
+// ForceConnectionCleanup forces an immediate cleanup of stale connections
+func (m *PoolMetrics) ForceConnectionCleanup() int {
+	if m.cleanupTracker == nil {
+		return 0
+	}
+
+	now := time.Now()
+	m.cleanupTracker.mu.Lock()
+
+	staleConnections := make([]string, 0)
+	for connectionID, lastSeen := range m.cleanupTracker.connections {
+		if now.Sub(lastSeen) > m.cleanupTracker.connectionTimeout {
+			staleConnections = append(staleConnections, connectionID)
+		}
+	}
+
+	m.cleanupTracker.lastCleanup = now
+	m.cleanupTracker.mu.Unlock()
+
+	// Remove stale connections
+	for _, connectionID := range staleConnections {
+		m.activeConnections.Delete(connectionID)
+
+		m.cleanupTracker.mu.Lock()
+		delete(m.cleanupTracker.connections, connectionID)
+		m.cleanupTracker.mu.Unlock()
+	}
+
+	return len(staleConnections)
+}
+
+// MetricSummary represents aggregated metrics for a longer time period
+type MetricSummary struct {
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+
+	// Aggregated core metrics
+	TotalConnectionsCreated   int64 `json:"total_connections_created"`
+	TotalConnectionsDestroyed int64 `json:"total_connections_destroyed"`
+	TotalAcquires             int64 `json:"total_acquires"`
+	TotalReleases             int64 `json:"total_releases"`
+	TotalErrors               int64 `json:"total_errors"`
+	TotalRetries              int64 `json:"total_retries"`
+	TotalAcquireWaitTime      int64 `json:"total_acquire_wait_time_ns"`
+
+	// Aggregated traffic metrics
+	TotalBytesDownloaded   int64 `json:"total_bytes_downloaded"`
+	TotalBytesUploaded     int64 `json:"total_bytes_uploaded"`
+	TotalArticlesRetrieved int64 `json:"total_articles_retrieved"`
+	TotalArticlesPosted    int64 `json:"total_articles_posted"`
+	TotalCommandCount      int64 `json:"total_command_count"`
+	TotalCommandErrors     int64 `json:"total_command_errors"`
+
+	// Computed metrics
+	AverageConnectionsPerHour float64 `json:"average_connections_per_hour"`
+	AverageErrorRate          float64 `json:"average_error_rate_percent"`
+	AverageSuccessRate        float64 `json:"average_success_rate_percent"`
+	AverageAcquireWaitTime    int64   `json:"average_acquire_wait_time_ns"`
+
+	// Number of windows that were summarized
+	WindowCount int `json:"window_count"`
+}
+
+// SummarizeHistoricalWindows creates a compressed summary of historical metric windows
+func (m *PoolMetrics) SummarizeHistoricalWindows(startTime, endTime time.Time) *MetricSummary {
+	if m.rollingMetrics == nil {
+		return nil
+	}
+
+	m.rollingMetrics.mu.RLock()
+	defer m.rollingMetrics.mu.RUnlock()
+
+	summary := &MetricSummary{
+		StartTime: startTime,
+		EndTime:   endTime,
+	}
+
+	windowCount := 0
+
+	// Aggregate metrics from all windows within the time range
+	for _, window := range m.rollingMetrics.historicalWindows {
+		// Check if window overlaps with our time range
+		if window.EndTime.Before(startTime) || window.StartTime.After(endTime) {
+			continue
+		}
+
+		summary.TotalConnectionsCreated += window.ConnectionsCreated
+		summary.TotalConnectionsDestroyed += window.ConnectionsDestroyed
+		summary.TotalAcquires += window.Acquires
+		summary.TotalReleases += window.Releases
+		summary.TotalErrors += window.Errors
+		summary.TotalRetries += window.Retries
+		summary.TotalAcquireWaitTime += window.AcquireWaitTime
+		summary.TotalBytesDownloaded += window.BytesDownloaded
+		summary.TotalBytesUploaded += window.BytesUploaded
+		summary.TotalArticlesRetrieved += window.ArticlesRetrieved
+		summary.TotalArticlesPosted += window.ArticlesPosted
+		summary.TotalCommandCount += window.CommandCount
+		summary.TotalCommandErrors += window.CommandErrors
+
+		windowCount++
+	}
+
+	// Calculate averages and rates
+	durationHours := endTime.Sub(startTime).Hours()
+	if durationHours > 0 {
+		summary.AverageConnectionsPerHour = float64(summary.TotalConnectionsCreated) / durationHours
+	}
+
+	if summary.TotalAcquires > 0 {
+		summary.AverageErrorRate = float64(summary.TotalErrors) / float64(summary.TotalAcquires) * 100
+		summary.AverageAcquireWaitTime = summary.TotalAcquireWaitTime / summary.TotalAcquires
+	}
+
+	if summary.TotalCommandCount > 0 {
+		successfulCommands := summary.TotalCommandCount - summary.TotalCommandErrors
+		summary.AverageSuccessRate = float64(successfulCommands) / float64(summary.TotalCommandCount) * 100
+	}
+
+	summary.WindowCount = windowCount
+
+	return summary
+}
+
+// GetDailySummary returns a summary of metrics for the last 24 hours
+func (m *PoolMetrics) GetDailySummary() *MetricSummary {
+	now := time.Now()
+	yesterday := now.Add(-24 * time.Hour)
+	return m.SummarizeHistoricalWindows(yesterday, now)
+}
+
+// GetWeeklySummary returns a summary of metrics for the last 7 days
+func (m *PoolMetrics) GetWeeklySummary() *MetricSummary {
+	now := time.Now()
+	weekAgo := now.Add(-7 * 24 * time.Hour)
+	return m.SummarizeHistoricalWindows(weekAgo, now)
+}
+
+// CompressOldWindows removes detailed windows older than the retention period
+// and optionally creates summaries before deletion
+func (m *PoolMetrics) CompressOldWindows(createSummaries bool) []*MetricSummary {
+	if m.rollingMetrics == nil {
+		return nil
+	}
+
+	now := time.Now()
+	retentionCutoff := now.Add(-m.rollingMetrics.config.DetailedRetentionDuration)
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	var summaries []*MetricSummary
+	var keepWindows []*MetricWindow
+	var compressWindows []*MetricWindow
+
+	// Separate windows into keep vs compress
+	for _, window := range m.rollingMetrics.historicalWindows {
+		if window.EndTime.Before(retentionCutoff) {
+			compressWindows = append(compressWindows, window)
+		} else {
+			keepWindows = append(keepWindows, window)
+		}
+	}
+
+	// Create summaries if requested
+	if createSummaries && len(compressWindows) > 0 {
+		// Group old windows by day for daily summaries
+		dayGroups := make(map[string][]*MetricWindow)
+		for _, window := range compressWindows {
+			dayKey := window.StartTime.Format("2006-01-02")
+			dayGroups[dayKey] = append(dayGroups[dayKey], window)
+		}
+
+		// Create daily summaries
+		for _, windows := range dayGroups {
+			if len(windows) == 0 {
+				continue
+			}
+
+			startTime := windows[0].StartTime
+			endTime := windows[len(windows)-1].EndTime
+
+			// Create summary for this day
+			summary := &MetricSummary{
+				StartTime: startTime,
+				EndTime:   endTime,
+			}
+
+			// Aggregate all windows for this day
+			for _, window := range windows {
+				summary.TotalConnectionsCreated += window.ConnectionsCreated
+				summary.TotalConnectionsDestroyed += window.ConnectionsDestroyed
+				summary.TotalAcquires += window.Acquires
+				summary.TotalReleases += window.Releases
+				summary.TotalErrors += window.Errors
+				summary.TotalRetries += window.Retries
+				summary.TotalAcquireWaitTime += window.AcquireWaitTime
+				summary.TotalBytesDownloaded += window.BytesDownloaded
+				summary.TotalBytesUploaded += window.BytesUploaded
+				summary.TotalArticlesRetrieved += window.ArticlesRetrieved
+				summary.TotalArticlesPosted += window.ArticlesPosted
+				summary.TotalCommandCount += window.CommandCount
+				summary.TotalCommandErrors += window.CommandErrors
+			}
+
+			// Calculate computed metrics
+			durationHours := endTime.Sub(startTime).Hours()
+			if durationHours > 0 {
+				summary.AverageConnectionsPerHour = float64(summary.TotalConnectionsCreated) / durationHours
+			}
+
+			if summary.TotalAcquires > 0 {
+				summary.AverageErrorRate = float64(summary.TotalErrors) / float64(summary.TotalAcquires) * 100
+				summary.AverageAcquireWaitTime = summary.TotalAcquireWaitTime / summary.TotalAcquires
+			}
+
+			if summary.TotalCommandCount > 0 {
+				successfulCommands := summary.TotalCommandCount - summary.TotalCommandErrors
+				summary.AverageSuccessRate = float64(successfulCommands) / float64(summary.TotalCommandCount) * 100
+			}
+
+			summary.WindowCount = len(windows)
+			summaries = append(summaries, summary)
+		}
+	}
+
+	// Keep only the recent windows
+	m.rollingMetrics.historicalWindows = keepWindows
+
+	return summaries
 }
 
 // ActiveConnectionMetrics represents metrics for active connections only
@@ -287,6 +862,27 @@ type PoolMetricsSnapshot struct {
 	TotalErrors  int64   `json:"total_errors"`
 	TotalRetries int64   `json:"total_retries"`
 	ErrorRate    float64 `json:"error_rate_percent"`
+
+	// Rolling metrics information
+	CurrentWindowStartTime  time.Time `json:"current_window_start_time"`
+	CurrentWindowEndTime    time.Time `json:"current_window_end_time"`
+	HistoricalWindowCount   int       `json:"historical_window_count"`
+	WindowRotationInterval  float64   `json:"window_rotation_interval_seconds"`
+	DetailedRetentionPeriod float64   `json:"detailed_retention_period_hours"`
+	MaxHistoricalWindows    int       `json:"max_historical_windows"`
+
+	// Memory management
+	MemoryThreshold    uint64    `json:"memory_threshold_bytes"`
+	CurrentMemoryUsage uint64    `json:"current_memory_usage_bytes"`
+	AutoCleanupEnabled bool      `json:"auto_cleanup_enabled"`
+	LastMemoryCheck    time.Time `json:"last_memory_check"`
+
+	// Connection cleanup statistics
+	ConnectionCleanupStats ConnectionCleanupStats `json:"connection_cleanup_stats"`
+
+	// Daily and weekly summaries
+	DailySummary  *MetricSummary `json:"daily_summary,omitempty"`
+	WeeklySummary *MetricSummary `json:"weekly_summary,omitempty"`
 
 	// Provider-specific metrics
 	ProviderMetrics []ProviderMetricsSnapshot `json:"provider_metrics"`
@@ -424,12 +1020,48 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 		totalConnections += stat.TotalResources()
 	}
 
+	// Get rolling metrics information
+	var currentWindowStart, currentWindowEnd time.Time
+	var historicalWindowCount int
+	var windowRotationInterval, detailedRetentionPeriod float64
+	var maxHistoricalWindows int
+	var memoryThreshold uint64
+	var autoCleanupEnabled bool
+	var lastMemoryCheck time.Time
+
+	if m.rollingMetrics != nil {
+		m.rollingMetrics.mu.RLock()
+		if m.rollingMetrics.currentWindow != nil {
+			currentWindowStart = m.rollingMetrics.currentWindow.StartTime
+			currentWindowEnd = m.rollingMetrics.currentWindow.EndTime
+		}
+		historicalWindowCount = len(m.rollingMetrics.historicalWindows)
+		windowRotationInterval = m.rollingMetrics.config.RotationInterval.Seconds()
+		detailedRetentionPeriod = m.rollingMetrics.config.DetailedRetentionDuration.Hours()
+		maxHistoricalWindows = m.rollingMetrics.config.MaxHistoricalWindows
+		memoryThreshold = m.rollingMetrics.config.MemoryThresholdBytes
+		autoCleanupEnabled = m.rollingMetrics.config.AutoCleanupEnabled
+		lastMemoryCheck = m.rollingMetrics.lastMemoryCheck
+		m.rollingMetrics.mu.RUnlock()
+	}
+
+	// Get current memory usage
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	// Get connection cleanup stats
+	connectionCleanupStats := m.GetConnectionCleanupStats()
+
+	// Get daily and weekly summaries
+	dailySummary := m.GetDailySummary()
+	weeklySummary := m.GetWeeklySummary()
+
 	return PoolMetricsSnapshot{
 		Timestamp:                 timestamp,
 		Uptime:                    uptime,
 		TotalConnectionsCreated:   m.GetTotalConnectionsCreated(),
 		TotalConnectionsDestroyed: m.GetTotalConnectionsDestroyed(),
-		ActiveConnections:         m.GetActiveConnections(),
+		ActiveConnections:         m.GetTotalActiveConnections(),
 		TotalAcquires:             m.GetTotalAcquires(),
 		TotalReleases:             m.GetTotalReleases(),
 		AcquiredConnections:       totalAcquired,
@@ -453,7 +1085,29 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 		TotalErrors:               m.GetTotalErrors(),
 		TotalRetries:              m.GetTotalRetries(),
 		ErrorRate:                 errorRate,
-		ProviderMetrics:           providerMetrics,
+
+		// Rolling metrics information
+		CurrentWindowStartTime:  currentWindowStart,
+		CurrentWindowEndTime:    currentWindowEnd,
+		HistoricalWindowCount:   historicalWindowCount,
+		WindowRotationInterval:  windowRotationInterval,
+		DetailedRetentionPeriod: detailedRetentionPeriod,
+		MaxHistoricalWindows:    maxHistoricalWindows,
+
+		// Memory management
+		MemoryThreshold:    memoryThreshold,
+		CurrentMemoryUsage: memStats.Alloc,
+		AutoCleanupEnabled: autoCleanupEnabled,
+		LastMemoryCheck:    lastMemoryCheck,
+
+		// Connection cleanup statistics
+		ConnectionCleanupStats: connectionCleanupStats,
+
+		// Daily and weekly summaries
+		DailySummary:  dailySummary,
+		WeeklySummary: weeklySummary,
+
+		ProviderMetrics: providerMetrics,
 	}
 }
 
@@ -467,32 +1121,8 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) AggregatedM
 	var totalArticlesRetrieved, totalArticlesPosted int64
 
 	// First, collect metrics from idle connections
-	idleResources := pool.connectionPool.AcquireAllIdle()
-	defer func() {
-		// Release all idle connections back to the pool
-		for _, res := range idleResources {
-			res.ReleaseUnused()
-		}
-	}()
-
-	connectionCount += len(idleResources)
-
-	for _, res := range idleResources {
-		conn := res.Value()
-		if conn.nntp != nil {
-			metrics := conn.nntp.GetMetrics()
-			if metrics != nil {
-				snapshot := metrics.GetSnapshot()
-				totalBytesDownloaded += snapshot.BytesDownloaded
-				totalBytesUploaded += snapshot.BytesUploaded
-				totalCommands += snapshot.TotalCommands
-				totalCommandErrors += snapshot.CommandErrors
-				totalConnectionAge += metrics.GetConnectionAge()
-				totalArticlesRetrieved += snapshot.ArticlesRetrieved
-				totalArticlesPosted += snapshot.ArticlesPosted
-			}
-		}
-	}
+	idleResources := pool.connectionPool.Stat().IdleResources()
+	connectionCount += int(idleResources)
 
 	// Second, collect metrics from active connections
 	m.activeConnections.Range(func(key, value interface{}) bool {
@@ -611,4 +1241,221 @@ func (m *PoolMetrics) calculateRecentSpeedsUncached() (downloadSpeed, uploadSpee
 	}
 
 	return downloadSpeed, uploadSpeed
+}
+
+// SetRetentionConfig updates the metric retention configuration
+func (m *PoolMetrics) SetRetentionConfig(config MetricRetentionConfig) {
+	if m.rollingMetrics == nil {
+		return
+	}
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	// Validate and set configuration values
+	if config.DetailedRetentionDuration > 0 {
+		m.rollingMetrics.config.DetailedRetentionDuration = config.DetailedRetentionDuration
+	}
+	if config.RotationInterval > 0 {
+		m.rollingMetrics.config.RotationInterval = config.RotationInterval
+
+		// Update current window end time if needed
+		if m.rollingMetrics.currentWindow != nil {
+			m.rollingMetrics.currentWindow.EndTime = m.rollingMetrics.currentWindow.StartTime.Add(config.RotationInterval)
+		}
+	}
+	if config.MaxHistoricalWindows > 0 {
+		m.rollingMetrics.config.MaxHistoricalWindows = config.MaxHistoricalWindows
+
+		// Trim historical windows if the new limit is smaller
+		if len(m.rollingMetrics.historicalWindows) > config.MaxHistoricalWindows {
+			excess := len(m.rollingMetrics.historicalWindows) - config.MaxHistoricalWindows
+			m.rollingMetrics.historicalWindows = m.rollingMetrics.historicalWindows[excess:]
+		}
+	}
+	if config.MemoryThresholdBytes > 0 {
+		m.rollingMetrics.config.MemoryThresholdBytes = config.MemoryThresholdBytes
+	}
+
+	m.rollingMetrics.config.AutoCleanupEnabled = config.AutoCleanupEnabled
+}
+
+// GetRetentionConfig returns the current metric retention configuration
+func (m *PoolMetrics) GetRetentionConfig() MetricRetentionConfig {
+	if m.rollingMetrics == nil {
+		return MetricRetentionConfig{}
+	}
+
+	m.rollingMetrics.mu.RLock()
+	defer m.rollingMetrics.mu.RUnlock()
+
+	return m.rollingMetrics.config
+}
+
+// SetRotationInterval updates how often metrics are rotated to new time windows
+func (m *PoolMetrics) SetRotationInterval(interval time.Duration) {
+	if m.rollingMetrics == nil || interval <= 0 {
+		return
+	}
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	m.rollingMetrics.config.RotationInterval = interval
+
+	// Update current window end time if needed
+	if m.rollingMetrics.currentWindow != nil {
+		m.rollingMetrics.currentWindow.EndTime = m.rollingMetrics.currentWindow.StartTime.Add(interval)
+	}
+}
+
+// SetDetailedRetentionDuration updates how long detailed metrics are kept before compression
+func (m *PoolMetrics) SetDetailedRetentionDuration(duration time.Duration) {
+	if m.rollingMetrics == nil || duration <= 0 {
+		return
+	}
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	m.rollingMetrics.config.DetailedRetentionDuration = duration
+}
+
+// SetMaxHistoricalWindows updates the maximum number of historical windows to keep
+func (m *PoolMetrics) SetMaxHistoricalWindows(maxWindows int) {
+	if m.rollingMetrics == nil || maxWindows <= 0 {
+		return
+	}
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	m.rollingMetrics.config.MaxHistoricalWindows = maxWindows
+
+	// Trim historical windows if the new limit is smaller
+	if len(m.rollingMetrics.historicalWindows) > maxWindows {
+		excess := len(m.rollingMetrics.historicalWindows) - maxWindows
+		m.rollingMetrics.historicalWindows = m.rollingMetrics.historicalWindows[excess:]
+	}
+}
+
+// SetMemoryThreshold updates the memory threshold that triggers automatic cleanup
+func (m *PoolMetrics) SetMemoryThreshold(thresholdBytes uint64) {
+	if m.rollingMetrics == nil {
+		return
+	}
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	m.rollingMetrics.config.MemoryThresholdBytes = thresholdBytes
+}
+
+// EnableAutoCleanup enables or disables automatic cleanup when memory thresholds are exceeded
+func (m *PoolMetrics) EnableAutoCleanup(enabled bool) {
+	if m.rollingMetrics == nil {
+		return
+	}
+
+	m.rollingMetrics.mu.Lock()
+	defer m.rollingMetrics.mu.Unlock()
+
+	m.rollingMetrics.config.AutoCleanupEnabled = enabled
+}
+
+// GetRollingMetricsStatus returns the current status of the rolling metrics system
+type RollingMetricsStatus struct {
+	Enabled                   bool      `json:"enabled"`
+	CurrentWindowActive       bool      `json:"current_window_active"`
+	CurrentWindowStartTime    time.Time `json:"current_window_start_time"`
+	CurrentWindowEndTime      time.Time `json:"current_window_end_time"`
+	CurrentWindowDuration     float64   `json:"current_window_duration_seconds"`
+	HistoricalWindowCount     int       `json:"historical_window_count"`
+	MaxHistoricalWindows      int       `json:"max_historical_windows"`
+	RotationInterval          float64   `json:"rotation_interval_seconds"`
+	DetailedRetentionDuration float64   `json:"detailed_retention_duration_hours"`
+	MemoryThreshold           uint64    `json:"memory_threshold_bytes"`
+	AutoCleanupEnabled        bool      `json:"auto_cleanup_enabled"`
+	LastMemoryCheck           time.Time `json:"last_memory_check"`
+	MemoryCheckInterval       float64   `json:"memory_check_interval_seconds"`
+}
+
+func (m *PoolMetrics) GetRollingMetricsStatus() RollingMetricsStatus {
+	if m.rollingMetrics == nil {
+		return RollingMetricsStatus{Enabled: false}
+	}
+
+	m.rollingMetrics.mu.RLock()
+	defer m.rollingMetrics.mu.RUnlock()
+
+	status := RollingMetricsStatus{
+		Enabled:                   true,
+		HistoricalWindowCount:     len(m.rollingMetrics.historicalWindows),
+		MaxHistoricalWindows:      m.rollingMetrics.config.MaxHistoricalWindows,
+		RotationInterval:          m.rollingMetrics.config.RotationInterval.Seconds(),
+		DetailedRetentionDuration: m.rollingMetrics.config.DetailedRetentionDuration.Hours(),
+		MemoryThreshold:           m.rollingMetrics.config.MemoryThresholdBytes,
+		AutoCleanupEnabled:        m.rollingMetrics.config.AutoCleanupEnabled,
+		LastMemoryCheck:           m.rollingMetrics.lastMemoryCheck,
+		MemoryCheckInterval:       m.rollingMetrics.memoryCheckInterval.Seconds(),
+	}
+
+	if m.rollingMetrics.currentWindow != nil {
+		status.CurrentWindowActive = true
+		status.CurrentWindowStartTime = m.rollingMetrics.currentWindow.StartTime
+		status.CurrentWindowEndTime = m.rollingMetrics.currentWindow.EndTime
+		status.CurrentWindowDuration = m.rollingMetrics.currentWindow.EndTime.Sub(m.rollingMetrics.currentWindow.StartTime).Seconds()
+	}
+
+	return status
+}
+
+// ResetCounters resets all atomic counters while preserving rolling metrics
+// This can be useful for periodic resets to prevent integer overflow
+func (m *PoolMetrics) ResetCounters() {
+	// Store current values in rolling metrics before reset
+	m.PerformRotationCheck() // This will rotate current window if needed
+
+	// Reset atomic counters
+	atomic.StoreInt64(&m.totalConnectionsCreated, 0)
+	atomic.StoreInt64(&m.totalConnectionsDestroyed, 0)
+	atomic.StoreInt64(&m.totalAcquires, 0)
+	atomic.StoreInt64(&m.totalReleases, 0)
+	atomic.StoreInt64(&m.totalErrors, 0)
+	atomic.StoreInt64(&m.totalRetries, 0)
+	atomic.StoreInt64(&m.totalAcquireWaitTime, 0)
+
+	// Update start time
+	atomic.StoreInt64(&m.startTime, time.Now().UnixNano())
+}
+
+// GetMemoryUsage returns current memory usage information
+type MemoryUsage struct {
+	AllocatedBytes      uint64 `json:"allocated_bytes"`
+	TotalAllocatedBytes uint64 `json:"total_allocated_bytes"`
+	SystemBytes         uint64 `json:"system_bytes"`
+	GCCount             uint32 `json:"gc_count"`
+	ThresholdBytes      uint64 `json:"threshold_bytes"`
+	ThresholdExceeded   bool   `json:"threshold_exceeded"`
+}
+
+func (m *PoolMetrics) GetMemoryUsage() MemoryUsage {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	var thresholdBytes uint64
+	if m.rollingMetrics != nil {
+		m.rollingMetrics.mu.RLock()
+		thresholdBytes = m.rollingMetrics.config.MemoryThresholdBytes
+		m.rollingMetrics.mu.RUnlock()
+	}
+
+	return MemoryUsage{
+		AllocatedBytes:      memStats.Alloc,
+		TotalAllocatedBytes: memStats.TotalAlloc,
+		SystemBytes:         memStats.Sys,
+		GCCount:             memStats.NumGC,
+		ThresholdBytes:      thresholdBytes,
+		ThresholdExceeded:   memStats.Alloc > thresholdBytes && thresholdBytes > 0,
+	}
 }

@@ -18,7 +18,7 @@ func TestPoolMetrics_Basic(t *testing.T) {
 	// Test initial state
 	assert.Equal(t, int64(0), metrics.GetTotalConnectionsCreated())
 	assert.Equal(t, int64(0), metrics.GetTotalConnectionsDestroyed())
-	assert.Equal(t, int64(0), metrics.GetActiveConnections())
+	assert.Equal(t, int64(0), metrics.GetTotalActiveConnections())
 	assert.Equal(t, int64(0), metrics.GetTotalAcquires())
 	assert.Equal(t, int64(0), metrics.GetTotalReleases())
 	assert.Equal(t, int64(0), metrics.GetTotalErrors())
@@ -32,13 +32,15 @@ func TestPoolMetrics_ConnectionLifecycle(t *testing.T) {
 	metrics.RecordConnectionCreated()
 	metrics.RecordConnectionCreated()
 	assert.Equal(t, int64(2), metrics.GetTotalConnectionsCreated())
-	assert.Equal(t, int64(2), metrics.GetActiveConnections())
+	// GetActiveConnections(nil) now returns 0 since no pools are provided
+	assert.Equal(t, int64(0), metrics.GetTotalActiveConnections())
 
 	// Record connection destruction
 	metrics.RecordConnectionDestroyed()
 	assert.Equal(t, int64(2), metrics.GetTotalConnectionsCreated())
 	assert.Equal(t, int64(1), metrics.GetTotalConnectionsDestroyed())
-	assert.Equal(t, int64(1), metrics.GetActiveConnections())
+	// GetActiveConnections(nil) still returns 0 since no pools are provided
+	assert.Equal(t, int64(0), metrics.GetTotalActiveConnections())
 }
 
 func TestPoolMetrics_AcquireRelease(t *testing.T) {
@@ -494,7 +496,7 @@ func TestPoolMetrics_ActiveConnectionRegistry(t *testing.T) {
 	metrics := NewPoolMetrics()
 
 	// Test initial state
-	assert.Equal(t, 0, metrics.GetActiveConnectionsCount())
+	assert.Equal(t, int64(0), metrics.GetTotalActiveConnections())
 	activeMetrics := metrics.GetActiveConnectionMetrics()
 	assert.Equal(t, 0, activeMetrics.Count)
 	assert.Equal(t, int64(0), activeMetrics.TotalBytesDownloaded)
@@ -536,10 +538,10 @@ func TestPoolMetrics_ActiveConnectionRegistration(t *testing.T) {
 
 	// Register active connections
 	metrics.RegisterActiveConnection("conn1", mockConn1)
-	assert.Equal(t, 1, metrics.GetActiveConnectionsCount())
+	assert.Equal(t, int64(1), metrics.GetTotalActiveConnections())
 
 	metrics.RegisterActiveConnection("conn2", mockConn2)
-	assert.Equal(t, 2, metrics.GetActiveConnectionsCount())
+	assert.Equal(t, int64(2), metrics.GetTotalActiveConnections())
 
 	// Get active metrics
 	activeMetrics := metrics.GetActiveConnectionMetrics()
@@ -557,10 +559,10 @@ func TestPoolMetrics_ActiveConnectionRegistration(t *testing.T) {
 
 	// Unregister connections
 	metrics.UnregisterActiveConnection("conn1")
-	assert.Equal(t, 1, metrics.GetActiveConnectionsCount())
+	assert.Equal(t, int64(1), metrics.GetTotalActiveConnections())
 
 	metrics.UnregisterActiveConnection("conn2")
-	assert.Equal(t, 0, metrics.GetActiveConnectionsCount())
+	assert.Equal(t, int64(0), metrics.GetTotalActiveConnections())
 
 	// Check final state
 	finalMetrics := metrics.GetActiveConnectionMetrics()
@@ -609,7 +611,7 @@ func TestPoolMetrics_ActiveConnectionConcurrency(t *testing.T) {
 	}
 
 	// Verify final state - all connections should be unregistered
-	assert.Equal(t, 0, metrics.GetActiveConnectionsCount())
+	assert.Equal(t, int64(0), metrics.GetTotalActiveConnections())
 	finalMetrics := metrics.GetActiveConnectionMetrics()
 	assert.Equal(t, 0, finalMetrics.Count)
 }
@@ -626,7 +628,7 @@ func TestPoolMetrics_ActiveConnectionWithNilMetrics(t *testing.T) {
 
 	// Register connection
 	metrics.RegisterActiveConnection("conn1", mockConn)
-	assert.Equal(t, 1, metrics.GetActiveConnectionsCount())
+	assert.Equal(t, int64(1), metrics.GetTotalActiveConnections())
 
 	// Get active metrics - should handle nil metrics gracefully
 	activeMetrics := metrics.GetActiveConnectionMetrics()
