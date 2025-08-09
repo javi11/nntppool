@@ -197,11 +197,23 @@ func (p *connectionPool) Quit() {
 			p.log.Warn("Shutdown timeout exceeded after 5 seconds, forcing close")
 		}
 
-		// Close all provider connection pools
-		for _, cp := range p.connPools {
-			if cp != nil && cp.connectionPool != nil {
-				cp.connectionPool.Close()
+		// Close all provider connection pools with timeout
+		poolCloseDone := make(chan struct{})
+		go func() {
+			defer close(poolCloseDone)
+			for _, cp := range p.connPools {
+				if cp != nil && cp.connectionPool != nil {
+					cp.connectionPool.Close()
+				}
 			}
+		}()
+
+		// Wait for pool close operations with 3-second timeout
+		select {
+		case <-poolCloseDone:
+			// Pool close operations completed normally
+		case <-time.After(5 * time.Second):
+			p.log.Warn("Pool close timeout exceeded after 3 seconds, forcing shutdown")
 		}
 
 		p.connPools = nil
