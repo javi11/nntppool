@@ -17,8 +17,6 @@ import (
 	"github.com/javi11/nntpcli"
 
 	"github.com/javi11/nntppool/internal/budget"
-	"github.com/javi11/nntppool/internal/config"
-	"github.com/javi11/nntppool/internal/migration"
 )
 
 const defaultHealthCheckInterval = 1 * time.Minute
@@ -116,15 +114,13 @@ type connectionPool struct {
 	log                     Logger
 	config                  Config
 	wg                      sync.WaitGroup
-	shutdownMu              sync.RWMutex       // Protects shutdown operations
-	isShutdown              int32              // Atomic flag for shutdown state
-	shutdownOnce            sync.Once          // Ensures single shutdown
-	connectionBudget        *budget.Budget     // Tracks connection limits per provider
-	migrationManager        *migration.Manager // Handles incremental migrations
-	metrics                 *PoolMetrics       // High-performance metrics collection
-	providerHealthCheckIdx  int                // Index for round-robin provider health checks
-	lastProviderHealthCheck time.Time          // Last time provider health check was performed
-	providerHealthCheckMu   sync.Mutex         // Protects provider health check state
+	shutdownOnce            sync.Once      // Ensures single shutdown
+	isShutdown              int32          // Atomic flag for shutdown state
+	connectionBudget        *budget.Budget // Tracks connection limits per provider
+	metrics                 *PoolMetrics   // High-performance metrics collection
+	providerHealthCheckIdx  int            // Index for round-robin provider health checks
+	lastProviderHealthCheck time.Time      // Last time provider health check was performed
+	providerHealthCheckMu   sync.Mutex     // Protects provider health check state
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
@@ -159,15 +155,11 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 		connPools:        pools,
 		log:              log,
 		config:           config,
-		closeChan:        make(chan struct{}, 1),
+		closeChan:        make(chan struct{}),
 		wg:               sync.WaitGroup{},
 		connectionBudget: budgetManager,
 		metrics:          metrics,
 	}
-
-	// Initialize migration manager with adapter
-	adapter := newMigrationAdapter(pool)
-	pool.migrationManager = migration.New(adapter)
 
 	healthCheckInterval := defaultHealthCheckInterval
 	if config.HealthCheckInterval > 0 {
@@ -188,15 +180,10 @@ func (p *connectionPool) Quit() {
 	p.shutdownOnce.Do(func() {
 		atomic.StoreInt32(&p.isShutdown, 1)
 
-		// Signal shutdown to health checker and reconnection system FIRST
-		select {
-		case p.closeChan <- struct{}{}:
-		default:
-			// Channel might be full, that's ok
-		}
+		// Signal shutdown to background goroutines
 		close(p.closeChan)
 
-		// Wait for background goroutines to finish with timeout
+		// Wait for background goroutines to finish with 5-second timeout
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -205,23 +192,16 @@ func (p *connectionPool) Quit() {
 
 		select {
 		case <-done:
-			// Normal shutdown
-		case <-time.After(p.config.ShutdownTimeout):
-			p.log.Warn("Shutdown timeout exceeded, forcing close")
+			// Background goroutines finished normally
+		case <-time.After(5 * time.Second):
+			p.log.Warn("Shutdown timeout exceeded after 5 seconds, forcing close")
 		}
 
-		// Now acquire the lock to do cleanup
-		p.shutdownMu.Lock()
-		defer p.shutdownMu.Unlock()
-
-		// Shutdown migration manager first to cancel any ongoing migrations
-		if p.migrationManager != nil {
-			p.migrationManager.Shutdown()
-		}
-
-		// Close all connection pools
+		// Close all provider connection pools
 		for _, cp := range p.connPools {
-			cp.connectionPool.Close()
+			if cp != nil && cp.connectionPool != nil {
+				cp.connectionPool.Close()
+			}
 		}
 
 		p.connPools = nil
@@ -233,15 +213,6 @@ func (p *connectionPool) GetConnection(
 	skipProviders []string,
 	useBackupProviders bool,
 ) (PooledConnection, error) {
-	if atomic.LoadInt32(&p.isShutdown) == 1 {
-		return nil, fmt.Errorf("connection pool is shutdown")
-	}
-
-	// Add read lock to prevent shutdown during connection acquisition
-	p.shutdownMu.RLock()
-	defer p.shutdownMu.RUnlock()
-
-	// Double-check after acquiring lock
 	if atomic.LoadInt32(&p.isShutdown) == 1 {
 		return nil, fmt.Errorf("connection pool is shutdown")
 	}
@@ -321,9 +292,6 @@ func (p *connectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bo
 		return nil, false
 	}
 
-	p.shutdownMu.RLock()
-	defer p.shutdownMu.RUnlock()
-
 	if p.connPools == nil {
 		return nil, false
 	}
@@ -359,63 +327,20 @@ func (p *connectionPool) Reconfigure(c ...Config) error {
 		return fmt.Errorf("connection pool is shutdown")
 	}
 
-	newConfig := mergeWithDefault(c...)
-
-	if len(newConfig.Providers) == 0 {
-		return ErrNoProviderAvailable
-	}
-
-	p.log.Info("starting incremental reconfiguration")
-
-	// Analyze what needs to change
-	diff := config.AnalyzeChanges(&p.config, &newConfig)
-
-	if !diff.HasChanges {
-		p.log.Info("no reconfiguration changes detected")
-		return nil
-	}
-
-	p.log.Info("reconfiguration changes detected",
-		"migration_id", diff.MigrationID,
-		"changes", len(diff.Changes),
-	)
-
-	// Start incremental migration
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	if err := p.migrationManager.StartMigration(ctx, diff); err != nil {
-		return fmt.Errorf("failed to start migration: %w", err)
-	}
-
-	// Update pool configuration with proper synchronization
-	p.shutdownMu.Lock()
-	p.config = newConfig
-	p.shutdownMu.Unlock()
-
-	p.log.Info("incremental migration started", "migration_id", diff.MigrationID)
-	return nil
+	// Simplified reconfigure - just return error indicating hot reload not supported
+	return fmt.Errorf("hot reconfiguration not supported - please restart the pool")
 }
 
 // GetReconfigurationStatus returns the status of a specific reconfiguration
 func (p *connectionPool) GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool) {
-	status, exists := p.migrationManager.GetReconfigurationStatus(migrationID)
-	if !exists {
-		return nil, false
-	}
-	return convertToInternalStatus(status), true
+	// No longer supporting hot reconfiguration
+	return nil, false
 }
 
 // GetActiveReconfigurations returns all currently active reconfigurations
 func (p *connectionPool) GetActiveReconfigurations() map[string]*ReconfigurationStatus {
-	internalReconfigurations := p.migrationManager.GetActiveReconfigurations()
-	result := make(map[string]*ReconfigurationStatus)
-
-	for k, v := range internalReconfigurations {
-		result[k] = convertToInternalStatus(v)
-	}
-
-	return result
+	// No longer supporting hot reconfiguration
+	return make(map[string]*ReconfigurationStatus)
 }
 
 // GetMetrics returns the pool's metrics instance for real-time monitoring
@@ -425,18 +350,8 @@ func (p *connectionPool) GetMetrics() *PoolMetrics {
 
 // GetMetricsSnapshot returns a comprehensive snapshot of pool and connection metrics
 func (p *connectionPool) GetMetricsSnapshot() PoolMetricsSnapshot {
-	if atomic.LoadInt32(&p.isShutdown) == 1 {
-		// Return empty snapshot if pool is shutdown
-		return PoolMetricsSnapshot{
-			Timestamp: time.Now(),
-		}
-	}
-
-	p.shutdownMu.RLock()
-	defer p.shutdownMu.RUnlock()
-
-	if p.connPools == nil {
-		// Return empty snapshot if pools are not available
+	if atomic.LoadInt32(&p.isShutdown) == 1 || p.connPools == nil {
+		// Return empty snapshot if pool is shutdown or not available
 		return PoolMetricsSnapshot{
 			Timestamp: time.Now(),
 		}
@@ -1143,11 +1058,7 @@ func (p *connectionPool) isExpired(res *puddle.Resource[*internalConnection]) bo
 
 // providerReconnectionSystem runs indefinitely trying to reconnect failed providers
 func (p *connectionPool) providerReconnectionSystem() {
-	// Read the interval with proper synchronization
-	p.shutdownMu.RLock()
 	interval := p.config.ProviderReconnectInterval
-	p.shutdownMu.RUnlock()
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	defer p.wg.Done()
@@ -1169,14 +1080,7 @@ func (p *connectionPool) providerReconnectionSystem() {
 
 // attemptProviderReconnections tries to reconnect offline providers
 func (p *connectionPool) attemptProviderReconnections(ctx context.Context) {
-	if atomic.LoadInt32(&p.isShutdown) == 1 {
-		return
-	}
-
-	p.shutdownMu.RLock()
-	defer p.shutdownMu.RUnlock()
-
-	if p.connPools == nil {
+	if atomic.LoadInt32(&p.isShutdown) == 1 || p.connPools == nil {
 		return
 	}
 
