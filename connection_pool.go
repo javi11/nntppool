@@ -1068,6 +1068,16 @@ func (p *connectionPool) isExpired(res *puddle.Resource[*internalConnection]) bo
 	return time.Now().After(res.Value().nntp.MaxAgeTime())
 }
 
+// isConnectionExpiredError checks if the error is likely due to an expired/stale connection
+func isConnectionExpiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	// Check for common expired connection error patterns
+	return isRetryableError(err)
+}
+
 // providerReconnectionSystem runs indefinitely trying to reconnect failed providers
 func (p *connectionPool) providerReconnectionSystem() {
 	interval := p.config.ProviderReconnectInterval
@@ -1264,42 +1274,78 @@ func (p *connectionPool) calculateBackoffDelay(retryCount int) time.Duration {
 // performLightweightProviderCheck performs a connectivity test to a provider using the connection pool
 // to respect connection limits and prevent exceeding provider quotas
 func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, pool *providerPool) error {
-	// Create a timeout context for this specific check
-	checkCtx, cancel := context.WithTimeout(ctx, p.config.ProviderHealthCheckTimeout)
-	defer cancel()
+	const maxRetries = 2
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Create a timeout context for this specific check
+		checkCtx, cancel := context.WithTimeout(ctx, p.config.ProviderHealthCheckTimeout)
+		
+		// Try to acquire a connection from the pool to respect connection limits
+		c, err := pool.connectionPool.Acquire(checkCtx)
+		if err != nil {
+			cancel()
+			// If we can't acquire a connection, it could mean:
+			// 1. Provider is offline/unreachable
+			// 2. Provider is at max connections (busy but healthy)
+			// 3. Pool creation failed
 
-	// Try to acquire a connection from the pool to respect connection limits
-	c, err := pool.connectionPool.Acquire(checkCtx)
-	if err != nil {
-		// If we can't acquire a connection, it could mean:
-		// 1. Provider is offline/unreachable
-		// 2. Provider is at max connections (busy but healthy)
-		// 3. Pool creation failed
+			// Check if this is a timeout/context error (likely busy)
+			if checkCtx.Err() == context.DeadlineExceeded {
+				// Provider is likely busy but healthy - treat as success
+				p.log.Debug(fmt.Sprintf("provider %s health check timeout - treating as busy but healthy", pool.provider.Host))
+				return nil
+			}
 
-		// Check if this is a timeout/context error (likely busy)
-		if checkCtx.Err() == context.DeadlineExceeded {
-			// Provider is likely busy but healthy - treat as success
-			p.log.Debug(fmt.Sprintf("provider %s health check timeout - treating as busy but healthy", pool.provider.Host))
-			return nil
+			return fmt.Errorf("failed to acquire connection for provider %s: %w", pool.provider.Host, err)
 		}
 
-		return fmt.Errorf("failed to acquire connection for provider %s: %w", pool.provider.Host, err)
-	}
-	defer c.ReleaseUnused()
+		// Get the underlying connection
+		conn := c.Value()
+		if conn == nil || conn.nntp == nil {
+			c.ReleaseUnused()
+			cancel()
+			return fmt.Errorf("provider %s has invalid connection", pool.provider.Host)
+		}
 
-	// Get the underlying connection
-	conn := c.Value()
-	if conn == nil || conn.nntp == nil {
-		return fmt.Errorf("provider %s has invalid connection", pool.provider.Host)
+		// Check if connection is expired before using it
+		if p.isExpired(c) {
+			p.log.Debug(fmt.Sprintf("provider %s health check found expired connection (attempt %d/%d), destroying and retrying", 
+				pool.provider.Host, attempt+1, maxRetries+1))
+			c.Destroy() // Destroy expired connection instead of releasing
+			cancel()
+			continue // Try again with a fresh connection
+		}
+
+		// Test basic NNTP command to ensure the server is responsive
+		_, err = conn.nntp.Capabilities()
+		if err != nil {
+			// Check if this error is likely due to connection expiry/staleness
+			if isConnectionExpiredError(err) && attempt < maxRetries {
+				p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (attempt %d/%d): %v, destroying connection and retrying", 
+					pool.provider.Host, attempt+1, maxRetries+1, err))
+				c.Destroy() // Destroy the bad connection
+				cancel()
+				continue // Try again with a fresh connection
+			}
+			
+			c.ReleaseUnused()
+			cancel()
+			return fmt.Errorf("capabilities check failed for provider %s: %w", pool.provider.Host, err)
+		}
+
+		// Success! Clean up and return
+		c.ReleaseUnused()
+		cancel()
+		
+		if attempt > 0 {
+			p.log.Debug(fmt.Sprintf("provider %s health check succeeded after %d retries", pool.provider.Host, attempt))
+		}
+		
+		return nil
 	}
 
-	// Test basic NNTP command to ensure the server is responsive
-	_, err = conn.nntp.Capabilities()
-	if err != nil {
-		return fmt.Errorf("capabilities check failed for provider %s: %w", pool.provider.Host, err)
-	}
-
-	return nil
+	// If we get here, all retries were exhausted
+	return fmt.Errorf("provider %s health check failed after %d attempts due to expired connections", pool.provider.Host, maxRetries+1)
 }
 
 // getProvidersToHealthCheck returns a list of providers that should be checked in this cycle

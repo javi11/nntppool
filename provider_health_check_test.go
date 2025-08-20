@@ -531,3 +531,31 @@ func TestProviderHealthCheckConcurrency(t *testing.T) {
 	assert.Greater(t, nonEmptyResults, 0, "At least some calls should return providers")
 	assert.Less(t, nonEmptyResults, 10, "Not all calls should return providers due to staggering")
 }
+
+func TestProviderHealthCheckExpiredConnectionRetry(t *testing.T) {
+	// Test the helper function that detects expired connection errors
+	t.Run("isConnectionExpiredError detects retryable errors", func(t *testing.T) {
+		testCases := []struct {
+			name     string
+			err      error
+			expected bool
+		}{
+			{"nil error", nil, false},
+			{"io.EOF", io.EOF, true},
+			{"generic error", assert.AnError, false},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				result := isConnectionExpiredError(tc.err)
+				assert.Equal(t, tc.expected, result)
+			})
+		}
+	})
+
+	// Note: The actual retry logic in performLightweightProviderCheck is complex to test
+	// due to connection pool interactions. The logic has been implemented and tested
+	// manually. The key improvement is that expired connections are now detected
+	// and retried up to 2 times before marking a provider as unhealthy.
+}
+
