@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/textproto"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -1319,19 +1320,23 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 
 		// Test basic NNTP command to ensure the server is responsive
 		_, err = conn.nntp.Stat("test")
-		if err != nil && err != nntpcli.ErrArticleNotFound {
-			// Check if this error is likely due to connection expiry/staleness
-			if isConnectionExpiredError(err) && attempt < maxRetries {
-				p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (attempt %d/%d): %v, destroying connection and retrying",
-					pool.provider.Host, attempt+1, maxRetries+1, err))
-				c.Destroy() // Destroy the bad connection
-				cancel()
-				continue // Try again with a fresh connection
-			}
+		if err != nil {
+			// If is not a textproto.Error, it could be a connection issue
+			var nntpErr *textproto.Error
+			if ok := errors.As(err, &nntpErr); !ok {
+				// Check if this error is likely due to connection expiry/staleness
+				if isConnectionExpiredError(err) && attempt < maxRetries {
+					p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (attempt %d/%d): %v, destroying connection and retrying",
+						pool.provider.Host, attempt+1, maxRetries+1, err))
+					c.Destroy() // Destroy the bad connection
+					cancel()
+					continue // Try again with a fresh connection
+				}
 
-			c.ReleaseUnused()
-			cancel()
-			return fmt.Errorf("capabilities check failed for provider %s: %w", pool.provider.Host, err)
+				c.ReleaseUnused()
+				cancel()
+				return fmt.Errorf("capabilities check failed for provider %s: %w", pool.provider.Host, err)
+			}
 		}
 
 		// Success! Clean up and return
