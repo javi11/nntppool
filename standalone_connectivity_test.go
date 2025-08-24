@@ -28,13 +28,12 @@ func TestStandaloneTestProviderConnectivity(t *testing.T) {
 			setupMocks: func(ctrl *gomock.Controller) nntpcli.Client {
 				mockClient := nntpcli.NewMockClient(ctrl)
 				mockConn := nntpcli.NewMockConnection(ctrl)
-				
+
 				mockClient.EXPECT().Dial(gomock.Any(), "test.example.com", 119, gomock.Any()).
 					Return(mockConn, nil)
 				mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil)
-				mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil)
 				mockConn.EXPECT().Close().AnyTimes()
-				
+
 				return mockClient
 			},
 			config: UsenetProviderConfig{
@@ -48,20 +47,46 @@ func TestStandaloneTestProviderConnectivity(t *testing.T) {
 			description:   "should succeed with working provider",
 		},
 		{
+			name: "successful connectivity test with capabilities",
+			setupMocks: func(ctrl *gomock.Controller) nntpcli.Client {
+				mockClient := nntpcli.NewMockClient(ctrl)
+				mockConn := nntpcli.NewMockConnection(ctrl)
+
+				mockClient.EXPECT().Dial(gomock.Any(), "test.example.com", 119, gomock.Any()).
+					Return(mockConn, nil)
+				mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil)
+				mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil)
+				mockConn.EXPECT().Close().AnyTimes()
+
+				return mockClient
+			},
+			config: UsenetProviderConfig{
+				Host:               "test.example.com",
+				Port:               119,
+				Username:           "testuser",
+				Password:           "testpass",
+				MaxConnections:     5,
+				VerifyCapabilities: []string{"READER"},
+			},
+			expectedError: false,
+			description:   "should succeed with working provider",
+		},
+		{
 			name: "connection failure",
 			setupMocks: func(ctrl *gomock.Controller) nntpcli.Client {
 				mockClient := nntpcli.NewMockClient(ctrl)
 				mockClient.EXPECT().Dial(gomock.Any(), "broken.example.com", 119, gomock.Any()).
 					Return(nil, errors.New("connection refused"))
-				
+
 				return mockClient
 			},
 			config: UsenetProviderConfig{
-				Host:           "broken.example.com",
-				Port:           119,
-				Username:       "testuser",
-				Password:       "testpass",
-				MaxConnections: 5,
+				Host:               "broken.example.com",
+				Port:               119,
+				Username:           "testuser",
+				Password:           "testpass",
+				MaxConnections:     5,
+				VerifyCapabilities: []string{"READER", "POST"},
 			},
 			expectedError: true,
 			errorContains: "failed to connect to provider broken.example.com",
@@ -72,21 +97,22 @@ func TestStandaloneTestProviderConnectivity(t *testing.T) {
 			setupMocks: func(ctrl *gomock.Controller) nntpcli.Client {
 				mockClient := nntpcli.NewMockClient(ctrl)
 				mockConn := nntpcli.NewMockConnection(ctrl)
-				
+
 				mockClient.EXPECT().Dial(gomock.Any(), "auth-fail.example.com", 119, gomock.Any()).
 					Return(mockConn, nil)
 				mockConn.EXPECT().Authenticate("user", "wrongpass").
 					Return(&textproto.Error{Code: AuthenticationFailedCode, Msg: "Authentication failed"})
 				mockConn.EXPECT().Close().AnyTimes()
-				
+
 				return mockClient
 			},
 			config: UsenetProviderConfig{
-				Host:           "auth-fail.example.com",
-				Port:           119,
-				Username:       "user",
-				Password:       "wrongpass",
-				MaxConnections: 5,
+				Host:               "auth-fail.example.com",
+				Port:               119,
+				Username:           "user",
+				Password:           "wrongpass",
+				MaxConnections:     5,
+				VerifyCapabilities: []string{"READER", "POST"},
 			},
 			expectedError: true,
 			errorContains: "authentication failed for provider auth-fail.example.com",
@@ -97,21 +123,22 @@ func TestStandaloneTestProviderConnectivity(t *testing.T) {
 			setupMocks: func(ctrl *gomock.Controller) nntpcli.Client {
 				mockClient := nntpcli.NewMockClient(ctrl)
 				mockConn := nntpcli.NewMockConnection(ctrl)
-				
+
 				mockClient.EXPECT().Dial(gomock.Any(), "caps-fail.example.com", 119, gomock.Any()).
 					Return(mockConn, nil)
 				mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil)
 				mockConn.EXPECT().Capabilities().Return(nil, errors.New("capabilities failed"))
 				mockConn.EXPECT().Close().AnyTimes()
-				
+
 				return mockClient
 			},
 			config: UsenetProviderConfig{
-				Host:           "caps-fail.example.com",
-				Port:           119,
-				Username:       "testuser",
-				Password:       "testpass",
-				MaxConnections: 5,
+				Host:               "caps-fail.example.com",
+				Port:               119,
+				Username:           "testuser",
+				Password:           "testpass",
+				MaxConnections:     5,
+				VerifyCapabilities: []string{"READER", "POST"},
 			},
 			expectedError: true,
 			errorContains: "failed to get capabilities from provider caps-fail.example.com",
@@ -122,22 +149,23 @@ func TestStandaloneTestProviderConnectivity(t *testing.T) {
 			setupMocks: func(ctrl *gomock.Controller) nntpcli.Client {
 				mockClient := nntpcli.NewMockClient(ctrl)
 				mockConn := nntpcli.NewMockConnection(ctrl)
-				
+
 				mockClient.EXPECT().Dial(gomock.Any(), "caps-auth-fail.example.com", 119, gomock.Any()).
 					Return(mockConn, nil)
 				mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil)
 				mockConn.EXPECT().Capabilities().
 					Return(nil, &textproto.Error{Code: AuthenticationFailedCode, Msg: "Authentication required for capabilities"})
 				mockConn.EXPECT().Close().AnyTimes()
-				
+
 				return mockClient
 			},
 			config: UsenetProviderConfig{
-				Host:           "caps-auth-fail.example.com",
-				Port:           119,
-				Username:       "testuser",
-				Password:       "testpass",
-				MaxConnections: 5,
+				Host:               "caps-auth-fail.example.com",
+				Port:               119,
+				Username:           "testuser",
+				Password:           "testpass",
+				MaxConnections:     5,
+				VerifyCapabilities: []string{"READER", "POST"},
 			},
 			expectedError: true,
 			errorContains: "authentication failed during capabilities check for provider caps-auth-fail.example.com",
@@ -152,7 +180,7 @@ func TestStandaloneTestProviderConnectivity(t *testing.T) {
 
 			mockClient := tt.setupMocks(ctrl)
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-			
+
 			ctx := context.Background()
 			err := TestProviderConnectivity(ctx, tt.config, logger, mockClient)
 
@@ -194,7 +222,7 @@ func TestStandaloneTestProviderConnectivityWithCapabilityRequirements(t *testing
 
 	ctx := context.Background()
 	err := TestProviderConnectivity(ctx, config, logger, mockClient)
-	
+
 	assert.Error(t, err, "should fail when required capability is missing")
 	assert.Contains(t, err.Error(), "does not support required capability POST")
 }
@@ -225,7 +253,7 @@ func TestStandaloneTestProviderConnectivityWithAllCapabilities(t *testing.T) {
 
 	ctx := context.Background()
 	err := TestProviderConnectivity(ctx, config, logger, mockClient)
-	
+
 	assert.NoError(t, err, "should succeed when all required capabilities are present")
 }
 
@@ -243,7 +271,7 @@ func TestStandaloneTestProviderConnectivityNilClient(t *testing.T) {
 	// This should now work by creating a default client, but will likely fail to connect
 	// since we're not mocking the actual network calls for the default client
 	err := TestProviderConnectivity(ctx, config, logger, nil)
-	
+
 	// Should fail with connection error (since it's trying to make a real connection)
 	// but not with "client cannot be nil" error
 	assert.Error(t, err, "should fail with connection error when using default client")
@@ -265,17 +293,18 @@ func TestStandaloneTestProviderConnectivityNilLogger(t *testing.T) {
 	mockConn.EXPECT().Close().AnyTimes()
 
 	config := UsenetProviderConfig{
-		Host:           "test.example.com",
-		Port:           119,
-		Username:       "testuser",
-		Password:       "testpass",
-		MaxConnections: 5,
+		Host:               "test.example.com",
+		Port:               119,
+		Username:           "testuser",
+		Password:           "testpass",
+		MaxConnections:     5,
+		VerifyCapabilities: []string{"READER"},
 	}
 
 	ctx := context.Background()
 	// Pass nil logger - should use default logger
 	err := TestProviderConnectivity(ctx, config, nil, mockClient)
-	
+
 	assert.NoError(t, err, "should succeed with nil logger (uses default)")
 }
 
@@ -331,16 +360,17 @@ func TestStandaloneTestProviderConnectivityNoAuth(t *testing.T) {
 	mockConn.EXPECT().Close().AnyTimes()
 
 	config := UsenetProviderConfig{
-		Host:           "noauth.example.com",
-		Port:           119,
-		Username:       "", // No username
-		Password:       "", // No password
-		MaxConnections: 5,
+		Host:               "noauth.example.com",
+		Port:               119,
+		Username:           "", // No username
+		Password:           "", // No password
+		MaxConnections:     5,
+		VerifyCapabilities: []string{"READER"},
 	}
 
 	ctx := context.Background()
 	err := TestProviderConnectivity(ctx, config, logger, mockClient)
-	
+
 	assert.NoError(t, err, "should succeed without authentication when no credentials provided")
 }
 
@@ -360,18 +390,19 @@ func TestStandaloneTestProviderConnectivityTLS(t *testing.T) {
 	mockConn.EXPECT().Close().AnyTimes()
 
 	config := UsenetProviderConfig{
-		Host:           "secure.example.com",
-		Port:           563,
-		Username:       "testuser",
-		Password:       "testpass",
-		MaxConnections: 5,
-		TLS:            true,
-		InsecureSSL:    false,
+		Host:               "secure.example.com",
+		Port:               563,
+		Username:           "testuser",
+		Password:           "testpass",
+		MaxConnections:     5,
+		TLS:                true,
+		InsecureSSL:        false,
+		VerifyCapabilities: []string{"READER"},
 	}
 
 	ctx := context.Background()
 	err := TestProviderConnectivity(ctx, config, logger, mockClient)
-	
+
 	assert.NoError(t, err, "should succeed with TLS connection")
 }
 
@@ -387,10 +418,10 @@ func TestStandaloneTestProviderConnectivityDefaultClient(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	
+
 	// Test calling without client parameter - should use default client
 	err := TestProviderConnectivity(ctx, config, logger, nil)
-	
+
 	// Should fail with connection error since we're using a non-existent host
 	assert.Error(t, err, "should fail with default client trying to connect to non-existent host")
 	assert.Contains(t, err.Error(), "failed to connect to provider nonexistent.example.com")

@@ -218,19 +218,19 @@ func TestProviderConnectivity(ctx context.Context, config UsenetProviderConfig, 
 		_ = conn.Close()
 	}()
 
-	// Test the connection by getting capabilities
-	caps, err := conn.Capabilities()
-	if err != nil {
-		if isAuthenticationError(err) {
-			return fmt.Errorf("authentication failed during capabilities check for provider %s: %w", config.Host, err)
-		}
-		return fmt.Errorf("failed to get capabilities from provider %s: %w", config.Host, err)
-	}
-
-	logger.Debug(fmt.Sprintf("capabilities for provider %s: %v", config.Host, caps))
-
 	// Verify required capabilities if specified
 	if len(config.VerifyCapabilities) > 0 {
+		// Test the connection by getting capabilities
+		caps, err := conn.Capabilities()
+		if err != nil {
+			if isAuthenticationError(err) {
+				return fmt.Errorf("authentication failed during capabilities check for provider %s: %w", config.Host, err)
+			}
+			return fmt.Errorf("failed to get capabilities from provider %s: %w", config.Host, err)
+		}
+
+		logger.Debug(fmt.Sprintf("capabilities for provider %s: %v", config.Host, caps))
+
 		for _, requiredCap := range config.VerifyCapabilities {
 			if !slices.Contains(caps, requiredCap) {
 				return fmt.Errorf("provider %s does not support required capability %s", config.Host, requiredCap)
