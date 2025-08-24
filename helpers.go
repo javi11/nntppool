@@ -120,12 +120,12 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 
 			defer c.Release()
 
-			conn := c.Value()
-			caps, _ := conn.nntp.Capabilities()
-
-			log.Info(fmt.Sprintf("capabilities for provider %s: %v", poolCopy.provider.Host, caps))
-
 			if len(poolCopy.provider.VerifyCapabilities) > 0 {
+				conn := c.Value()
+				caps, _ := conn.nntp.Capabilities()
+
+				log.Info(fmt.Sprintf("capabilities for provider %s: %v", poolCopy.provider.Host, caps))
+
 				for _, cap := range poolCopy.provider.VerifyCapabilities {
 					if !slices.Contains(caps, cap) {
 						err := fmt.Errorf("provider %s does not support capability %s", poolCopy.provider.Host, cap)
@@ -142,7 +142,7 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 			// Mark as successfully connected
 			poolCopy.SetConnectionAttempt(nil)
 			poolCopy.SetState(ProviderStateActive)
-			
+
 			log.Info(fmt.Sprintf("provider %s verified successfully", poolCopy.provider.Host))
 
 			return nil

@@ -1073,7 +1073,7 @@ func isConnectionExpiredError(err error) bool {
 	if err == nil {
 		return false
 	}
-	
+
 	// Check for common expired connection error patterns
 	return isRetryableError(err)
 }
@@ -1163,14 +1163,15 @@ func (p *connectionPool) attemptProviderReconnection(ctx context.Context, pool *
 
 	// Test the connection by getting capabilities
 	conn := c.Value()
-	caps, err := conn.nntp.Capabilities()
-	if err != nil {
-		p.handleReconnectionFailure(pool, err)
-		return
-	}
 
 	// Verify capabilities if needed
 	if len(pool.provider.VerifyCapabilities) > 0 {
+		caps, err := conn.nntp.Capabilities()
+		if err != nil {
+			p.handleReconnectionFailure(pool, err)
+			return
+		}
+
 		for _, cap := range pool.provider.VerifyCapabilities {
 			if !slices.Contains(caps, cap) {
 				err := fmt.Errorf("provider %s does not support capability %s", pool.provider.Host, cap)
@@ -1275,11 +1276,11 @@ func (p *connectionPool) calculateBackoffDelay(retryCount int) time.Duration {
 // to respect connection limits and prevent exceeding provider quotas
 func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, pool *providerPool) error {
 	const maxRetries = 2
-	
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// Create a timeout context for this specific check
 		checkCtx, cancel := context.WithTimeout(ctx, p.config.ProviderHealthCheckTimeout)
-		
+
 		// Try to acquire a connection from the pool to respect connection limits
 		c, err := pool.connectionPool.Acquire(checkCtx)
 		if err != nil {
@@ -1309,7 +1310,7 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 
 		// Check if connection is expired before using it
 		if p.isExpired(c) {
-			p.log.Debug(fmt.Sprintf("provider %s health check found expired connection (attempt %d/%d), destroying and retrying", 
+			p.log.Debug(fmt.Sprintf("provider %s health check found expired connection (attempt %d/%d), destroying and retrying",
 				pool.provider.Host, attempt+1, maxRetries+1))
 			c.Destroy() // Destroy expired connection instead of releasing
 			cancel()
@@ -1317,17 +1318,17 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		}
 
 		// Test basic NNTP command to ensure the server is responsive
-		_, err = conn.nntp.Capabilities()
-		if err != nil {
+		_, err = conn.nntp.Stat("test")
+		if err != nil && err != nntpcli.ErrArticleNotFound {
 			// Check if this error is likely due to connection expiry/staleness
 			if isConnectionExpiredError(err) && attempt < maxRetries {
-				p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (attempt %d/%d): %v, destroying connection and retrying", 
+				p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (attempt %d/%d): %v, destroying connection and retrying",
 					pool.provider.Host, attempt+1, maxRetries+1, err))
 				c.Destroy() // Destroy the bad connection
 				cancel()
 				continue // Try again with a fresh connection
 			}
-			
+
 			c.ReleaseUnused()
 			cancel()
 			return fmt.Errorf("capabilities check failed for provider %s: %w", pool.provider.Host, err)
@@ -1336,11 +1337,11 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		// Success! Clean up and return
 		c.ReleaseUnused()
 		cancel()
-		
+
 		if attempt > 0 {
 			p.log.Debug(fmt.Sprintf("provider %s health check succeeded after %d retries", pool.provider.Host, attempt))
 		}
-		
+
 		return nil
 	}
 
