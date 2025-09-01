@@ -13,9 +13,13 @@ type pooledBodyReader struct {
 	conn      PooledConnection
 	closeOnce sync.Once // Ensures Close is only called once
 	closed    bool      // Tracks if reader has been closed
+	mu        sync.RWMutex
 }
 
 func (r *pooledBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
+	r.mu.RLock()
+	defer r.mu.Unlock()
+
 	if r.closed {
 		return nntpcli.YencHeaders{}, io.EOF
 	}
@@ -24,6 +28,9 @@ func (r *pooledBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
 }
 
 func (r *pooledBodyReader) Read(p []byte) (n int, err error) {
+	r.mu.RLock()
+	defer r.mu.Unlock()
+
 	if r.closed {
 		return 0, io.EOF
 	}
@@ -31,6 +38,9 @@ func (r *pooledBodyReader) Read(p []byte) (n int, err error) {
 }
 
 func (r *pooledBodyReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	var closeErr error
 
 	r.closeOnce.Do(func() {
