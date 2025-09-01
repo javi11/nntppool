@@ -16,6 +16,10 @@ type pooledBodyReader struct {
 }
 
 func (r *pooledBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
+	if r.closed {
+		return nntpcli.YencHeaders{}, io.EOF
+	}
+
 	return r.reader.GetYencHeaders()
 }
 
