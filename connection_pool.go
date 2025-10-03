@@ -16,8 +16,6 @@ import (
 	"github.com/avast/retry-go/v4"
 	"github.com/jackc/puddle/v2"
 	"github.com/javi11/nntpcli"
-
-	"github.com/javi11/nntppool/internal/budget"
 )
 
 const defaultHealthCheckInterval = 1 * time.Minute
@@ -111,17 +109,17 @@ type UsenetConnectionPool interface {
 
 type connectionPool struct {
 	closeChan               chan struct{}
+	connPoolsMu             sync.RWMutex // Protects connPools access
 	connPools               []*providerPool
 	log                     Logger
 	config                  Config
 	wg                      sync.WaitGroup
-	shutdownOnce            sync.Once      // Ensures single shutdown
-	isShutdown              int32          // Atomic flag for shutdown state
-	connectionBudget        *budget.Budget // Tracks connection limits per provider
-	metrics                 *PoolMetrics   // High-performance metrics collection
-	providerHealthCheckIdx  int            // Index for round-robin provider health checks
-	lastProviderHealthCheck time.Time      // Last time provider health check was performed
-	providerHealthCheckMu   sync.Mutex     // Protects provider health check state
+	shutdownOnce            sync.Once  // Ensures single shutdown
+	isShutdown              int32      // Atomic flag for shutdown state
+	metrics                 *PoolMetrics // High-performance metrics collection
+	providerHealthCheckIdx  int          // Index for round-robin provider health checks
+	lastProviderHealthCheck time.Time    // Last time provider health check was performed
+	providerHealthCheckMu   sync.Mutex   // Protects provider health check state
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
@@ -146,20 +144,13 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 
 	log.Info("providers verified")
 
-	// Initialize connection budget
-	budgetManager := budget.New()
-	for _, provider := range config.Providers {
-		budgetManager.SetProviderLimit(provider.ID(), provider.MaxConnections)
-	}
-
 	pool := &connectionPool{
-		connPools:        pools,
-		log:              log,
-		config:           config,
-		closeChan:        make(chan struct{}),
-		wg:               sync.WaitGroup{},
-		connectionBudget: budgetManager,
-		metrics:          metrics,
+		connPools: pools,
+		log:       log,
+		config:    config,
+		closeChan: make(chan struct{}),
+		wg:        sync.WaitGroup{},
+		metrics:   metrics,
 	}
 
 	healthCheckInterval := defaultHealthCheckInterval
@@ -202,7 +193,13 @@ func (p *connectionPool) Quit() {
 		poolCloseDone := make(chan struct{})
 		go func() {
 			defer close(poolCloseDone)
-			for _, cp := range p.connPools {
+
+			// Lock to safely read connPools
+			p.connPoolsMu.RLock()
+			pools := p.connPools
+			p.connPoolsMu.RUnlock()
+
+			for _, cp := range pools {
 				if cp != nil && cp.connectionPool != nil {
 					cp.connectionPool.Close()
 				}
@@ -217,7 +214,10 @@ func (p *connectionPool) Quit() {
 			p.log.Warn("Pool close timeout exceeded after 3 seconds, forcing shutdown")
 		}
 
+		// Lock to safely set connPools to nil
+		p.connPoolsMu.Lock()
 		p.connPools = nil
+		p.connPoolsMu.Unlock()
 	})
 }
 
@@ -230,7 +230,10 @@ func (p *connectionPool) GetConnection(
 		return nil, fmt.Errorf("connection pool is shutdown")
 	}
 
+	// Lock access to connPools to prevent TOCTOU race with Quit()
+	p.connPoolsMu.RLock()
 	if p.connPools == nil {
+		p.connPoolsMu.RUnlock()
 		return nil, fmt.Errorf("connection pool is not available")
 	}
 
@@ -243,6 +246,7 @@ func (p *connectionPool) GetConnection(
 			cp = append(cp, provider)
 		}
 	}
+	p.connPoolsMu.RUnlock()
 
 	if len(cp) == 0 {
 		return nil, ErrArticleNotFoundInProviders
@@ -276,6 +280,9 @@ func (p *connectionPool) GetConnection(
 }
 
 func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
+	p.connPoolsMu.RLock()
+	defer p.connPoolsMu.RUnlock()
+
 	pi := make([]ProviderInfo, 0)
 
 	for _, pool := range p.connPools {
@@ -304,6 +311,9 @@ func (p *connectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bo
 	if atomic.LoadInt32(&p.isShutdown) == 1 {
 		return nil, false
 	}
+
+	p.connPoolsMu.RLock()
+	defer p.connPoolsMu.RUnlock()
 
 	if p.connPools == nil {
 		return nil, false
@@ -363,14 +373,25 @@ func (p *connectionPool) GetMetrics() *PoolMetrics {
 
 // GetMetricsSnapshot returns a comprehensive snapshot of pool and connection metrics
 func (p *connectionPool) GetMetricsSnapshot() PoolMetricsSnapshot {
-	if atomic.LoadInt32(&p.isShutdown) == 1 || p.connPools == nil {
-		// Return empty snapshot if pool is shutdown or not available
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		// Return empty snapshot if pool is shutdown
 		return PoolMetricsSnapshot{
 			Timestamp: time.Now(),
 		}
 	}
 
-	return p.metrics.GetSnapshot(p.connPools)
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
+	if pools == nil {
+		// Return empty snapshot if pools not available
+		return PoolMetricsSnapshot{
+			Timestamp: time.Now(),
+		}
+	}
+
+	return p.metrics.GetSnapshot(pools)
 }
 
 // Helper that will implement retry mechanism and provider rotation on top of the connection.
@@ -672,8 +693,9 @@ func (p *connectionPool) BodyReader(
 
 	// Wrap the reader to manage the connection lifecycle
 	return &pooledBodyReader{
-		reader: reader,
-		conn:   conn,
+		reader:  reader,
+		conn:    conn,
+		closeCh: make(chan struct{}),
 	}, nil
 }
 
@@ -1017,9 +1039,13 @@ func (p *connectionPool) checkHealth(ctx context.Context) {
 func (p *connectionPool) checkConnsHealth() bool {
 	var destroyed bool
 
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
 	idle := make([]*puddle.Resource[*internalConnection], 0)
 
-	for _, pool := range p.connPools {
+	for _, pool := range pools {
 		idle = append(idle, pool.connectionPool.AcquireAllIdle()...)
 	}
 
@@ -1103,11 +1129,19 @@ func (p *connectionPool) providerReconnectionSystem() {
 
 // attemptProviderReconnections tries to reconnect offline providers
 func (p *connectionPool) attemptProviderReconnections(ctx context.Context) {
-	if atomic.LoadInt32(&p.isShutdown) == 1 || p.connPools == nil {
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
 		return
 	}
 
-	for _, pool := range p.connPools {
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
+	if pools == nil {
+		return
+	}
+
+	for _, pool := range pools {
 		select {
 		case <-ctx.Done():
 			return
@@ -1360,7 +1394,11 @@ func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
 	p.providerHealthCheckMu.Lock()
 	defer p.providerHealthCheckMu.Unlock()
 
-	if len(p.connPools) == 0 {
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
+	if len(pools) == 0 {
 		return nil
 	}
 
@@ -1374,7 +1412,7 @@ func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
 	p.lastProviderHealthCheck = now
 
 	// Calculate how many providers to check per cycle to stagger over the health check interval
-	totalProviders := len(p.connPools)
+	totalProviders := len(pools)
 	if totalProviders == 0 {
 		return nil
 	}
@@ -1397,7 +1435,7 @@ func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
 	var providersToCheck []*providerPool
 	for i := 0; i < providersPerCycle && len(providersToCheck) < totalProviders; i++ {
 		idx := (p.providerHealthCheckIdx + i) % totalProviders
-		pool := p.connPools[idx]
+		pool := pools[idx]
 
 		// Only check active providers (offline/reconnecting providers are handled by reconnection worker)
 		state := pool.GetState()

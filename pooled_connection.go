@@ -53,8 +53,10 @@ func (p pooledConnection) connectionID() string {
 // cases where the connection was already released.
 func (p pooledConnection) Close() error {
 	var resultErr error
+	destroyed := false
 
-	defer func() { // recover from panics
+	defer func() {
+		// Recover from panics
 		if err := recover(); err != nil {
 			errorMsg := fmt.Sprintf("can not close a connection already released: %v", err)
 			p.log.Warn(errorMsg)
@@ -62,15 +64,16 @@ func (p pooledConnection) Close() error {
 				resultErr = fmt.Errorf("can not close a connection already released: %v", err)
 			}
 		}
+
+		// Update metrics only if destruction succeeded (after defer recovery)
+		if destroyed && p.metrics != nil {
+			p.metrics.UnregisterActiveConnection(p.connectionID())
+			p.metrics.RecordConnectionDestroyed()
+		}
 	}()
 
-	// Unregister from active connections before destroying
-	if p.metrics != nil {
-		p.metrics.UnregisterActiveConnection(p.connectionID())
-		p.metrics.RecordConnectionDestroyed()
-	}
-
 	p.resource.Destroy()
+	destroyed = true
 
 	return resultErr
 }
@@ -81,8 +84,10 @@ func (p pooledConnection) Close() error {
 // cases where the connection was already released.
 func (p pooledConnection) Free() error {
 	var resultErr error
+	released := false
 
-	defer func() { // recover from panics
+	defer func() {
+		// Recover from panics
 		if err := recover(); err != nil {
 			errorMsg := fmt.Sprintf("can not free a connection already released: %v", err)
 			p.log.Warn(errorMsg)
@@ -90,15 +95,16 @@ func (p pooledConnection) Free() error {
 				resultErr = fmt.Errorf("can not free a connection already released: %v", err)
 			}
 		}
+
+		// Update metrics only if release succeeded (after defer recovery)
+		if released && p.metrics != nil {
+			p.metrics.UnregisterActiveConnection(p.connectionID())
+			p.metrics.RecordRelease()
+		}
 	}()
 
-	// Unregister from active connections before releasing
-	if p.metrics != nil {
-		p.metrics.UnregisterActiveConnection(p.connectionID())
-		p.metrics.RecordRelease()
-	}
-
 	p.resource.Release()
+	released = true
 
 	return resultErr
 }
