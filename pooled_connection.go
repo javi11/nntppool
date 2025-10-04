@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/puddle/v2"
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/pkg/nntpcli"
 )
 
 // globalConnectionID is an atomic counter used to generate unique connection IDs.

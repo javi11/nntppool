@@ -5,15 +5,15 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/pkg/nntpcli"
 )
 
 // pooledBodyReader wraps an io.ReadCloser and manages the associated pooled connection
 type pooledBodyReader struct {
 	reader    nntpcli.ArticleBodyReader
 	conn      PooledConnection
-	closeOnce sync.Once  // Ensures Close is only called once
-	closed    atomic.Bool // Tracks if reader has been closed (atomic for lock-free check)
+	closeOnce sync.Once     // Ensures Close is only called once
+	closed    atomic.Bool   // Tracks if reader has been closed (atomic for lock-free check)
 	closeCh   chan struct{} // Signals when close is in progress
 	mu        sync.Mutex    // Protects Close() operations only
 }

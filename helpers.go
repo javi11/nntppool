@@ -13,7 +13,7 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/jackc/puddle/v2"
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/pkg/nntpcli"
 )
 
 func joinGroup(c nntpcli.Connection, groups []string) error {

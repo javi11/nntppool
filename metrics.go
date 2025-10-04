@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/pkg/nntpcli"
 )
 
 const (

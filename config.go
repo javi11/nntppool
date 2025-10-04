@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/avast/retry-go/v4"
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/pkg/nntpcli"
 
 	"github.com/javi11/nntppool/internal/config"
 )

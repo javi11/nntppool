@@ -7,6 +7,7 @@
 **Purpose**: Enable reliable, high-performance Usenet article downloads and posts through connection pooling, automatic retries, provider rotation, and yenc encoding/decoding.
 
 **Key Features**:
+
 - Connection pooling with configurable min/max connections per provider
 - Multiple provider support with automatic rotation on failures
 - Backup provider support for block account usage
@@ -23,6 +24,7 @@
 ### Core Components
 
 1. **ConnectionPool** (`connection_pool.go`)
+
    - Main interface and implementation for connection pooling
    - Manages lifecycle of connections across multiple providers
    - Implements retry logic and provider rotation
@@ -30,18 +32,21 @@
    - Thread-safe with extensive use of mutexes and atomic operations
 
 2. **Provider** (`provider.go`, `internal/provider/`)
+
    - Represents a single NNTP provider (primary or backup)
    - Manages provider-specific connection pools using `puddle`
    - Tracks provider health and status
    - Implements connection lifecycle management
 
 3. **Configuration** (`config.go`, `internal/config/`)
+
    - `Config`: Main pool configuration
    - `UsenetProviderConfig`: Per-provider settings
    - `MetricRetentionConfig`: Metrics system configuration
    - Supports validation and reconfiguration
 
 4. **Metrics System** (`metrics.go`)
+
    - Comprehensive metrics with rolling time windows (default: 1 hour)
    - Automatic cleanup to prevent memory growth
    - Connection tracking with stale connection detection
@@ -49,11 +54,13 @@
    - Memory usage monitoring
 
 5. **PooledConnection** (`pooled_connection.go`)
+
    - Wrapper around `nntpcli.Client` connections
    - Manages connection leases and automatic release
    - Thread-safe operations
 
 6. **PooledBodyReader** (`pooled_body_reader.go`)
+
    - Wraps article body readers with automatic connection release
    - Handles yenc header extraction
    - Thread-safe with mutex protection
@@ -81,7 +88,7 @@ nntppool/
 
 ### Key Dependencies
 
-- **nntpcli** (`github.com/javi11/nntpcli`): NNTP client library
+- **nntpcli** (`github.com/javi11/nntppool/pkg/nntpcli`): NNTP client library
 - **puddle** (`github.com/jackc/puddle/v2`): Generic resource pool
 - **rapidyenc** (`github.com/mnightingale/rapidyenc`): Fast yenc encoding/decoding (requires CGO)
 - **retry-go** (`github.com/avast/retry-go/v4`): Retry mechanisms
@@ -107,17 +114,20 @@ nntppool/
 ### Code Style
 
 1. **Follow Standard Go Conventions**
+
    - Use `gofmt` and `golangci-lint`
    - Idiomatic Go naming (PascalCase for exports, camelCase for private)
    - Clear, descriptive variable names
 
 2. **Error Handling**
+
    - Always handle errors explicitly
    - Use `fmt.Errorf` with `%w` for error wrapping
    - Use `multierror` for aggregating multiple errors
    - Return errors rather than logging and continuing
 
 3. **Concurrency**
+
    - Use mutexes for shared state protection
    - Prefer `sync.RWMutex` for read-heavy operations
    - Use `atomic` for simple counters and flags
@@ -125,6 +135,7 @@ nntppool/
    - Context-aware operations with proper cancellation
 
 4. **Documentation**
+
    - Document all exported types, functions, and constants
    - Use complete sentences starting with the name
    - Include usage examples for complex functions
@@ -267,6 +278,7 @@ func TestConnectionPool_Body(t *testing.T) {
 - **Command**: `make generate` to regenerate mocks
 
 Example:
+
 ```go
 //go:generate go tool mockgen -source=./connection_pool.go -destination=./connection_pool_mock.go -package=nntppool UsenetConnectionPool
 ```
@@ -403,6 +415,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for pull request workflow and testing gui
 ## Additional Resources
 
 - [Project README](README.md): Installation and usage
-- [nntpcli Documentation](https://pkg.go.dev/github.com/javi11/nntpcli): NNTP client library
+- [nntpcli Documentation](https://pkg.go.dev/github.com/javi11/nntppool/pkg/nntpcli): NNTP client library
 - [puddle Documentation](https://pkg.go.dev/github.com/jackc/puddle/v2): Resource pooling
 - [Google Go Testing Guide](https://google.github.io/styleguide/go/decisions.html#useful-test-failures)

@@ -15,7 +15,7 @@ import (
 
 	"github.com/avast/retry-go/v4"
 	"github.com/jackc/puddle/v2"
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/pkg/nntpcli"
 )
 
 const defaultHealthCheckInterval = 1 * time.Minute
@@ -114,8 +114,8 @@ type connectionPool struct {
 	log                     Logger
 	config                  Config
 	wg                      sync.WaitGroup
-	shutdownOnce            sync.Once  // Ensures single shutdown
-	isShutdown              int32      // Atomic flag for shutdown state
+	shutdownOnce            sync.Once    // Ensures single shutdown
+	isShutdown              int32        // Atomic flag for shutdown state
 	metrics                 *PoolMetrics // High-performance metrics collection
 	providerHealthCheckIdx  int          // Index for round-robin provider health checks
 	lastProviderHealthCheck time.Time    // Last time provider health check was performed

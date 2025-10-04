@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/pkg/nntpcli"
 )
 
 func TestSimplifiedQuit(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 	reflect "reflect"
 	time "time"
 
-	nntpcli "github.com/javi11/nntpcli"
+	nntpcli "github.com/javi11/nntppool/pkg/nntpcli"
 	gomock "go.uber.org/mock/gomock"
 )
 
