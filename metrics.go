@@ -9,6 +9,14 @@ import (
 	"github.com/javi11/nntpcli"
 )
 
+const (
+	// AbsoluteMaxHistoricalWindows is the hard cap on historical windows to prevent unbounded memory growth
+	AbsoluteMaxHistoricalWindows = 10000
+
+	// EmergencyCleanupThreshold triggers cleanup when reaching this percentage of absolute max
+	EmergencyCleanupThreshold = 0.8 // 80%
+)
+
 // speedCache holds cached speed calculation results
 type speedCache struct {
 	mu             sync.RWMutex
@@ -246,8 +254,20 @@ func (m *PoolMetrics) rotateCurrentWindow(now time.Time) {
 	// Add to historical windows
 	m.rollingMetrics.historicalWindows = append(m.rollingMetrics.historicalWindows, m.rollingMetrics.currentWindow)
 
-	// Trim historical windows if we exceed the limit
+	// Emergency cleanup if approaching absolute maximum (prevents unbounded growth)
+	emergencyThreshold := int(float64(AbsoluteMaxHistoricalWindows) * EmergencyCleanupThreshold)
+	if len(m.rollingMetrics.historicalWindows) > emergencyThreshold {
+		m.performEmergencyWindowCleanup()
+	}
+
+	// Trim historical windows if we exceed the configured limit
 	maxWindows := m.rollingMetrics.config.MaxHistoricalWindows
+
+	// Enforce absolute hard cap (never exceed this regardless of config)
+	if maxWindows > AbsoluteMaxHistoricalWindows {
+		maxWindows = AbsoluteMaxHistoricalWindows
+	}
+
 	if len(m.rollingMetrics.historicalWindows) > maxWindows {
 		// Remove oldest windows
 		excess := len(m.rollingMetrics.historicalWindows) - maxWindows
@@ -256,6 +276,21 @@ func (m *PoolMetrics) rotateCurrentWindow(now time.Time) {
 
 	// Create new current window
 	m.createNewCurrentWindow(now)
+}
+
+// performEmergencyWindowCleanup aggressively reduces window count to prevent memory exhaustion
+func (m *PoolMetrics) performEmergencyWindowCleanup() {
+	currentCount := len(m.rollingMetrics.historicalWindows)
+
+	// Keep only most recent 25% of windows
+	keepCount := currentCount / 4
+	if keepCount < 24 {
+		keepCount = 24 // Keep at least 1 day of hourly data
+	}
+
+	if keepCount < currentCount {
+		m.rollingMetrics.historicalWindows = m.rollingMetrics.historicalWindows[currentCount-keepCount:]
+	}
 }
 
 // createNewCurrentWindow creates a new current window starting at the given time
@@ -1173,7 +1208,7 @@ func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) AggregatedM
 func (m *PoolMetrics) calculateRecentSpeeds(pools []*providerPool) (downloadSpeed, uploadSpeed float64) {
 	now := time.Now()
 
-	// Check if we have fresh cached values first
+	// Fast path: Check if we have fresh cached values (read lock)
 	m.speedCache.mu.RLock()
 	if !m.speedCache.lastCalculated.IsZero() &&
 		now.Sub(m.speedCache.lastCalculated) < m.speedCache.cacheDuration {
@@ -1185,15 +1220,24 @@ func (m *PoolMetrics) calculateRecentSpeeds(pools []*providerPool) (downloadSpee
 	}
 	m.speedCache.mu.RUnlock()
 
+	// Slow path: Acquire write lock to calculate (check-lock-check pattern)
+	m.speedCache.mu.Lock()
+	defer m.speedCache.mu.Unlock()
+
+	// Re-check cache after acquiring write lock (another goroutine may have updated it)
+	if !m.speedCache.lastCalculated.IsZero() &&
+		now.Sub(m.speedCache.lastCalculated) < m.speedCache.cacheDuration {
+		// Another goroutine already updated the cache
+		return m.speedCache.downloadSpeed, m.speedCache.uploadSpeed
+	}
+
 	// Cache is stale or empty, calculate fresh values
 	downloadSpeed, uploadSpeed = m.calculateRecentSpeedsUncached()
 
-	// Update cache with new values
-	m.speedCache.mu.Lock()
+	// Update cache with new values (lock already held)
 	m.speedCache.lastCalculated = now
 	m.speedCache.downloadSpeed = downloadSpeed
 	m.speedCache.uploadSpeed = uploadSpeed
-	m.speedCache.mu.Unlock()
 
 	return downloadSpeed, uploadSpeed
 }

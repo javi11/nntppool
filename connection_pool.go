@@ -153,6 +153,19 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 		metrics:   metrics,
 	}
 
+	// Pre-warm pool with MinConnections to reduce latency for first requests
+	if config.MinConnections > 0 {
+		log.Info(fmt.Sprintf("Pre-warming pool with %d connections", config.MinConnections))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := pool.createIdleResources(ctx, config.MinConnections); err != nil {
+			log.Warn("Failed to pre-warm all connections, will continue with partial warmup", "error", err)
+			// Don't fail pool creation, health checks will create more connections later
+		}
+	}
+
 	healthCheckInterval := defaultHealthCheckInterval
 	if config.HealthCheckInterval > 0 {
 		healthCheckInterval = config.HealthCheckInterval
@@ -265,11 +278,8 @@ func (p *connectionPool) GetConnection(
 	// Record successful acquire timing
 	p.metrics.RecordAcquireWaitTime(time.Since(start))
 
-	pooledConn := pooledConnection{
-		resource: conn,
-		log:      p.log,
-		metrics:  p.metrics,
-	}
+	// Create pooled connection with unique ID
+	pooledConn := newPooledConnection(conn, p.log, p.metrics)
 
 	// Register the connection as active for metrics tracking
 	if conn.Value().nntp != nil {
@@ -420,9 +430,9 @@ func (p *connectionPool) Body(
 	nntpGroups []string,
 ) (int64, error) {
 	var (
-		written      int64
-		conn         PooledConnection
-		bytesWritten int64
+		totalBytesFromPreviousAttempts int64 // Cumulative bytes written across failed retry attempts
+		conn                           PooledConnection
+		finalBytesWritten              int64 // Total bytes written on successful attempt
 	)
 
 	skipProviders := make([]string, 0)
@@ -438,7 +448,9 @@ func (p *connectionPool) Body(
 		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
 		if err != nil {
 			if c != nil {
-				_ = c.Close()
+				if closeErr := c.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
+				}
 			}
 
 			if errors.Is(err, context.Canceled) {
@@ -458,15 +470,17 @@ func (p *connectionPool) Body(
 			}
 		}
 
-		n, err := nntpConn.BodyDecoded(msgID, w, written)
+		n, err := nntpConn.BodyDecoded(msgID, w, totalBytesFromPreviousAttempts)
 		if err != nil && ctx.Err() == nil {
-			written += n
+			totalBytesFromPreviousAttempts += n
 			return fmt.Errorf("error downloading body: %w", err)
 		}
 
-		bytesWritten = n
+		finalBytesWritten = n
 
-		_ = conn.Free()
+		if err := conn.Free(); err != nil {
+			p.log.DebugContext(ctx, "Failed to free connection after successful body download", "error", err)
+		}
 
 		return nil
 	},
@@ -496,7 +510,9 @@ func (p *connectionPool) Body(
 						provider.Host,
 					)
 
-					_ = conn.Free()
+					if freeErr := conn.Free(); freeErr != nil {
+						p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
+					}
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -507,7 +523,9 @@ func (p *connectionPool) Body(
 						"error_connection_created_at", conn.CreatedAt(),
 					)
 
-					_ = conn.Close()
+					if closeErr := conn.Close(); closeErr != nil {
+						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
+					}
 					conn = nil
 				}
 			}
@@ -524,9 +542,13 @@ func (p *connectionPool) Body(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -539,15 +561,15 @@ func (p *connectionPool) Body(
 
 		if nntpcli.IsArticleNotFoundError(err) {
 			// if article not found, we don't want to retry so mark it as corrupted
-			return bytesWritten, ErrArticleNotFoundInProviders
+			return finalBytesWritten, ErrArticleNotFoundInProviders
 		}
 
-		return bytesWritten, err
+		return finalBytesWritten, err
 	}
 
 	conn = nil
 
-	return bytesWritten, nil
+	return finalBytesWritten, nil
 }
 
 // BodyReader retrieves the body reader of a message with the given message ID from the NNTP server.
@@ -586,7 +608,9 @@ func (p *connectionPool) BodyReader(
 		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
 		if err != nil {
 			if c != nil {
-				_ = c.Close()
+				if closeErr := c.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
+				}
 			}
 
 			if errors.Is(err, context.Canceled) {
@@ -642,7 +666,9 @@ func (p *connectionPool) BodyReader(
 						provider.Host,
 					)
 
-					_ = conn.Free()
+					if freeErr := conn.Free(); freeErr != nil {
+						p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
+					}
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -653,7 +679,9 @@ func (p *connectionPool) BodyReader(
 						"error_connection_created_at", conn.CreatedAt(),
 					)
 
-					_ = conn.Close()
+					if closeErr := conn.Close(); closeErr != nil {
+						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
+					}
 					conn = nil
 				}
 			}
@@ -671,9 +699,13 @@ func (p *connectionPool) BodyReader(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -796,9 +828,13 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -848,7 +884,9 @@ func (p *connectionPool) Stat(
 		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
 		if err != nil {
 			if c != nil {
-				_ = c.Close()
+				if closeErr := c.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
+				}
 			}
 
 			if errors.Is(err, context.Canceled) {
@@ -924,9 +962,13 @@ func (p *connectionPool) Stat(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -1066,8 +1108,13 @@ func (p *connectionPool) checkConnsHealth() bool {
 
 func (p *connectionPool) createIdleResources(ctx context.Context, toCreate int) error {
 	for i := 0; i < toCreate; i++ {
-		if _, err := p.GetConnection(ctx, []string{}, false); err != nil {
+		conn, err := p.GetConnection(ctx, []string{}, false)
+		if err != nil {
 			return err
+		}
+		// Immediately free the connection back to the pool to keep it idle
+		if freeErr := conn.Free(); freeErr != nil {
+			p.log.Debug("Failed to free connection during warmup", "error", freeErr)
 		}
 	}
 

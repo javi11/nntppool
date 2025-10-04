@@ -5,13 +5,16 @@ package nntppool
 
 import (
 	"fmt"
-	"strconv"
+	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/jackc/puddle/v2"
 	"github.com/javi11/nntpcli"
 )
+
+// globalConnectionID is an atomic counter used to generate unique connection IDs.
+// Each new connection increments this counter to get a deterministic, human-readable ID.
+var globalConnectionID atomic.Uint64
 
 type internalConnection struct {
 	nntp                 nntpcli.Connection   // 8 bytes
@@ -40,11 +43,29 @@ type pooledConnection struct {
 	resource *puddle.Resource[*internalConnection]
 	log      Logger
 	metrics  *PoolMetrics
+	id       string // Unique identifier for this connection (e.g., "conn-1", "conn-2")
 }
 
-// connectionID generates a unique identifier for this connection
+// newPooledConnection creates a new pooled connection with a unique ID.
+// The ID is generated using an atomic counter, ensuring deterministic and
+// human-readable connection identifiers (e.g., "conn-1", "conn-2").
+func newPooledConnection(resource *puddle.Resource[*internalConnection], log Logger, metrics *PoolMetrics) pooledConnection {
+	// Generate a unique ID using atomic counter
+	id := fmt.Sprintf("conn-%d", globalConnectionID.Add(1))
+
+	return pooledConnection{
+		resource: resource,
+		log:      log,
+		metrics:  metrics,
+		id:       id,
+	}
+}
+
+// connectionID returns the unique identifier for this connection.
+// The ID is assigned when the connection is created and remains constant
+// throughout the connection's lifetime.
 func (p pooledConnection) connectionID() string {
-	return strconv.FormatUint(uint64(uintptr(unsafe.Pointer(p.resource))), 16)
+	return p.id
 }
 
 // Close destroys the connection and removes it from the pool.

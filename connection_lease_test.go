@@ -42,10 +42,7 @@ func TestConnectionLeaseExpiration(t *testing.T) {
 	}
 	defer resource.Release()
 
-	pooledConn := pooledConnection{
-		resource: resource,
-		log:      slog.Default(),
-	}
+	pooledConn := newPooledConnection(resource, slog.Default(), nil)
 
 	// Initially not expired
 	if pooledConn.IsLeaseExpired() {
@@ -90,10 +87,7 @@ func TestConnectionLeaseExtension(t *testing.T) {
 	}
 	defer resource.Release()
 
-	pooledConn := pooledConnection{
-		resource: resource,
-		log:      slog.Default(),
-	}
+	pooledConn := newPooledConnection(resource, slog.Default(), nil)
 
 	// Extend lease before it expires
 	pooledConn.ExtendLease(200 * time.Millisecond)
@@ -144,10 +138,7 @@ func TestConnectionMarkForReplacement(t *testing.T) {
 	}
 	defer resource.Release()
 
-	pooledConn := pooledConnection{
-		resource: resource,
-		log:      slog.Default(),
-	}
+	pooledConn := newPooledConnection(resource, slog.Default(), nil)
 
 	// Initially not marked for replacement
 	if pooledConn.IsMarkedForReplacement() {
@@ -194,10 +185,7 @@ func TestConnectionProviderInfo(t *testing.T) {
 	}
 	defer resource.Release()
 
-	pooledConn := pooledConnection{
-		resource: resource,
-		log:      slog.Default(),
-	}
+	pooledConn := newPooledConnection(resource, slog.Default(), nil)
 
 	info := pooledConn.Provider()
 
@@ -250,10 +238,7 @@ func TestConnectionCreatedAt(t *testing.T) {
 	defer resource.Release()
 	afterAcquire := time.Now()
 
-	pooledConn := pooledConnection{
-		resource: resource,
-		log:      slog.Default(),
-	}
+	pooledConn := newPooledConnection(resource, slog.Default(), nil)
 
 	createdAt := pooledConn.CreatedAt()
 
@@ -293,10 +278,7 @@ func TestConnectionNNTPAccess(t *testing.T) {
 	}
 	defer resource.Release()
 
-	pooledConn := pooledConnection{
-		resource: resource,
-		log:      slog.Default(),
-	}
+	pooledConn := newPooledConnection(resource, slog.Default(), nil)
 
 	// Test that we can access the underlying NNTP connection
 	nntpConn := pooledConn.Connection()
