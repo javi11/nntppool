@@ -132,22 +132,6 @@ func TestProviderPoolDrainTracking(t *testing.T) {
 	}
 }
 
-func TestProviderPoolMigrationID(t *testing.T) {
-	pool := &providerPool{}
-
-	// Initially no migration ID
-	if id := pool.GetMigrationID(); id != "" {
-		t.Errorf("expected empty migration ID, got %q", id)
-	}
-
-	// Set migration ID
-	testID := "migration_123456"
-	pool.SetMigrationID(testID)
-	if id := pool.GetMigrationID(); id != testID {
-		t.Errorf("expected migration ID %q, got %q", testID, id)
-	}
-}
-
 func TestProviderPoolConcurrentStateAccess(t *testing.T) {
 	pool := &providerPool{
 		state: ProviderStateActive,
@@ -176,8 +160,6 @@ func TestProviderPoolConcurrentStateAccess(t *testing.T) {
 	// Start more goroutines setting migration ID
 	for i := 0; i < 50; i++ {
 		go func(index int) {
-			pool.SetMigrationID("migration_" + string(rune(index)))
-			pool.GetMigrationID()
 			done <- true
 		}(i)
 	}
@@ -191,7 +173,6 @@ func TestProviderPoolConcurrentStateAccess(t *testing.T) {
 	_ = pool.GetState()
 	_ = pool.IsAcceptingConnections()
 	_ = pool.GetDrainDuration()
-	_ = pool.GetMigrationID()
 }
 
 func TestConnectionProviderInfoID(t *testing.T) {

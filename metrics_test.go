@@ -400,51 +400,29 @@ func TestPoolMetrics_NonBlockingSpeedCalculation(t *testing.T) {
 }
 
 func TestPoolMetrics_ActiveOnlySpeedCalculation(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
 	metrics := NewPoolMetrics()
 
-	// Test with no active connections - should return 0
+	// Test with no activity - should return 0
 	downloadSpeed, uploadSpeed := metrics.calculateRecentSpeedsUncached()
 	assert.Equal(t, float64(0), downloadSpeed)
 	assert.Equal(t, float64(0), uploadSpeed)
 
-	// Add mock active connections
-	mockConn1 := nntpcli.NewMockConnection(ctrl)
-	mockConn2 := nntpcli.NewMockConnection(ctrl)
+	// Record some download/upload activity at pool level
+	metrics.RecordDownload(3000)
+	metrics.RecordUpload(1300)
 
-	mockMetrics1 := nntpcli.NewMetrics()
-	mockMetrics2 := nntpcli.NewMetrics()
-
-	mockConn1.EXPECT().GetMetrics().Return(mockMetrics1).AnyTimes()
-	mockConn2.EXPECT().GetMetrics().Return(mockMetrics2).AnyTimes()
-
-	// Simulate some activity
-	mockMetrics1.RecordDownload(1000)
-	mockMetrics1.RecordUpload(500)
-	mockMetrics2.RecordDownload(2000)
-	mockMetrics2.RecordUpload(800)
-
-	// Register as active connections
-	metrics.RegisterActiveConnection("conn1", mockConn1)
-	metrics.RegisterActiveConnection("conn2", mockConn2)
-
-	// Calculate speed based on active connections only
+	// Calculate speed based on rolling window
 	downloadSpeed, uploadSpeed = metrics.calculateRecentSpeedsUncached()
 
-	// Should have non-zero speeds based on active connections
-	assert.True(t, downloadSpeed > 0, "Download speed should be > 0 with active connections")
-	assert.True(t, uploadSpeed > 0, "Upload speed should be > 0 with active connections")
+	// Should have non-zero speeds based on recorded bytes
+	assert.True(t, downloadSpeed > 0, "Download speed should be > 0 after recording downloads")
+	assert.True(t, uploadSpeed > 0, "Upload speed should be > 0 after recording uploads")
 
-	// Unregister connections
-	metrics.UnregisterActiveConnection("conn1")
-	metrics.UnregisterActiveConnection("conn2")
-
-	// Should return to 0 with no active connections
-	downloadSpeed, uploadSpeed = metrics.calculateRecentSpeedsUncached()
-	assert.Equal(t, float64(0), downloadSpeed)
-	assert.Equal(t, float64(0), uploadSpeed)
+	// Verify the speeds match expected values (bytes / window duration)
+	expectedDownloadSpeed := float64(3000) / metrics.speedWindowDuration.Seconds()
+	expectedUploadSpeed := float64(1300) / metrics.speedWindowDuration.Seconds()
+	assert.Equal(t, expectedDownloadSpeed, downloadSpeed)
+	assert.Equal(t, expectedUploadSpeed, uploadSpeed)
 }
 
 // Benchmark tests to ensure minimal performance overhead
@@ -515,27 +493,6 @@ func TestPoolMetrics_ActiveConnectionRegistration(t *testing.T) {
 	mockConn1 := nntpcli.NewMockConnection(ctrl)
 	mockConn2 := nntpcli.NewMockConnection(ctrl)
 
-	// Create mock metrics for the connections
-	mockMetrics1 := nntpcli.NewMetrics()
-	mockMetrics2 := nntpcli.NewMetrics()
-
-	// Setup expectations for mock connections to return our metrics
-	mockConn1.EXPECT().GetMetrics().Return(mockMetrics1).AnyTimes()
-	mockConn2.EXPECT().GetMetrics().Return(mockMetrics2).AnyTimes()
-
-	// Simulate some activity on the connections
-	mockMetrics1.RecordDownload(1000)
-	mockMetrics1.RecordUpload(500)
-	for i := 0; i < 10; i++ {
-		mockMetrics1.RecordCommand(i < 9) // 9 successes, 1 failure
-	}
-
-	mockMetrics2.RecordDownload(2000)
-	mockMetrics2.RecordUpload(800)
-	for i := 0; i < 15; i++ {
-		mockMetrics2.RecordCommand(i < 13) // 13 successes, 2 failures
-	}
-
 	// Register active connections
 	metrics.RegisterActiveConnection("conn1", mockConn1)
 	assert.Equal(t, int64(1), metrics.GetTotalActiveConnections())
@@ -543,19 +500,16 @@ func TestPoolMetrics_ActiveConnectionRegistration(t *testing.T) {
 	metrics.RegisterActiveConnection("conn2", mockConn2)
 	assert.Equal(t, int64(2), metrics.GetTotalActiveConnections())
 
-	// Get active metrics
+	// Get active metrics - now only returns count since connection metrics are removed
 	activeMetrics := metrics.GetActiveConnectionMetrics()
 	assert.Equal(t, 2, activeMetrics.Count)
-	assert.Equal(t, int64(3000), activeMetrics.TotalBytesDownloaded) // 1000 + 2000
-	assert.Equal(t, int64(1300), activeMetrics.TotalBytesUploaded)   // 500 + 800
-	assert.Equal(t, int64(25), activeMetrics.TotalCommands)          // 10 + 15
-	assert.Equal(t, int64(3), activeMetrics.TotalCommandErrors)      // 1 + 2
-
-	// Success rate should be (25-3)/25 * 100 = 88%
-	assert.InDelta(t, 88.0, activeMetrics.SuccessRate, 0.1)
-
-	// Connection age will be very small since we just created the metrics
-	assert.True(t, activeMetrics.AverageConnectionAge > 0)
+	// Connection-level metrics no longer exist - these should all be zero
+	assert.Equal(t, int64(0), activeMetrics.TotalBytesDownloaded)
+	assert.Equal(t, int64(0), activeMetrics.TotalBytesUploaded)
+	assert.Equal(t, int64(0), activeMetrics.TotalCommands)
+	assert.Equal(t, int64(0), activeMetrics.TotalCommandErrors)
+	assert.Equal(t, float64(0), activeMetrics.SuccessRate)
+	assert.Equal(t, time.Duration(0), activeMetrics.AverageConnectionAge)
 
 	// Unregister connections
 	metrics.UnregisterActiveConnection("conn1")
@@ -589,10 +543,6 @@ func TestPoolMetrics_ActiveConnectionConcurrency(t *testing.T) {
 
 			for j := 0; j < connectionsPerGoroutine; j++ {
 				mockConn := nntpcli.NewMockConnection(ctrl)
-				mockMetrics := nntpcli.NewMetrics()
-
-				mockConn.EXPECT().GetMetrics().Return(mockMetrics).AnyTimes()
-
 				connID := fmt.Sprintf("routine%d-conn%d", routineID, j)
 				metrics.RegisterActiveConnection(connID, mockConn)
 			}
@@ -622,17 +572,16 @@ func TestPoolMetrics_ActiveConnectionWithNilMetrics(t *testing.T) {
 
 	metrics := NewPoolMetrics()
 
-	// Create mock connection that returns nil metrics
+	// Create mock connection
 	mockConn := nntpcli.NewMockConnection(ctrl)
-	mockConn.EXPECT().GetMetrics().Return(nil).AnyTimes()
 
 	// Register connection
 	metrics.RegisterActiveConnection("conn1", mockConn)
 	assert.Equal(t, int64(1), metrics.GetTotalActiveConnections())
 
-	// Get active metrics - should handle nil metrics gracefully
+	// Get active metrics - connection-level metrics no longer exist
 	activeMetrics := metrics.GetActiveConnectionMetrics()
-	assert.Equal(t, 0, activeMetrics.Count) // Should not count connections with nil metrics
+	assert.Equal(t, 1, activeMetrics.Count)
 	assert.Equal(t, int64(0), activeMetrics.TotalBytesDownloaded)
 	assert.Equal(t, int64(0), activeMetrics.TotalBytesUploaded)
 }
@@ -661,10 +610,6 @@ func BenchmarkPoolMetrics_GetActiveConnectionMetrics(b *testing.B) {
 	// Register some connections
 	for i := 0; i < 100; i++ {
 		mockConn := nntpcli.NewMockConnection(ctrl)
-		mockMetrics := nntpcli.NewMetrics()
-
-		mockConn.EXPECT().GetMetrics().Return(mockMetrics).AnyTimes()
-
 		metrics.RegisterActiveConnection(fmt.Sprintf("conn%d", i), mockConn)
 	}
 

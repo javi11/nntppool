@@ -132,20 +132,6 @@ func (pp *Pool) GetDrainDuration() time.Duration {
 	return time.Since(pp.drainStarted)
 }
 
-// SetMigrationID sets the migration ID for tracking purposes
-func (pp *Pool) SetMigrationID(id string) {
-	pp.stateMu.Lock()
-	defer pp.stateMu.Unlock()
-	pp.migrationID = id
-}
-
-// GetMigrationID returns the current migration ID
-func (pp *Pool) GetMigrationID() string {
-	pp.stateMu.RLock()
-	defer pp.stateMu.RUnlock()
-	return pp.migrationID
-}
-
 // Close closes the provider pool
 func (pp *Pool) Close() {
 	pp.connectionPool.Close()

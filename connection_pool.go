@@ -569,6 +569,10 @@ func (p *connectionPool) Body(
 
 	conn = nil
 
+	// Record successful download metrics
+	p.metrics.RecordDownload(finalBytesWritten)
+	p.metrics.RecordArticleDownloaded()
+
 	return finalBytesWritten, nil
 }
 
@@ -727,6 +731,7 @@ func (p *connectionPool) BodyReader(
 	return &pooledBodyReader{
 		reader:  reader,
 		conn:    conn,
+		metrics: p.metrics,
 		closeCh: make(chan struct{}),
 	}, nil
 }
@@ -740,6 +745,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 	var (
 		conn          PooledConnection
 		skipProviders []string
+		bytesPosted   int64
 	)
 
 	retryErr := retry.Do(func() error {
@@ -759,11 +765,12 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 		conn = c
 		nntpConn := conn.Connection()
 
-		err = nntpConn.Post(r)
+		n, err := nntpConn.Post(r)
 		if err != nil {
 			return fmt.Errorf("error posting article: %w", err)
 		}
 
+		bytesPosted = n
 		_ = conn.Free()
 
 		return nil
@@ -849,6 +856,10 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 	}
 
 	conn = nil
+
+	// Record successful post metrics
+	p.metrics.RecordUpload(bytesPosted)
+	p.metrics.RecordArticlePosted()
 
 	return nil
 }

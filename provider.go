@@ -122,7 +122,7 @@ func (pp *providerPool) SetState(state ProviderState) {
 	if state == ProviderStateDraining && oldState != ProviderStateDraining {
 		pp.drainStarted = time.Now()
 	}
-	
+
 	// Reset retry scheduling when state changes
 	if oldState != state {
 		pp.nextRetryAt = time.Time{}
@@ -142,18 +142,6 @@ func (pp *providerPool) GetDrainDuration() time.Duration {
 		return 0
 	}
 	return time.Since(pp.drainStarted)
-}
-
-func (pp *providerPool) SetMigrationID(id string) {
-	pp.stateMu.Lock()
-	defer pp.stateMu.Unlock()
-	pp.migrationID = id
-}
-
-func (pp *providerPool) GetMigrationID() string {
-	pp.stateMu.RLock()
-	defer pp.stateMu.RUnlock()
-	return pp.migrationID
 }
 
 // SetConnectionAttempt records a connection attempt

@@ -1,4 +1,4 @@
-//go:generate .tools/mockgen -source=./nntp.go -destination=./nntp_mock.go -package=nntpcli Client
+//go:generate go tool mockgen -source=./nntp.go -destination=./nntp_mock.go -package=nntpcli Client
 package nntpcli
 
 import (

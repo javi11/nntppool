@@ -128,20 +128,6 @@ func (mr *MockConnectionMockRecorder) CurrentJoinedGroup() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CurrentJoinedGroup", reflect.TypeOf((*MockConnection)(nil).CurrentJoinedGroup))
 }
 
-// GetMetrics mocks base method.
-func (m *MockConnection) GetMetrics() *Metrics {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetMetrics")
-	ret0, _ := ret[0].(*Metrics)
-	return ret0
-}
-
-// GetMetrics indicates an expected call of GetMetrics.
-func (mr *MockConnectionMockRecorder) GetMetrics() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetMetrics", reflect.TypeOf((*MockConnection)(nil).GetMetrics))
-}
-
 // JoinGroup mocks base method.
 func (m *MockConnection) JoinGroup(name string) error {
 	m.ctrl.T.Helper()
@@ -171,11 +157,12 @@ func (mr *MockConnectionMockRecorder) MaxAgeTime() *gomock.Call {
 }
 
 // Post mocks base method.
-func (m *MockConnection) Post(r io.Reader) error {
+func (m *MockConnection) Post(r io.Reader) (int64, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "Post", r)
-	ret0, _ := ret[0].(error)
-	return ret0
+	ret0, _ := ret[0].(int64)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // Post indicates an expected call of Post.

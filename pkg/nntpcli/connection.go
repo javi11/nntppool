@@ -20,12 +20,11 @@ type Connection interface {
 	JoinGroup(name string) error
 	BodyDecoded(msgID string, w io.Writer, discard int64) (int64, error)
 	BodyReader(msgID string) (ArticleBodyReader, error)
-	Post(r io.Reader) error
+	Post(r io.Reader) (int64, error)
 	CurrentJoinedGroup() string
 	MaxAgeTime() time.Time
 	Stat(msgID string) (int, error)
 	Capabilities() ([]string, error)
-	GetMetrics() *Metrics
 }
 
 type connection struct {
@@ -33,7 +32,6 @@ type connection struct {
 	netconn            net.Conn
 	conn               *textproto.Conn
 	currentJoinedGroup string
-	metrics            *Metrics
 }
 
 func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
@@ -48,7 +46,6 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
 				conn:       conn,
 				netconn:    netconn,
 				maxAgeTime: maxAgeTime,
-				metrics:    NewMetrics(),
 			}, nil
 		}
 
@@ -61,7 +58,6 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
 		conn:       conn,
 		netconn:    netconn,
 		maxAgeTime: maxAgeTime,
-		metrics:    NewMetrics(),
 	}, nil
 }
 
@@ -81,34 +77,28 @@ func (c *connection) Close() error {
 func (c *connection) Authenticate(username, password string) (err error) {
 	code, _, err := c.sendCmd(StatusMoreAuthInfoRequired, "AUTHINFO USER %s", username)
 	if err != nil {
-		c.metrics.RecordAuth(false)
-		return err
+		return fmt.Errorf("AUTHINFO USER %s: %w", username, err)
 	}
 
 	switch code {
 	case 481, 482, StatusPermissionDenied:
 		// failed, out of sequence or command not available
-		c.metrics.RecordAuth(false)
-		return err
+		return fmt.Errorf("AUTHINFO USER %s: authentication failed with code %d", username, code)
 	case StatusAuthenticated:
 		// accepted without password
-		c.metrics.RecordAuth(true)
 		return nil
 	case StatusMoreAuthInfoRequired:
 		// need password
 		break
 	default:
-		c.metrics.RecordAuth(false)
-		return err
+		return fmt.Errorf("AUTHINFO USER %s: unexpected response code %d", username, code)
 	}
 
 	_, _, err = c.sendCmd(StatusAuthenticated, "AUTHINFO PASS %s", password)
 	if err != nil {
-		c.metrics.RecordAuth(false)
-		return err
+		return fmt.Errorf("AUTHINFO PASS (user %s): %w", username, err)
 	}
 
-	c.metrics.RecordAuth(true)
 	return nil
 }
 
@@ -119,13 +109,12 @@ func (c *connection) JoinGroup(group string) error {
 
 	_, _, err := c.sendCmd(StatusGroupSelected, "GROUP %s", group)
 	if err != nil {
-		return err
+		return fmt.Errorf("GROUP %s: %w", group, err)
 	}
 
 	c.currentJoinedGroup = group
-	c.metrics.RecordGroupJoin()
 
-	return err
+	return nil
 }
 
 func (c *connection) CurrentJoinedGroup() string {
@@ -155,7 +144,7 @@ func (c *connection) CurrentJoinedGroup() string {
 func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int64, error) {
 	id, err := c.conn.Cmd("BODY <%s>", msgID)
 	if err != nil {
-		return 0, formatError(err)
+		return 0, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
 	}
 
 	c.conn.StartResponse(id)
@@ -163,7 +152,7 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int6
 
 	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("BODY <%s>: %w", msgID, err)
 	}
 
 	dec := rapidyenc.AcquireDecoder(c.conn.R)
@@ -174,10 +163,10 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int6
 		if _, err = io.CopyN(io.Discard, dec, discard); err != nil {
 			// Attempt to drain the decoder to avoid connection issues
 			if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-				return 0, fmt.Errorf("discard failed: %w (drain also failed: %v)", err, drainErr)
+				return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w (drain also failed: %v)", msgID, discard, err, drainErr)
 			}
 
-			return 0, err
+			return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", msgID, discard, err)
 		}
 	}
 
@@ -185,21 +174,19 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int6
 	if err != nil {
 		// Attempt to drain the decoder to avoid connection issues
 		if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-			return n, fmt.Errorf("copy failed: %w (drain also failed: %v)", err, drainErr)
+			return n, fmt.Errorf("BODY <%s>: copy failed: %w (drain also failed: %v)", msgID, err, drainErr)
 		}
 
-		return n, err
+		return n, fmt.Errorf("BODY <%s>: copy failed: %w", msgID, err)
 	}
 
-	c.metrics.RecordDownload(n)
-	c.metrics.RecordArticle()
 	return n, nil
 }
 
 func (c *connection) BodyReader(msgID string) (ArticleBodyReader, error) {
 	id, err := c.conn.Cmd("BODY <%s>", msgID)
 	if err != nil {
-		return nil, formatError(err)
+		return nil, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
 	}
 
 	c.conn.StartResponse(id)
@@ -207,18 +194,16 @@ func (c *connection) BodyReader(msgID string) (ArticleBodyReader, error) {
 	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
 	if err != nil {
 		c.conn.EndResponse(id)
-		return nil, err
+		return nil, fmt.Errorf("BODY <%s>: %w", msgID, err)
 	}
 
 	dec := rapidyenc.AcquireDecoder(c.conn.R)
 
-	c.metrics.RecordArticle()
 	return &articleBodyReader{
 		decoder:    dec,
 		conn:       c,
 		responseID: id,
 		closed:     false,
-		metrics:    c.metrics,
 	}, nil
 }
 
@@ -226,31 +211,31 @@ func (c *connection) BodyReader(msgID string) (ArticleBodyReader, error) {
 //
 // The reader should contain the entire article, headers and body in
 // RFC822ish format.
-func (c *connection) Post(r io.Reader) error {
+//
+// Returns the number of bytes written and any error encountered.
+func (c *connection) Post(r io.Reader) (int64, error) {
 	_, _, err := c.sendCmd(StatusPasswordRequired, "POST")
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("POST: %w", err)
 	}
 
 	w := c.conn.DotWriter()
 
 	n, err := io.Copy(w, r)
 	if err != nil {
-		// This seems really bad
-		return err
+		return 0, fmt.Errorf("POST: copy article content failed: %w", err)
 	}
 
 	if err := w.Close(); err != nil {
-		return err
+		return 0, fmt.Errorf("POST: close writer failed: %w", err)
 	}
 
 	_, _, err = c.conn.ReadCodeLine(StatusArticlePosted)
 	if err == nil {
-		c.metrics.RecordUpload(n)
-		c.metrics.RecordArticlePosted()
+		return n, nil
 	}
 
-	return err
+	return 0, fmt.Errorf("POST: %w", err)
 }
 
 // Stat sends a STAT command to the NNTP server to check the status of a message
@@ -267,7 +252,7 @@ func (c *connection) Post(r io.Reader) error {
 func (c *connection) Stat(msgID string) (int, error) {
 	id, err := c.conn.Cmd("STAT <%s>", msgID)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("STAT <%s>: %w", msgID, err)
 	}
 
 	c.conn.StartResponse(id)
@@ -275,20 +260,20 @@ func (c *connection) Stat(msgID string) (int, error) {
 
 	_, line, err := c.conn.ReadCodeLine(StatusStatSuccess)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("STAT <%s>: %w", msgID, err)
 	}
 
 	ss := strings.SplitN(line, " ", NumberOfStatResParams) // optional comment ignored
 	if len(ss) < NumberOfStatResParams-1 {
-		return 0, fmt.Errorf("bad response to STAT: %s", line)
+		return 0, fmt.Errorf("STAT <%s>: bad response format: %s", msgID, line)
 	}
 
 	number, err := strconv.Atoi(ss[0])
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("STAT <%s>: invalid article number in response: %w", msgID, err)
 	}
 
-	return number, err
+	return number, nil
 }
 
 func (c *connection) MaxAgeTime() time.Time {
@@ -336,7 +321,6 @@ func (c *connection) readStrings() ([]string, error) {
 func (c *connection) sendCmd(expectCode int, cmd string, args ...any) (int, string, error) {
 	id, err := c.conn.Cmd(cmd, args...)
 	if err != nil {
-		c.metrics.RecordCommand(false)
 		return 0, "", err
 	}
 
@@ -345,13 +329,7 @@ func (c *connection) sendCmd(expectCode int, cmd string, args ...any) (int, stri
 	defer c.conn.EndResponse(id)
 
 	code, line, err := c.conn.ReadCodeLine(expectCode)
-	c.metrics.RecordCommand(err == nil)
 	return code, line, err
-}
-
-// GetMetrics returns the connection metrics
-func (c *connection) GetMetrics() *Metrics {
-	return c.metrics
 }
 
 func formatError(err error) error {

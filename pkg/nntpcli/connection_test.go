@@ -101,14 +101,14 @@ func TestConnection_Post_Error(t *testing.T) {
 
 	// Test posting invalid article
 	invalidPost := bytes.NewBufferString("invalid post content")
-	err := conn.Post(invalidPost)
+	_, err := conn.Post(invalidPost)
 	assert.Error(t, err)
 
 	// Test posting with closed writer
 	r, w := io.Pipe()
 	_ = w.Close()
 
-	err = conn.Post(r)
+	_, err = conn.Post(r)
 
 	assert.Error(t, err)
 }
@@ -296,7 +296,7 @@ func articleReadyToDownload(t *testing.T) Connection {
 	_, err = buf.Write(encoded)
 	assert.NoError(t, err)
 
-	err = conn.Post(buf)
+	_, err = conn.Post(buf)
 	assert.NoError(t, err)
 
 	return conn

@@ -202,6 +202,26 @@ func (m *PoolMetrics) RecordAcquireWaitTime(duration time.Duration) {
 	m.recordToCurrentWindow("acquireWaitTime", int64(duration))
 }
 
+// RecordDownload records bytes downloaded
+func (m *PoolMetrics) RecordDownload(bytes int64) {
+	m.recordToCurrentWindow("bytesDownloaded", bytes)
+}
+
+// RecordUpload records bytes uploaded
+func (m *PoolMetrics) RecordUpload(bytes int64) {
+	m.recordToCurrentWindow("bytesUploaded", bytes)
+}
+
+// RecordArticleDownloaded records an article download
+func (m *PoolMetrics) RecordArticleDownloaded() {
+	m.recordToCurrentWindow("articlesRetrieved", 1)
+}
+
+// RecordArticlePosted records an article post
+func (m *PoolMetrics) RecordArticlePosted() {
+	m.recordToCurrentWindow("articlesPosted", 1)
+}
+
 // recordToCurrentWindow safely records a metric to the current window
 func (m *PoolMetrics) recordToCurrentWindow(metricType string, value int64) {
 	if m.rollingMetrics == nil {
@@ -239,6 +259,14 @@ func (m *PoolMetrics) recordToCurrentWindow(metricType string, value int64) {
 		atomic.AddInt64(&m.rollingMetrics.currentWindow.Retries, value)
 	case "acquireWaitTime":
 		atomic.AddInt64(&m.rollingMetrics.currentWindow.AcquireWaitTime, value)
+	case "bytesDownloaded":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.BytesDownloaded, value)
+	case "bytesUploaded":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.BytesUploaded, value)
+	case "articlesRetrieved":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.ArticlesRetrieved, value)
+	case "articlesPosted":
+		atomic.AddInt64(&m.rollingMetrics.currentWindow.ArticlesPosted, value)
 	}
 }
 
@@ -809,49 +837,28 @@ type ActiveConnectionMetrics struct {
 }
 
 // GetActiveConnectionMetrics returns real-time metrics for currently active connections
+// Note: Connection-level metrics have been removed. This method now returns zero values
+// to maintain API compatibility. Use pool-level metrics from GetPoolSnapshot() instead.
 func (m *PoolMetrics) GetActiveConnectionMetrics() ActiveConnectionMetrics {
-	var totalBytesDownloaded, totalBytesUploaded int64
-	var totalCommands, totalCommandErrors int64
-	var totalConnectionAge time.Duration
+	// Count active connections only
 	var count int
-
 	m.activeConnections.Range(func(key, value interface{}) bool {
 		conn, ok := value.(nntpcli.Connection)
-		if !ok || conn == nil {
-			return true // Continue iteration
-		}
-
-		metrics := conn.GetMetrics()
-		if metrics != nil {
-			snapshot := metrics.GetSnapshot()
-			totalBytesDownloaded += snapshot.BytesDownloaded
-			totalBytesUploaded += snapshot.BytesUploaded
-			totalCommands += snapshot.TotalCommands
-			totalCommandErrors += snapshot.CommandErrors
-			totalConnectionAge += metrics.GetConnectionAge()
+		if ok && conn != nil {
 			count++
 		}
 		return true // Continue iteration
 	})
 
-	var successRate float64
-	if totalCommands > 0 {
-		successRate = float64(totalCommands-totalCommandErrors) / float64(totalCommands) * 100
-	}
-
-	var averageConnectionAge time.Duration
-	if count > 0 {
-		averageConnectionAge = totalConnectionAge / time.Duration(count)
-	}
-
+	// Connection-level metrics no longer exist - return zero values for compatibility
 	return ActiveConnectionMetrics{
 		Count:                count,
-		TotalBytesDownloaded: totalBytesDownloaded,
-		TotalBytesUploaded:   totalBytesUploaded,
-		TotalCommands:        totalCommands,
-		TotalCommandErrors:   totalCommandErrors,
-		SuccessRate:          successRate,
-		AverageConnectionAge: averageConnectionAge,
+		TotalBytesDownloaded: 0,
+		TotalBytesUploaded:   0,
+		TotalCommands:        0,
+		TotalCommandErrors:   0,
+		SuccessRate:          0,
+		AverageConnectionAge: 0,
 	}
 }
 
@@ -1147,59 +1154,20 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 }
 
 // aggregateConnectionMetrics aggregates metrics from all connections in a provider pool
-// This includes both idle connections and active connections for complete visibility
+// Note: Connection-level metrics have been removed. This method now returns zero values
+// to maintain API compatibility. Use pool-level metrics from GetPoolSnapshot() instead.
 func (m *PoolMetrics) aggregateConnectionMetrics(pool *providerPool) AggregatedMetrics {
-	var totalBytesDownloaded, totalBytesUploaded int64
-	var totalCommands, totalCommandErrors int64
-	var totalConnectionAge time.Duration
-	var connectionCount int
-	var totalArticlesRetrieved, totalArticlesPosted int64
-
-	// First, collect metrics from idle connections
-	idleResources := pool.connectionPool.Stat().IdleResources()
-	connectionCount += int(idleResources)
-
-	// Second, collect metrics from active connections
-	m.activeConnections.Range(func(key, value interface{}) bool {
-		conn, ok := value.(nntpcli.Connection)
-		if !ok || conn == nil {
-			return true // Continue iteration
-		}
-
-		metrics := conn.GetMetrics()
-		if metrics != nil {
-			snapshot := metrics.GetSnapshot()
-			totalBytesDownloaded += snapshot.BytesDownloaded
-			totalBytesUploaded += snapshot.BytesUploaded
-			totalCommands += snapshot.TotalCommands
-			totalCommandErrors += snapshot.CommandErrors
-			totalConnectionAge += metrics.GetConnectionAge()
-			totalArticlesRetrieved += snapshot.ArticlesRetrieved
-			totalArticlesPosted += snapshot.ArticlesPosted
-			connectionCount++
-		}
-		return true // Continue iteration
-	})
-
-	var successRate float64
-	if totalCommands > 0 {
-		successRate = float64(totalCommands-totalCommandErrors) / float64(totalCommands) * 100
-	}
-
-	var averageConnectionAge time.Duration
-	if connectionCount > 0 {
-		averageConnectionAge = totalConnectionAge / time.Duration(connectionCount)
-	}
-
+	// Connection-level metrics no longer exist - metrics are now tracked at pool level only
+	// Return zero values to maintain API compatibility
 	return AggregatedMetrics{
-		TotalBytesDownloaded:   totalBytesDownloaded,
-		TotalBytesUploaded:     totalBytesUploaded,
-		TotalCommands:          totalCommands,
-		TotalCommandErrors:     totalCommandErrors,
-		SuccessRate:            successRate,
-		AverageConnectionAge:   averageConnectionAge,
-		TotalArticlesRetrieved: totalArticlesRetrieved,
-		TotalArticlesPosted:    totalArticlesPosted,
+		TotalBytesDownloaded:   0,
+		TotalBytesUploaded:     0,
+		TotalCommands:          0,
+		TotalCommandErrors:     0,
+		SuccessRate:            0,
+		AverageConnectionAge:   0,
+		TotalArticlesRetrieved: 0,
+		TotalArticlesPosted:    0,
 	}
 }
 
@@ -1242,44 +1210,27 @@ func (m *PoolMetrics) calculateRecentSpeeds(pools []*providerPool) (downloadSpee
 	return downloadSpeed, uploadSpeed
 }
 
-// calculateRecentSpeedsUncached performs the actual speed calculation using only active connections
-// This method provides maximum performance by completely avoiding any pool interference
+// calculateRecentSpeedsUncached performs the actual speed calculation using pool-level metrics
+// Note: Now uses pool-level rolling metrics instead of connection-level metrics
 func (m *PoolMetrics) calculateRecentSpeedsUncached() (downloadSpeed, uploadSpeed float64) {
-	var recentBytesDownloaded, recentBytesUploaded int64
-	var activeConnectionCount int
+	if m.rollingMetrics == nil {
+		return 0, 0
+	}
 
-	// Use only active connections - zero pool blocking, maximum performance
-	m.activeConnections.Range(func(key, value interface{}) bool {
-		conn, ok := value.(nntpcli.Connection)
-		if !ok || conn == nil {
-			return true
-		}
+	m.rollingMetrics.mu.RLock()
+	defer m.rollingMetrics.mu.RUnlock()
 
-		metrics := conn.GetMetrics()
-		if metrics != nil {
-			// Active connections represent current activity
-			snapshot := metrics.GetSnapshot()
-			connectionAge := metrics.GetConnectionAge()
+	// Use current window bytes for speed calculation
+	if m.rollingMetrics.currentWindow == nil {
+		return 0, 0
+	}
 
-			if connectionAge <= m.speedWindowDuration {
-				// Connection is newer than our time window - count all its bytes
-				recentBytesDownloaded += snapshot.BytesDownloaded
-				recentBytesUploaded += snapshot.BytesUploaded
-			} else {
-				// Connection is older than window - estimate recent activity
-				// Since it's active, we can be generous with the estimation
-				windowRatio := float64(m.speedWindowDuration) / float64(connectionAge)
-				recentBytesDownloaded += int64(float64(snapshot.BytesDownloaded) * windowRatio * 0.8)
-				recentBytesUploaded += int64(float64(snapshot.BytesUploaded) * windowRatio * 0.8)
-			}
-			activeConnectionCount++
-		}
-		return true
-	})
+	recentBytesDownloaded := atomic.LoadInt64(&m.rollingMetrics.currentWindow.BytesDownloaded)
+	recentBytesUploaded := atomic.LoadInt64(&m.rollingMetrics.currentWindow.BytesUploaded)
 
-	// Calculate speeds based on active connection activity
+	// Calculate speeds based on current window duration
 	windowSeconds := m.speedWindowDuration.Seconds()
-	if windowSeconds > 0 && activeConnectionCount > 0 {
+	if windowSeconds > 0 {
 		downloadSpeed = float64(recentBytesDownloaded) / windowSeconds
 		uploadSpeed = float64(recentBytesUploaded) / windowSeconds
 	}
