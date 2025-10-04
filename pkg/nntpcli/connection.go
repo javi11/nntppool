@@ -39,10 +39,10 @@ type connection struct {
 func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
 	conn := textproto.NewConn(netconn)
 
-	_, _, err := conn.ReadCodeLine(200)
+	_, _, err := conn.ReadCodeLine(StatusReady)
 	if err != nil {
 		// Download only server
-		_, _, err = conn.ReadCodeLine(201)
+		_, _, err = conn.ReadCodeLine(StatusReadyNoPosting)
 		if err == nil {
 			return &connection{
 				conn:       conn,
@@ -67,7 +67,7 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
 
 // Close this client.
 func (c *connection) Close() error {
-	_, _, err := c.sendCmd(205, "QUIT")
+	_, _, err := c.sendCmd(StatusQuit, "QUIT")
 	e := c.conn.Close()
 
 	if err != nil {
@@ -79,22 +79,22 @@ func (c *connection) Close() error {
 
 // Authenticate against an NNTP server using authinfo user/pass
 func (c *connection) Authenticate(username, password string) (err error) {
-	code, _, err := c.sendCmd(381, "AUTHINFO USER %s", username)
+	code, _, err := c.sendCmd(StatusMoreAuthInfoRequired, "AUTHINFO USER %s", username)
 	if err != nil {
 		c.metrics.RecordAuth(false)
 		return err
 	}
 
 	switch code {
-	case 481, 482, 502:
+	case 481, 482, StatusPermissionDenied:
 		// failed, out of sequence or command not available
 		c.metrics.RecordAuth(false)
 		return err
-	case 281:
+	case StatusAuthenticated:
 		// accepted without password
 		c.metrics.RecordAuth(true)
 		return nil
-	case 381:
+	case StatusMoreAuthInfoRequired:
 		// need password
 		break
 	default:
@@ -102,7 +102,7 @@ func (c *connection) Authenticate(username, password string) (err error) {
 		return err
 	}
 
-	_, _, err = c.sendCmd(281, "AUTHINFO PASS %s", password)
+	_, _, err = c.sendCmd(StatusAuthenticated, "AUTHINFO PASS %s", password)
 	if err != nil {
 		c.metrics.RecordAuth(false)
 		return err
@@ -117,7 +117,7 @@ func (c *connection) JoinGroup(group string) error {
 		return nil
 	}
 
-	_, _, err := c.sendCmd(211, "GROUP %s", group)
+	_, _, err := c.sendCmd(StatusGroupSelected, "GROUP %s", group)
 	if err != nil {
 		return err
 	}
@@ -161,7 +161,7 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int6
 	c.conn.StartResponse(id)
 	defer c.conn.EndResponse(id)
 
-	_, _, err = c.conn.ReadCodeLine(222)
+	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
 	if err != nil {
 		return 0, err
 	}
@@ -204,7 +204,7 @@ func (c *connection) BodyReader(msgID string) (ArticleBodyReader, error) {
 
 	c.conn.StartResponse(id)
 
-	_, _, err = c.conn.ReadCodeLine(222)
+	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
 	if err != nil {
 		c.conn.EndResponse(id)
 		return nil, err
@@ -227,7 +227,7 @@ func (c *connection) BodyReader(msgID string) (ArticleBodyReader, error) {
 // The reader should contain the entire article, headers and body in
 // RFC822ish format.
 func (c *connection) Post(r io.Reader) error {
-	_, _, err := c.sendCmd(340, "POST")
+	_, _, err := c.sendCmd(StatusPasswordRequired, "POST")
 	if err != nil {
 		return err
 	}
@@ -244,7 +244,7 @@ func (c *connection) Post(r io.Reader) error {
 		return err
 	}
 
-	_, _, err = c.conn.ReadCodeLine(240)
+	_, _, err = c.conn.ReadCodeLine(StatusArticlePosted)
 	if err == nil {
 		c.metrics.RecordUpload(n)
 		c.metrics.RecordArticlePosted()
@@ -252,8 +252,6 @@ func (c *connection) Post(r io.Reader) error {
 
 	return err
 }
-
-const NumberOfStatResParams = 3
 
 // Stat sends a STAT command to the NNTP server to check the status of a message
 // with the given message ID. It returns the message number if the message exists.
@@ -275,7 +273,7 @@ func (c *connection) Stat(msgID string) (int, error) {
 	c.conn.StartResponse(id)
 	defer c.conn.EndResponse(id)
 
-	_, line, err := c.conn.ReadCodeLine(223)
+	_, line, err := c.conn.ReadCodeLine(StatusStatSuccess)
 	if err != nil {
 		return 0, err
 	}
@@ -300,7 +298,8 @@ func (c *connection) MaxAgeTime() time.Time {
 // Capabilities returns a list of features this server performs.
 // Not all servers support capabilities.
 func (c *connection) Capabilities() ([]string, error) {
-	_, _, err := c.sendCmd(101, "CAPABILITIES")
+	const StatusCapabilities = 101 // Capability list follows
+	_, _, err := c.sendCmd(StatusCapabilities, "CAPABILITIES")
 	if err != nil {
 		return nil, err
 	}
@@ -320,11 +319,9 @@ func (c *connection) readStrings() ([]string, error) {
 			return nil, err
 		}
 
-		if strings.HasSuffix(line, "\r\n") {
-			line = line[0 : len(line)-2]
-		} else if strings.HasSuffix(line, "\n") {
-			line = line[0 : len(line)-1]
-		}
+		// Trim trailing newlines more efficiently
+		line = strings.TrimSuffix(line, "\r\n")
+		line = strings.TrimSuffix(line, "\n")
 
 		if line == "." {
 			break

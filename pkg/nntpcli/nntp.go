@@ -14,11 +14,6 @@ type DialConfig struct {
 	DialTimeout   time.Duration
 }
 
-type TimeData struct {
-	Milliseconds int64
-	Bytes        int
-}
-
 type Client interface {
 	Dial(
 		ctx context.Context,
@@ -52,6 +47,46 @@ func New(
 	}
 }
 
+// setupTCPConn configures a TCP connection with keep-alive and other options
+func (c *client) setupTCPConn(ctx context.Context, host string, port int, cfg DialConfig) (net.Conn, time.Duration, error) {
+	var d net.Dialer
+	if cfg.DialTimeout != 0 {
+		d = net.Dialer{Timeout: cfg.DialTimeout}
+	}
+
+	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return nil, 0, fmt.Errorf("expected TCP connection, got %T", conn)
+	}
+
+	err = tcpConn.SetKeepAlive(true)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	keepAlive := c.keepAliveTime
+	if cfg.KeepAliveTime != 0 {
+		keepAlive = cfg.KeepAliveTime
+	}
+
+	err = tcpConn.SetKeepAlivePeriod(keepAlive)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	err = tcpConn.SetNoDelay(true)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return conn, keepAlive, nil
+}
+
 // Dial connects to an NNTP server using a plain TCP connection.
 //
 // Parameters:
@@ -75,37 +110,7 @@ func (c *client) Dial(
 		cfg = config[0]
 	}
 
-	var d net.Dialer
-	if cfg.DialTimeout != 0 {
-		d = net.Dialer{Timeout: cfg.DialTimeout}
-	}
-
-	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		return nil, err
-	}
-
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return nil, fmt.Errorf("expected TCP connection, got %T", conn)
-	}
-
-	err = tcpConn.SetKeepAlive(true)
-	if err != nil {
-		return nil, err
-	}
-
-	keepAlive := c.keepAliveTime
-	if cfg.KeepAliveTime != 0 {
-		keepAlive = cfg.KeepAliveTime
-	}
-
-	err = tcpConn.SetKeepAlivePeriod(keepAlive)
-	if err != nil {
-		return nil, err
-	}
-
-	err = tcpConn.SetNoDelay(true)
+	conn, keepAlive, err := c.setupTCPConn(ctx, host, port, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -140,37 +145,7 @@ func (c *client) DialTLS(
 		cfg = config[0]
 	}
 
-	var d net.Dialer
-	if cfg.DialTimeout != 0 {
-		d = net.Dialer{Timeout: cfg.DialTimeout}
-	}
-
-	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		return nil, err
-	}
-
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return nil, fmt.Errorf("expected TCP connection, got %T", conn)
-	}
-
-	err = tcpConn.SetKeepAlive(true)
-	if err != nil {
-		return nil, err
-	}
-
-	keepAlive := c.keepAliveTime
-	if cfg.KeepAliveTime != 0 {
-		keepAlive = cfg.KeepAliveTime
-	}
-
-	err = tcpConn.SetKeepAlivePeriod(keepAlive)
-	if err != nil {
-		return nil, err
-	}
-
-	err = tcpConn.SetNoDelay(true)
+	conn, keepAlive, err := c.setupTCPConn(ctx, host, port, cfg)
 	if err != nil {
 		return nil, err
 	}

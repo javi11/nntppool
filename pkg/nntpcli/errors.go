@@ -15,7 +15,7 @@ var (
 
 const (
 	SegmentAlreadyExistsErrCode = 441
-	ToManyConnectionsErrCode    = 502
+	TooManyConnectionsErrCode   = 502
 	CanNotJoinGroup             = 411
 	ArticleNotFoundErrCode      = 430
 )
@@ -23,7 +23,7 @@ const (
 func IsArticleNotFoundError(err error) bool {
 	var nntpErr *textproto.Error
 	if ok := errors.As(err, &nntpErr); ok {
-		return nntpErr.Code == 430
+		return nntpErr.Code == ArticleNotFoundErrCode
 	}
 
 	return false
@@ -32,7 +32,7 @@ func IsArticleNotFoundError(err error) bool {
 func IsSegmentAlreadyExistsError(err error) bool {
 	var nntpErr *textproto.Error
 	if ok := errors.As(err, &nntpErr); ok {
-		return nntpErr.Code == 441
+		return nntpErr.Code == SegmentAlreadyExistsErrCode
 	}
 
 	return false
