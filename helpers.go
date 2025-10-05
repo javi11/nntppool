@@ -13,7 +13,7 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/jackc/puddle/v2"
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 )
 
 func joinGroup(c nntpcli.Connection, groups []string) error {
@@ -215,7 +215,9 @@ func TestProviderConnectivity(ctx context.Context, config UsenetProviderConfig, 
 		return fmt.Errorf("failed to connect to provider %s: %w", config.Host, err)
 	}
 	defer func() {
-		_ = conn.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			logger.DebugContext(ctx, "Failed to close test connection", "error", closeErr, "provider", config.Host)
+		}
 	}()
 
 	// Verify required capabilities if specified

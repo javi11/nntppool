@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -301,7 +301,7 @@ func TestProviderStateTransitions(t *testing.T) {
 		assert.Equal(t, transition.newState, pool.GetState(), transition.description)
 
 		// Test IsAcceptingConnections for each state
-		expectedAccepting := transition.newState == ProviderStateActive || transition.newState == ProviderStateMigrating
+		expectedAccepting := transition.newState == ProviderStateActive
 		assert.Equal(t, expectedAccepting, pool.IsAcceptingConnections(),
 			"IsAcceptingConnections should be %v for state %s", expectedAccepting, transition.newState)
 	}

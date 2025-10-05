@@ -15,68 +15,10 @@ import (
 
 	"github.com/avast/retry-go/v4"
 	"github.com/jackc/puddle/v2"
-	"github.com/javi11/nntpcli"
-
-	"github.com/javi11/nntppool/internal/budget"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 )
 
 const defaultHealthCheckInterval = 1 * time.Minute
-
-// ReconfigurationStatus tracks the progress of a configuration reconfiguration
-type ReconfigurationStatus struct {
-	ID          string                    `json:"id"`
-	StartTime   time.Time                 `json:"start_time"`
-	Status      string                    `json:"status"` // "running", "completed", "failed", "rolled_back"
-	Changes     []ProviderChange          `json:"changes"`
-	Progress    map[string]ProviderStatus `json:"progress"` // providerID -> status
-	Error       string                    `json:"error,omitempty"`
-	CompletedAt *time.Time                `json:"completed_at,omitempty"`
-}
-
-// ProviderStatus tracks the migration status of a single provider
-type ProviderStatus struct {
-	ProviderID     string     `json:"provider_id"`
-	Status         string     `json:"status"` // "pending", "migrating", "completed", "failed"
-	ConnectionsOld int        `json:"connections_old"`
-	ConnectionsNew int        `json:"connections_new"`
-	StartTime      time.Time  `json:"start_time"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
-	Error          string     `json:"error,omitempty"`
-}
-
-// ProviderChange represents a change to be made to a provider during migration
-type ProviderChange struct {
-	ID         string                `json:"id"`
-	ChangeType ProviderChangeType    `json:"change_type"`
-	OldConfig  *UsenetProviderConfig `json:"old_config,omitempty"`
-	NewConfig  *UsenetProviderConfig `json:"new_config,omitempty"`
-	Priority   int                   `json:"priority"` // Migration priority (0 = highest)
-}
-
-// ProviderChangeType represents the type of change for a provider
-type ProviderChangeType int
-
-const (
-	ProviderChangeKeep   ProviderChangeType = iota // No change needed
-	ProviderChangeUpdate                           // Settings changed, migrate connections
-	ProviderChangeAdd                              // New provider, add gradually
-	ProviderChangeRemove                           // Remove provider, drain connections
-)
-
-func (pct ProviderChangeType) String() string {
-	switch pct {
-	case ProviderChangeKeep:
-		return "keep"
-	case ProviderChangeUpdate:
-		return "update"
-	case ProviderChangeAdd:
-		return "add"
-	case ProviderChangeRemove:
-		return "remove"
-	default:
-		return "unknown"
-	}
-}
 
 type UsenetConnectionPool interface {
 	GetConnection(
@@ -102,8 +44,6 @@ type UsenetConnectionPool interface {
 	GetProvidersInfo() []ProviderInfo
 	GetProviderStatus(providerID string) (*ProviderInfo, bool)
 	Reconfigure(...Config) error
-	GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool)
-	GetActiveReconfigurations() map[string]*ReconfigurationStatus
 	GetMetrics() *PoolMetrics
 	GetMetricsSnapshot() PoolMetricsSnapshot
 	Quit()
@@ -111,17 +51,17 @@ type UsenetConnectionPool interface {
 
 type connectionPool struct {
 	closeChan               chan struct{}
+	connPoolsMu             sync.RWMutex // Protects connPools access
 	connPools               []*providerPool
 	log                     Logger
 	config                  Config
 	wg                      sync.WaitGroup
-	shutdownOnce            sync.Once      // Ensures single shutdown
-	isShutdown              int32          // Atomic flag for shutdown state
-	connectionBudget        *budget.Budget // Tracks connection limits per provider
-	metrics                 *PoolMetrics   // High-performance metrics collection
-	providerHealthCheckIdx  int            // Index for round-robin provider health checks
-	lastProviderHealthCheck time.Time      // Last time provider health check was performed
-	providerHealthCheckMu   sync.Mutex     // Protects provider health check state
+	shutdownOnce            sync.Once    // Ensures single shutdown
+	isShutdown              int32        // Atomic flag for shutdown state
+	metrics                 *PoolMetrics // High-performance metrics collection
+	providerHealthCheckIdx  int          // Index for round-robin provider health checks
+	lastProviderHealthCheck time.Time    // Last time provider health check was performed
+	providerHealthCheckMu   sync.Mutex   // Protects provider health check state
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
@@ -146,20 +86,26 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 
 	log.Info("providers verified")
 
-	// Initialize connection budget
-	budgetManager := budget.New()
-	for _, provider := range config.Providers {
-		budgetManager.SetProviderLimit(provider.ID(), provider.MaxConnections)
+	pool := &connectionPool{
+		connPools: pools,
+		log:       log,
+		config:    config,
+		closeChan: make(chan struct{}),
+		wg:        sync.WaitGroup{},
+		metrics:   metrics,
 	}
 
-	pool := &connectionPool{
-		connPools:        pools,
-		log:              log,
-		config:           config,
-		closeChan:        make(chan struct{}),
-		wg:               sync.WaitGroup{},
-		connectionBudget: budgetManager,
-		metrics:          metrics,
+	// Pre-warm pool with MinConnections to reduce latency for first requests
+	if config.MinConnections > 0 {
+		log.Info(fmt.Sprintf("Pre-warming pool with %d connections", config.MinConnections))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := pool.createIdleResources(ctx, config.MinConnections); err != nil {
+			log.Warn("Failed to pre-warm all connections, will continue with partial warmup", "error", err)
+			// Don't fail pool creation, health checks will create more connections later
+		}
 	}
 
 	healthCheckInterval := defaultHealthCheckInterval
@@ -179,12 +125,70 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 
 func (p *connectionPool) Quit() {
 	p.shutdownOnce.Do(func() {
+		startTime := time.Now()
+		p.log.Info("Starting connection pool shutdown", "phase", "1-signal")
+
+		// ========== PHASE 1: SIGNAL ==========
+		// Set shutdown flag to stop accepting new connections
 		atomic.StoreInt32(&p.isShutdown, 1)
 
 		// Signal shutdown to background goroutines
 		close(p.closeChan)
 
-		// Wait for background goroutines to finish with 5-second timeout
+		p.log.Info("Shutdown signal sent, rejecting new connections", "phase", "1-signal", "elapsed", time.Since(startTime))
+
+		// ========== PHASE 2: DRAIN ==========
+		// Wait for active operations to complete with drain timeout
+		// Check every 100ms if there are any active connections
+		p.log.Info("Waiting for active operations to complete", "phase", "2-drain", "timeout", p.config.DrainTimeout)
+
+		drainStart := time.Now()
+		drainTicker := time.NewTicker(100 * time.Millisecond)
+		defer drainTicker.Stop()
+
+		drainTimeout := time.After(p.config.DrainTimeout)
+
+	drainLoop:
+		for {
+			select {
+			case <-drainTimeout:
+				p.log.Warn("Drain timeout reached, proceeding with shutdown", "phase", "2-drain", "timeout", p.config.DrainTimeout)
+				break drainLoop
+			case <-drainTicker.C:
+				// Check if there are any active connections
+				p.connPoolsMu.RLock()
+				pools := p.connPools
+				p.connPoolsMu.RUnlock()
+
+				if pools == nil {
+					break drainLoop
+				}
+
+				hasActiveConnections := false
+				for _, pool := range pools {
+					if pool != nil && pool.connectionPool != nil {
+						stats := pool.connectionPool.Stat()
+						if stats.AcquiredResources() > 0 {
+							hasActiveConnections = true
+							break
+						}
+					}
+				}
+
+				if !hasActiveConnections {
+					p.log.Info("No active connections detected, skipping drain period", "phase", "2-drain", "elapsed", time.Since(drainStart))
+					break drainLoop
+				}
+			}
+		}
+
+		p.log.Info("Drain period completed", "phase", "2-drain", "elapsed", time.Since(drainStart))
+
+		// ========== PHASE 3: BACKGROUND CLEANUP ==========
+		// Wait for background goroutines to finish
+		p.log.Info("Waiting for background goroutines to finish", "phase", "3-background")
+
+		backgroundStart := time.Now()
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -193,31 +197,69 @@ func (p *connectionPool) Quit() {
 
 		select {
 		case <-done:
-			// Background goroutines finished normally
-		case <-time.After(5 * time.Second):
-			p.log.Warn("Shutdown timeout exceeded after 5 seconds, forcing close")
+			p.log.Info("Background goroutines finished", "phase", "3-background", "elapsed", time.Since(backgroundStart))
+		case <-time.After(p.config.ForceCloseTimeout):
+			p.log.Warn("Background goroutine timeout exceeded, forcing shutdown", "phase", "3-background", "timeout", p.config.ForceCloseTimeout)
 		}
 
-		// Close all provider connection pools with timeout
+		// ========== PHASE 4: CONNECTION POOL CLEANUP ==========
+		// Close all provider connection pools with explicit connection destruction
+		p.log.Info("Cleaning up connection pools", "phase", "4-pools")
+
+		poolCleanupStart := time.Now()
 		poolCloseDone := make(chan struct{})
 		go func() {
 			defer close(poolCloseDone)
-			for _, cp := range p.connPools {
-				if cp != nil && cp.connectionPool != nil {
-					cp.connectionPool.Close()
+
+			// Lock to safely read connPools
+			p.connPoolsMu.RLock()
+			pools := p.connPools
+			p.connPoolsMu.RUnlock()
+
+			if pools == nil {
+				return
+			}
+
+			for _, cp := range pools {
+				if cp == nil || cp.connectionPool == nil {
+					continue
 				}
+
+				providerStart := time.Now()
+
+				// Close the pool (this will call destructors for remaining connections)
+				cp.connectionPool.Close()
+
+				p.log.Debug("Provider pool closed", "provider", cp.provider.Host, "elapsed", time.Since(providerStart))
 			}
 		}()
 
-		// Wait for pool close operations with 3-second timeout
+		// Wait for pool close operations with force close timeout
 		select {
 		case <-poolCloseDone:
-			// Pool close operations completed normally
-		case <-time.After(5 * time.Second):
-			p.log.Warn("Pool close timeout exceeded after 3 seconds, forcing shutdown")
+			p.log.Info("Connection pools cleaned up successfully", "phase", "4-pools", "elapsed", time.Since(poolCleanupStart))
+		case <-time.After(p.config.ForceCloseTimeout):
+			p.log.Warn("Pool cleanup timeout exceeded, forcing shutdown", "phase", "4-pools", "timeout", p.config.ForceCloseTimeout)
 		}
 
+		// ========== PHASE 5: FINAL CLEANUP ==========
+		// Clean up metrics and nil out references
+		p.log.Info("Performing final cleanup", "phase", "5-final")
+
+		finalCleanupStart := time.Now()
+
+		// Clean up metrics to prevent memory leaks
+		if p.metrics != nil {
+			p.metrics.Cleanup()
+		}
+
+		// Lock to safely set connPools to nil
+		p.connPoolsMu.Lock()
 		p.connPools = nil
+		p.connPoolsMu.Unlock()
+
+		totalElapsed := time.Since(startTime)
+		p.log.Info("Connection pool shutdown complete", "phase", "5-final", "cleanup_elapsed", time.Since(finalCleanupStart), "total_elapsed", totalElapsed)
 	})
 }
 
@@ -230,7 +272,10 @@ func (p *connectionPool) GetConnection(
 		return nil, fmt.Errorf("connection pool is shutdown")
 	}
 
+	// Lock access to connPools to prevent TOCTOU race with Quit()
+	p.connPoolsMu.RLock()
 	if p.connPools == nil {
+		p.connPoolsMu.RUnlock()
 		return nil, fmt.Errorf("connection pool is not available")
 	}
 
@@ -243,6 +288,7 @@ func (p *connectionPool) GetConnection(
 			cp = append(cp, provider)
 		}
 	}
+	p.connPoolsMu.RUnlock()
 
 	if len(cp) == 0 {
 		return nil, ErrArticleNotFoundInProviders
@@ -254,18 +300,15 @@ func (p *connectionPool) GetConnection(
 
 	conn, err := p.getConnection(ctx, cp, 0)
 	if err != nil {
-		p.metrics.RecordError()
+		p.metrics.RecordError("")
 		return nil, err
 	}
 
 	// Record successful acquire timing
 	p.metrics.RecordAcquireWaitTime(time.Since(start))
 
-	pooledConn := pooledConnection{
-		resource: conn,
-		log:      p.log,
-		metrics:  p.metrics,
-	}
+	// Create pooled connection with unique ID
+	pooledConn := newPooledConnection(conn, p.log, p.metrics)
 
 	// Register the connection as active for metrics tracking
 	if conn.Value().nntp != nil {
@@ -276,6 +319,9 @@ func (p *connectionPool) GetConnection(
 }
 
 func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
+	p.connPoolsMu.RLock()
+	defer p.connPoolsMu.RUnlock()
+
 	pi := make([]ProviderInfo, 0)
 
 	for _, pool := range p.connPools {
@@ -304,6 +350,9 @@ func (p *connectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bo
 	if atomic.LoadInt32(&p.isShutdown) == 1 {
 		return nil, false
 	}
+
+	p.connPoolsMu.RLock()
+	defer p.connPoolsMu.RUnlock()
 
 	if p.connPools == nil {
 		return nil, false
@@ -344,18 +393,6 @@ func (p *connectionPool) Reconfigure(c ...Config) error {
 	return fmt.Errorf("hot reconfiguration not supported - please restart the pool")
 }
 
-// GetReconfigurationStatus returns the status of a specific reconfiguration
-func (p *connectionPool) GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool) {
-	// No longer supporting hot reconfiguration
-	return nil, false
-}
-
-// GetActiveReconfigurations returns all currently active reconfigurations
-func (p *connectionPool) GetActiveReconfigurations() map[string]*ReconfigurationStatus {
-	// No longer supporting hot reconfiguration
-	return make(map[string]*ReconfigurationStatus)
-}
-
 // GetMetrics returns the pool's metrics instance for real-time monitoring
 func (p *connectionPool) GetMetrics() *PoolMetrics {
 	return p.metrics
@@ -363,14 +400,25 @@ func (p *connectionPool) GetMetrics() *PoolMetrics {
 
 // GetMetricsSnapshot returns a comprehensive snapshot of pool and connection metrics
 func (p *connectionPool) GetMetricsSnapshot() PoolMetricsSnapshot {
-	if atomic.LoadInt32(&p.isShutdown) == 1 || p.connPools == nil {
-		// Return empty snapshot if pool is shutdown or not available
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
+		// Return empty snapshot if pool is shutdown
 		return PoolMetricsSnapshot{
 			Timestamp: time.Now(),
 		}
 	}
 
-	return p.metrics.GetSnapshot(p.connPools)
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
+	if pools == nil {
+		// Return empty snapshot if pools not available
+		return PoolMetricsSnapshot{
+			Timestamp: time.Now(),
+		}
+	}
+
+	return p.metrics.GetSnapshot(pools)
 }
 
 // Helper that will implement retry mechanism and provider rotation on top of the connection.
@@ -399,9 +447,9 @@ func (p *connectionPool) Body(
 	nntpGroups []string,
 ) (int64, error) {
 	var (
-		written      int64
-		conn         PooledConnection
-		bytesWritten int64
+		totalBytesFromPreviousAttempts int64 // Cumulative bytes written across failed retry attempts
+		conn                           PooledConnection
+		finalBytesWritten              int64 // Total bytes written on successful attempt
 	)
 
 	skipProviders := make([]string, 0)
@@ -417,7 +465,9 @@ func (p *connectionPool) Body(
 		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
 		if err != nil {
 			if c != nil {
-				_ = c.Close()
+				if closeErr := c.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
+				}
 			}
 
 			if errors.Is(err, context.Canceled) {
@@ -437,15 +487,17 @@ func (p *connectionPool) Body(
 			}
 		}
 
-		n, err := nntpConn.BodyDecoded(msgID, w, written)
+		n, err := nntpConn.BodyDecoded(msgID, w, totalBytesFromPreviousAttempts)
 		if err != nil && ctx.Err() == nil {
-			written += n
+			totalBytesFromPreviousAttempts += n
 			return fmt.Errorf("error downloading body: %w", err)
 		}
 
-		bytesWritten = n
+		finalBytesWritten = n
 
-		_ = conn.Free()
+		if err := conn.Free(); err != nil {
+			p.log.DebugContext(ctx, "Failed to free connection after successful body download", "error", err)
+		}
 
 		return nil
 	},
@@ -467,6 +519,9 @@ func (p *connectionPool) Body(
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
+
 				if nntpcli.IsArticleNotFoundError(err) {
 					skipProviders = append(skipProviders, provider.ID())
 					p.log.DebugContext(ctx,
@@ -475,7 +530,9 @@ func (p *connectionPool) Body(
 						provider.Host,
 					)
 
-					_ = conn.Free()
+					if freeErr := conn.Free(); freeErr != nil {
+						p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
+					}
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -486,7 +543,9 @@ func (p *connectionPool) Body(
 						"error_connection_created_at", conn.CreatedAt(),
 					)
 
-					_ = conn.Close()
+					if closeErr := conn.Close(); closeErr != nil {
+						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
+					}
 					conn = nil
 				}
 			}
@@ -503,9 +562,13 @@ func (p *connectionPool) Body(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -518,15 +581,19 @@ func (p *connectionPool) Body(
 
 		if nntpcli.IsArticleNotFoundError(err) {
 			// if article not found, we don't want to retry so mark it as corrupted
-			return bytesWritten, ErrArticleNotFoundInProviders
+			return finalBytesWritten, ErrArticleNotFoundInProviders
 		}
 
-		return bytesWritten, err
+		return finalBytesWritten, err
 	}
 
 	conn = nil
 
-	return bytesWritten, nil
+	// Record successful download metrics
+	p.metrics.RecordDownload(finalBytesWritten)
+	p.metrics.RecordArticleDownloaded()
+
+	return finalBytesWritten, nil
 }
 
 // BodyReader retrieves the body reader of a message with the given message ID from the NNTP server.
@@ -565,7 +632,9 @@ func (p *connectionPool) BodyReader(
 		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
 		if err != nil {
 			if c != nil {
-				_ = c.Close()
+				if closeErr := c.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
+				}
 			}
 
 			if errors.Is(err, context.Canceled) {
@@ -613,6 +682,9 @@ func (p *connectionPool) BodyReader(
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
+
 				if nntpcli.IsArticleNotFoundError(err) {
 					skipProviders = append(skipProviders, provider.ID())
 					p.log.DebugContext(ctx,
@@ -621,7 +693,9 @@ func (p *connectionPool) BodyReader(
 						provider.Host,
 					)
 
-					_ = conn.Free()
+					if freeErr := conn.Free(); freeErr != nil {
+						p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
+					}
 					conn = nil
 				} else {
 					p.log.DebugContext(ctx,
@@ -632,7 +706,9 @@ func (p *connectionPool) BodyReader(
 						"error_connection_created_at", conn.CreatedAt(),
 					)
 
-					_ = conn.Close()
+					if closeErr := conn.Close(); closeErr != nil {
+						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
+					}
 					conn = nil
 				}
 			}
@@ -650,9 +726,13 @@ func (p *connectionPool) BodyReader(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -672,8 +752,10 @@ func (p *connectionPool) BodyReader(
 
 	// Wrap the reader to manage the connection lifecycle
 	return &pooledBodyReader{
-		reader: reader,
-		conn:   conn,
+		reader:  reader,
+		conn:    conn,
+		metrics: p.metrics,
+		closeCh: make(chan struct{}),
 	}, nil
 }
 
@@ -686,6 +768,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 	var (
 		conn          PooledConnection
 		skipProviders []string
+		bytesPosted   int64
 	)
 
 	retryErr := retry.Do(func() error {
@@ -705,11 +788,12 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 		conn = c
 		nntpConn := conn.Connection()
 
-		err = nntpConn.Post(r)
+		n, err := nntpConn.Post(r)
 		if err != nil {
 			return fmt.Errorf("error posting article: %w", err)
 		}
 
+		bytesPosted = n
 		_ = conn.Free()
 
 		return nil
@@ -732,6 +816,8 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
 				if nntpcli.IsSegmentAlreadyExistsError(err) {
 					skipProviders = append(skipProviders, provider.ID())
 					p.log.DebugContext(ctx,
@@ -774,9 +860,13 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -791,6 +881,10 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 	}
 
 	conn = nil
+
+	// Record successful post metrics
+	p.metrics.RecordUpload(bytesPosted)
+	p.metrics.RecordArticlePosted()
 
 	return nil
 }
@@ -826,7 +920,9 @@ func (p *connectionPool) Stat(
 		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
 		if err != nil {
 			if c != nil {
-				_ = c.Close()
+				if closeErr := c.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
+				}
 			}
 
 			if errors.Is(err, context.Canceled) {
@@ -873,6 +969,8 @@ func (p *connectionPool) Stat(
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
 				if nntpcli.IsArticleNotFoundError(err) {
 					_ = conn.Free()
 					conn = nil
@@ -902,9 +1000,13 @@ func (p *connectionPool) Stat(
 
 		if conn != nil {
 			if errors.Is(err, context.Canceled) {
-				_ = conn.Free()
+				if freeErr := conn.Free(); freeErr != nil {
+					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+				}
 			} else {
-				_ = conn.Close()
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+				}
 			}
 		}
 
@@ -1017,9 +1119,13 @@ func (p *connectionPool) checkHealth(ctx context.Context) {
 func (p *connectionPool) checkConnsHealth() bool {
 	var destroyed bool
 
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
 	idle := make([]*puddle.Resource[*internalConnection], 0)
 
-	for _, pool := range p.connPools {
+	for _, pool := range pools {
 		idle = append(idle, pool.connectionPool.AcquireAllIdle()...)
 	}
 
@@ -1040,8 +1146,13 @@ func (p *connectionPool) checkConnsHealth() bool {
 
 func (p *connectionPool) createIdleResources(ctx context.Context, toCreate int) error {
 	for i := 0; i < toCreate; i++ {
-		if _, err := p.GetConnection(ctx, []string{}, false); err != nil {
+		conn, err := p.GetConnection(ctx, []string{}, false)
+		if err != nil {
 			return err
+		}
+		// Immediately free the connection back to the pool to keep it idle
+		if freeErr := conn.Free(); freeErr != nil {
+			p.log.Debug("Failed to free connection during warmup", "error", freeErr)
 		}
 	}
 
@@ -1103,11 +1214,19 @@ func (p *connectionPool) providerReconnectionSystem() {
 
 // attemptProviderReconnections tries to reconnect offline providers
 func (p *connectionPool) attemptProviderReconnections(ctx context.Context) {
-	if atomic.LoadInt32(&p.isShutdown) == 1 || p.connPools == nil {
+	if atomic.LoadInt32(&p.isShutdown) == 1 {
 		return
 	}
 
-	for _, pool := range p.connPools {
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
+	if pools == nil {
+		return
+	}
+
+	for _, pool := range pools {
 		select {
 		case <-ctx.Done():
 			return
@@ -1319,7 +1438,7 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		}
 
 		// Test basic NNTP command to ensure the server is responsive
-		_, err = conn.nntp.Stat("test")
+		err = conn.nntp.Ping()
 		if err != nil {
 			// If is not a textproto.Error, it could be a connection issue
 			var nntpErr *textproto.Error
@@ -1360,7 +1479,11 @@ func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
 	p.providerHealthCheckMu.Lock()
 	defer p.providerHealthCheckMu.Unlock()
 
-	if len(p.connPools) == 0 {
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
+	if len(pools) == 0 {
 		return nil
 	}
 
@@ -1374,7 +1497,7 @@ func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
 	p.lastProviderHealthCheck = now
 
 	// Calculate how many providers to check per cycle to stagger over the health check interval
-	totalProviders := len(p.connPools)
+	totalProviders := len(pools)
 	if totalProviders == 0 {
 		return nil
 	}
@@ -1397,7 +1520,7 @@ func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
 	var providersToCheck []*providerPool
 	for i := 0; i < providersPerCycle && len(providersToCheck) < totalProviders; i++ {
 		idx := (p.providerHealthCheckIdx + i) % totalProviders
-		pool := p.connPools[idx]
+		pool := pools[idx]
 
 		// Only check active providers (offline/reconnecting providers are handled by reconnection worker)
 		state := pool.GetState()
@@ -1429,13 +1552,8 @@ func (p *connectionPool) checkProviderHealth(ctx context.Context, providersToChe
 		default:
 		}
 
-		// Skip if provider is being migrated or removed
-		state := pool.GetState()
-		if state == ProviderStateMigrating || state == ProviderStateRemoving || state == ProviderStateDraining {
-			continue
-		}
-
 		// Skip authentication failed providers
+		state := pool.GetState()
 		if state == ProviderStateAuthenticationFailed {
 			continue
 		}

@@ -14,7 +14,7 @@ import (
 	io "io"
 	reflect "reflect"
 
-	nntpcli "github.com/javi11/nntpcli"
+	nntpcli "github.com/javi11/nntppool/v2/pkg/nntpcli"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -70,20 +70,6 @@ func (m *MockUsenetConnectionPool) BodyReader(ctx context.Context, msgID string,
 func (mr *MockUsenetConnectionPoolMockRecorder) BodyReader(ctx, msgID, nntpGroups any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyReader", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyReader), ctx, msgID, nntpGroups)
-}
-
-// GetActiveReconfigurations mocks base method.
-func (m *MockUsenetConnectionPool) GetActiveReconfigurations() map[string]*ReconfigurationStatus {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetActiveReconfigurations")
-	ret0, _ := ret[0].(map[string]*ReconfigurationStatus)
-	return ret0
-}
-
-// GetActiveReconfigurations indicates an expected call of GetActiveReconfigurations.
-func (mr *MockUsenetConnectionPoolMockRecorder) GetActiveReconfigurations() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetActiveReconfigurations", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetActiveReconfigurations))
 }
 
 // GetConnection mocks base method.
@@ -156,21 +142,6 @@ func (m *MockUsenetConnectionPool) GetProvidersInfo() []ProviderInfo {
 func (mr *MockUsenetConnectionPoolMockRecorder) GetProvidersInfo() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetProvidersInfo", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetProvidersInfo))
-}
-
-// GetReconfigurationStatus mocks base method.
-func (m *MockUsenetConnectionPool) GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetReconfigurationStatus", migrationID)
-	ret0, _ := ret[0].(*ReconfigurationStatus)
-	ret1, _ := ret[1].(bool)
-	return ret0, ret1
-}
-
-// GetReconfigurationStatus indicates an expected call of GetReconfigurationStatus.
-func (mr *MockUsenetConnectionPoolMockRecorder) GetReconfigurationStatus(migrationID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetReconfigurationStatus", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetReconfigurationStatus), migrationID)
 }
 
 // Post mocks base method.

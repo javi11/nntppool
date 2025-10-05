@@ -21,7 +21,7 @@ A nntp pool connection with retry and provider rotation.
 To install the `nntppool` package, you can use `go get`:
 
 ```sh
-go get github.com/javi11/nntppool
+go get github.com/javi11/nntppool/v2
 ```
 
 Since this package uses [Rapidyenc](github.com/mnightingale/rapidyenc), you will need to build it with **CGO enabled**
@@ -37,7 +37,7 @@ import (
     "os"
     "time"
 
-    "github.com/javi11/nntppool"
+    "github.com/javi11/nntppool/v2"
 )
 
 func main() {
@@ -159,7 +159,7 @@ if snapshot.WeeklySummary != nil {
 // Configure metrics retention policy
 config := nntppool.MetricRetentionConfig{
     DetailedRetentionDuration: 48 * time.Hour,        // Keep detailed metrics for 2 days
-    RotationInterval:          30 * time.Minute,      // Create new windows every 30 minutes  
+    RotationInterval:          30 * time.Minute,      // Create new windows every 30 minutes
     MaxHistoricalWindows:      96,                    // Keep 96 windows (2 days of 30-min windows)
     MemoryThresholdBytes:      50 * 1024 * 1024,      // Trigger cleanup at 50MB
     AutoCleanupEnabled:        true,                  // Enable automatic cleanup
@@ -186,8 +186,8 @@ fmt.Printf("Current window: %v to %v\n", status.CurrentWindowStartTime, status.C
 fmt.Printf("Historical windows: %d/%d\n", status.HistoricalWindowCount, status.MaxHistoricalWindows)
 
 memory := metrics.GetMemoryUsage()
-fmt.Printf("Memory: %d/%d bytes (%.1f%%)\n", 
-    memory.AllocatedBytes, 
+fmt.Printf("Memory: %d/%d bytes (%.1f%%)\n",
+    memory.AllocatedBytes,
     memory.ThresholdBytes,
     float64(memory.AllocatedBytes)/float64(memory.ThresholdBytes)*100)
 ```
@@ -242,7 +242,7 @@ To set up the project for development, follow these steps:
 1. Clone the repository:
 
 ```sh
-git clone https://github.com/javi11/nntppool.git
+git clone https://github.com/javi11/nntppool/v2.git
 cd nntppool
 ```
 

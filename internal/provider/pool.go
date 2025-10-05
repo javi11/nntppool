@@ -67,7 +67,6 @@ type Pool struct {
 	state          State
 	stateMu        sync.RWMutex // Protects state changes
 	drainStarted   time.Time    // When draining started
-	migrationID    string       // ID for tracking migration operations
 }
 
 // NewPool creates a new provider pool
@@ -130,20 +129,6 @@ func (pp *Pool) GetDrainDuration() time.Duration {
 		return 0
 	}
 	return time.Since(pp.drainStarted)
-}
-
-// SetMigrationID sets the migration ID for tracking purposes
-func (pp *Pool) SetMigrationID(id string) {
-	pp.stateMu.Lock()
-	defer pp.stateMu.Unlock()
-	pp.migrationID = id
-}
-
-// GetMigrationID returns the current migration ID
-func (pp *Pool) GetMigrationID() string {
-	pp.stateMu.RLock()
-	defer pp.stateMu.RUnlock()
-	return pp.migrationID
 }
 
 // Close closes the provider pool

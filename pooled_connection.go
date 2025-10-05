@@ -5,13 +5,16 @@ package nntppool
 
 import (
 	"fmt"
-	"strconv"
+	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/jackc/puddle/v2"
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 )
+
+// globalConnectionID is an atomic counter used to generate unique connection IDs.
+// Each new connection increments this counter to get a deterministic, human-readable ID.
+var globalConnectionID atomic.Uint64
 
 type internalConnection struct {
 	nntp                 nntpcli.Connection   // 8 bytes
@@ -40,11 +43,29 @@ type pooledConnection struct {
 	resource *puddle.Resource[*internalConnection]
 	log      Logger
 	metrics  *PoolMetrics
+	id       string // Unique identifier for this connection (e.g., "conn-1", "conn-2")
 }
 
-// connectionID generates a unique identifier for this connection
+// newPooledConnection creates a new pooled connection with a unique ID.
+// The ID is generated using an atomic counter, ensuring deterministic and
+// human-readable connection identifiers (e.g., "conn-1", "conn-2").
+func newPooledConnection(resource *puddle.Resource[*internalConnection], log Logger, metrics *PoolMetrics) pooledConnection {
+	// Generate a unique ID using atomic counter
+	id := fmt.Sprintf("conn-%d", globalConnectionID.Add(1))
+
+	return pooledConnection{
+		resource: resource,
+		log:      log,
+		metrics:  metrics,
+		id:       id,
+	}
+}
+
+// connectionID returns the unique identifier for this connection.
+// The ID is assigned when the connection is created and remains constant
+// throughout the connection's lifetime.
 func (p pooledConnection) connectionID() string {
-	return strconv.FormatUint(uint64(uintptr(unsafe.Pointer(p.resource))), 16)
+	return p.id
 }
 
 // Close destroys the connection and removes it from the pool.
@@ -53,8 +74,10 @@ func (p pooledConnection) connectionID() string {
 // cases where the connection was already released.
 func (p pooledConnection) Close() error {
 	var resultErr error
+	destroyed := false
 
-	defer func() { // recover from panics
+	defer func() {
+		// Recover from panics
 		if err := recover(); err != nil {
 			errorMsg := fmt.Sprintf("can not close a connection already released: %v", err)
 			p.log.Warn(errorMsg)
@@ -62,15 +85,16 @@ func (p pooledConnection) Close() error {
 				resultErr = fmt.Errorf("can not close a connection already released: %v", err)
 			}
 		}
+
+		// Update metrics only if destruction succeeded (after defer recovery)
+		if destroyed && p.metrics != nil {
+			p.metrics.UnregisterActiveConnection(p.connectionID())
+			p.metrics.RecordConnectionDestroyed()
+		}
 	}()
 
-	// Unregister from active connections before destroying
-	if p.metrics != nil {
-		p.metrics.UnregisterActiveConnection(p.connectionID())
-		p.metrics.RecordConnectionDestroyed()
-	}
-
 	p.resource.Destroy()
+	destroyed = true
 
 	return resultErr
 }
@@ -81,8 +105,10 @@ func (p pooledConnection) Close() error {
 // cases where the connection was already released.
 func (p pooledConnection) Free() error {
 	var resultErr error
+	released := false
 
-	defer func() { // recover from panics
+	defer func() {
+		// Recover from panics
 		if err := recover(); err != nil {
 			errorMsg := fmt.Sprintf("can not free a connection already released: %v", err)
 			p.log.Warn(errorMsg)
@@ -90,15 +116,16 @@ func (p pooledConnection) Free() error {
 				resultErr = fmt.Errorf("can not free a connection already released: %v", err)
 			}
 		}
+
+		// Update metrics only if release succeeded (after defer recovery)
+		if released && p.metrics != nil {
+			p.metrics.UnregisterActiveConnection(p.connectionID())
+			p.metrics.RecordRelease()
+		}
 	}()
 
-	// Unregister from active connections before releasing
-	if p.metrics != nil {
-		p.metrics.UnregisterActiveConnection(p.connectionID())
-		p.metrics.RecordRelease()
-	}
-
 	p.resource.Release()
+	released = true
 
 	return resultErr
 }

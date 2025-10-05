@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 )
@@ -210,9 +210,6 @@ func TestProviderStateChangeResetsRetrySchedule(t *testing.T) {
 		{"Reconnecting to Active", ProviderStateActive},
 		{"Active to AuthenticationFailed", ProviderStateAuthenticationFailed},
 		{"AuthenticationFailed to Offline", ProviderStateOffline},
-		{"Offline to Draining", ProviderStateDraining},
-		{"Draining to Migrating", ProviderStateMigrating},
-		{"Migrating to Removing", ProviderStateRemoving},
 	}
 
 	for _, tc := range testCases {
@@ -558,4 +555,3 @@ func TestProviderHealthCheckExpiredConnectionRetry(t *testing.T) {
 	// manually. The key improvement is that expired connections are now detected
 	// and retried up to 2 times before marking a provider as unhealthy.
 }
-

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntpcli"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
 )
