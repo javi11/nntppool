@@ -79,8 +79,13 @@ func (r *pooledBodyReader) Close() error {
 		if closeErr == nil && r.metrics != nil {
 			bytesRead := r.bytesRead.Load()
 			if bytesRead > 0 {
-				r.metrics.RecordDownload(bytesRead)
-				r.metrics.RecordArticleDownloaded()
+				// Get provider host if connection is available
+				providerHost := ""
+				if r.conn != nil {
+					providerHost = r.conn.Provider().Host
+				}
+				r.metrics.RecordDownload(bytesRead, providerHost)
+				r.metrics.RecordArticleDownloaded(providerHost)
 			}
 		}
 

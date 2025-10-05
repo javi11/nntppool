@@ -43,7 +43,6 @@ type UsenetConnectionPool interface {
 	Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error)
 	GetProvidersInfo() []ProviderInfo
 	GetProviderStatus(providerID string) (*ProviderInfo, bool)
-	Reconfigure(...Config) error
 	GetMetrics() *PoolMetrics
 	GetMetricsSnapshot() PoolMetricsSnapshot
 	Quit()
@@ -269,7 +268,7 @@ func (p *connectionPool) GetConnection(
 	useBackupProviders bool,
 ) (PooledConnection, error) {
 	if atomic.LoadInt32(&p.isShutdown) == 1 {
-		return nil, fmt.Errorf("connection pool is shutdown")
+		return nil, ErrConnectionPoolShutdown
 	}
 
 	// Lock access to connPools to prevent TOCTOU race with Quit()
@@ -383,16 +382,6 @@ func (p *connectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bo
 	return nil, false
 }
 
-func (p *connectionPool) Reconfigure(c ...Config) error {
-	// Check if already shutdown
-	if atomic.LoadInt32(&p.isShutdown) == 1 {
-		return fmt.Errorf("connection pool is shutdown")
-	}
-
-	// Simplified reconfigure - just return error indicating hot reload not supported
-	return fmt.Errorf("hot reconfiguration not supported - please restart the pool")
-}
-
 // GetMetrics returns the pool's metrics instance for real-time monitoring
 func (p *connectionPool) GetMetrics() *PoolMetrics {
 	return p.metrics
@@ -450,6 +439,7 @@ func (p *connectionPool) Body(
 		totalBytesFromPreviousAttempts int64 // Cumulative bytes written across failed retry attempts
 		conn                           PooledConnection
 		finalBytesWritten              int64 // Total bytes written on successful attempt
+		providerHost                   string // Provider host for metrics tracking
 	)
 
 	skipProviders := make([]string, 0)
@@ -494,6 +484,9 @@ func (p *connectionPool) Body(
 		}
 
 		finalBytesWritten = n
+
+		// Capture provider host before freeing connection
+		providerHost = conn.Provider().Host
 
 		if err := conn.Free(); err != nil {
 			p.log.DebugContext(ctx, "Failed to free connection after successful body download", "error", err)
@@ -589,9 +582,9 @@ func (p *connectionPool) Body(
 
 	conn = nil
 
-	// Record successful download metrics
-	p.metrics.RecordDownload(finalBytesWritten)
-	p.metrics.RecordArticleDownloaded()
+	// Record successful download metrics with provider host
+	p.metrics.RecordDownload(finalBytesWritten, providerHost)
+	p.metrics.RecordArticleDownloaded(providerHost)
 
 	return finalBytesWritten, nil
 }
@@ -769,6 +762,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 		conn          PooledConnection
 		skipProviders []string
 		bytesPosted   int64
+		providerHost  string // Provider host for metrics tracking
 	)
 
 	retryErr := retry.Do(func() error {
@@ -794,6 +788,10 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 		}
 
 		bytesPosted = n
+
+		// Capture provider host before freeing connection
+		providerHost = conn.Provider().Host
+
 		_ = conn.Free()
 
 		return nil
@@ -882,9 +880,9 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 
 	conn = nil
 
-	// Record successful post metrics
-	p.metrics.RecordUpload(bytesPosted)
-	p.metrics.RecordArticlePosted()
+	// Record successful post metrics with provider host
+	p.metrics.RecordUpload(bytesPosted, providerHost)
+	p.metrics.RecordArticlePosted(providerHost)
 
 	return nil
 }

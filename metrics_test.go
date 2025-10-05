@@ -37,9 +37,9 @@ func TestPoolMetrics_ArticleCounters(t *testing.T) {
 	metrics := NewPoolMetrics()
 
 	// Test article download counter
-	metrics.RecordArticleDownloaded()
-	metrics.RecordArticleDownloaded()
-	metrics.RecordArticleDownloaded()
+	metrics.RecordArticleDownloaded("")
+	metrics.RecordArticleDownloaded("")
+	metrics.RecordArticleDownloaded("")
 
 	snapshot := metrics.GetSnapshot(nil)
 	if snapshot.ArticlesDownloaded != 3 {
@@ -47,8 +47,8 @@ func TestPoolMetrics_ArticleCounters(t *testing.T) {
 	}
 
 	// Test article post counter
-	metrics.RecordArticlePosted()
-	metrics.RecordArticlePosted()
+	metrics.RecordArticlePosted("")
+	metrics.RecordArticlePosted("")
 
 	snapshot = metrics.GetSnapshot(nil)
 	if snapshot.ArticlesPosted != 2 {
@@ -63,9 +63,9 @@ func TestPoolMetrics_TrafficCounters(t *testing.T) {
 	metrics := NewPoolMetrics()
 
 	// Test bytes downloaded counter
-	metrics.RecordDownload(1024)
-	metrics.RecordDownload(2048)
-	metrics.RecordDownload(512)
+	metrics.RecordDownload(1024, "")
+	metrics.RecordDownload(2048, "")
+	metrics.RecordDownload(512, "")
 
 	snapshot := metrics.GetSnapshot(nil)
 	expectedDownload := int64(1024 + 2048 + 512)
@@ -74,8 +74,8 @@ func TestPoolMetrics_TrafficCounters(t *testing.T) {
 	}
 
 	// Test bytes uploaded counter
-	metrics.RecordUpload(4096)
-	metrics.RecordUpload(8192)
+	metrics.RecordUpload(4096, "")
+	metrics.RecordUpload(8192, "")
 
 	snapshot = metrics.GetSnapshot(nil)
 	expectedUpload := int64(4096 + 8192)
@@ -139,10 +139,10 @@ func TestPoolMetrics_Reset(t *testing.T) {
 	metrics := NewPoolMetrics()
 
 	// Populate metrics
-	metrics.RecordArticleDownloaded()
-	metrics.RecordArticlePosted()
-	metrics.RecordDownload(1024)
-	metrics.RecordUpload(2048)
+	metrics.RecordArticleDownloaded("")
+	metrics.RecordArticlePosted("")
+	metrics.RecordDownload(1024, "")
+	metrics.RecordUpload(2048, "")
 	metrics.RecordError("provider.example.com")
 	metrics.RecordError("")
 
@@ -207,10 +207,10 @@ func TestPoolMetrics_ConcurrentAccess(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			for j := 0; j < operations; j++ {
-				metrics.RecordArticleDownloaded()
-				metrics.RecordArticlePosted()
-				metrics.RecordDownload(100)
-				metrics.RecordUpload(200)
+				metrics.RecordArticleDownloaded("")
+				metrics.RecordArticlePosted("")
+				metrics.RecordDownload(100, "")
+				metrics.RecordUpload(200, "")
 				metrics.RecordError("provider.example.com")
 			}
 			done <- true
@@ -275,11 +275,11 @@ func TestPoolMetrics_SnapshotIsolation(t *testing.T) {
 	metrics := NewPoolMetrics()
 
 	// Record some metrics
-	metrics.RecordArticleDownloaded()
+	metrics.RecordArticleDownloaded("")
 	snapshot1 := metrics.GetSnapshot(nil)
 
 	// Record more metrics
-	metrics.RecordArticleDownloaded()
+	metrics.RecordArticleDownloaded("")
 	snapshot2 := metrics.GetSnapshot(nil)
 
 	// Verify snapshots are isolated

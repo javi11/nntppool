@@ -48,15 +48,6 @@ func TestSimplifiedQuit(t *testing.T) {
 		t.Errorf("expected shutdown error, got: %v", err)
 	}
 
-	// Test reconfiguration fails after shutdown
-	err = pool.Reconfigure(config)
-	if err == nil {
-		t.Error("Reconfigure should fail after shutdown")
-	}
-	if err.Error() != "connection pool is shutdown" {
-		t.Errorf("expected shutdown error, got: %v", err)
-	}
-
 	// Test that double quit is safe
 	pool.Quit() // Should not panic or hang
 }
