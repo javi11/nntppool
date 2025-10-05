@@ -170,24 +170,6 @@ func (mr *MockUsenetConnectionPoolMockRecorder) Quit() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Quit", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Quit))
 }
 
-// Reconfigure mocks base method.
-func (m *MockUsenetConnectionPool) Reconfigure(arg0 ...Config) error {
-	m.ctrl.T.Helper()
-	varargs := []any{}
-	for _, a := range arg0 {
-		varargs = append(varargs, a)
-	}
-	ret := m.ctrl.Call(m, "Reconfigure", varargs...)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// Reconfigure indicates an expected call of Reconfigure.
-func (mr *MockUsenetConnectionPoolMockRecorder) Reconfigure(arg0 ...any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Reconfigure", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Reconfigure), arg0...)
-}
-
 // Stat mocks base method.
 func (m *MockUsenetConnectionPool) Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error) {
 	m.ctrl.T.Helper()
