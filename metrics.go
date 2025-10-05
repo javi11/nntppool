@@ -126,6 +126,16 @@ func (m *PoolMetrics) Reset() {
 	})
 }
 
+// Cleanup removes all provider error tracking entries from memory
+// This should be called during shutdown to prevent memory leaks
+func (m *PoolMetrics) Cleanup() {
+	// Delete all entries from the sync.Map to prevent memory leaks
+	m.providerErrors.Range(func(key, value interface{}) bool {
+		m.providerErrors.Delete(key)
+		return true
+	})
+}
+
 // No-op methods to maintain backward compatibility with existing code
 // These methods exist but do nothing in the simplified metrics
 

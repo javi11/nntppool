@@ -123,9 +123,6 @@ func TestProviderCanRetry(t *testing.T) {
 		{ProviderStateActive, true},
 		{ProviderStateOffline, true},
 		{ProviderStateReconnecting, true},
-		{ProviderStateDraining, true},
-		{ProviderStateMigrating, true},
-		{ProviderStateRemoving, true},
 		{ProviderStateAuthenticationFailed, false},
 	}
 
@@ -177,12 +174,9 @@ func TestProviderIsAcceptingConnections(t *testing.T) {
 		acceptConnections bool
 	}{
 		{ProviderStateActive, true},
-		{ProviderStateMigrating, true},
 		{ProviderStateOffline, false},
 		{ProviderStateReconnecting, false},
 		{ProviderStateAuthenticationFailed, false},
-		{ProviderStateDraining, false},
-		{ProviderStateRemoving, false},
 	}
 
 	for _, tc := range testCases {
@@ -198,9 +192,6 @@ func TestNewProviderStates(t *testing.T) {
 		expected string
 	}{
 		{ProviderStateActive, "active"},
-		{ProviderStateDraining, "draining"},
-		{ProviderStateMigrating, "migrating"},
-		{ProviderStateRemoving, "removing"},
 		{ProviderStateOffline, "offline"},
 		{ProviderStateReconnecting, "reconnecting"},
 		{ProviderStateAuthenticationFailed, "authentication_failed"},

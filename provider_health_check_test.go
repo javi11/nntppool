@@ -210,9 +210,6 @@ func TestProviderStateChangeResetsRetrySchedule(t *testing.T) {
 		{"Reconnecting to Active", ProviderStateActive},
 		{"Active to AuthenticationFailed", ProviderStateAuthenticationFailed},
 		{"AuthenticationFailed to Offline", ProviderStateOffline},
-		{"Offline to Draining", ProviderStateDraining},
-		{"Draining to Migrating", ProviderStateMigrating},
-		{"Migrating to Removing", ProviderStateRemoving},
 	}
 
 	for _, tc := range testCases {

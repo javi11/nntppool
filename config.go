@@ -45,6 +45,8 @@ type Config struct {
 	SkipProvidersVerificationOnCreation bool
 	RetryDelay                          time.Duration
 	ShutdownTimeout                     time.Duration
+	DrainTimeout                        time.Duration
+	ForceCloseTimeout                   time.Duration
 	DefaultConnectionLease              time.Duration
 	ProviderReconnectInterval           time.Duration
 	ProviderMaxReconnectInterval        time.Duration
@@ -119,6 +121,8 @@ var (
 		MaxRetries:                   4,
 		RetryDelay:                   5 * time.Second,
 		ShutdownTimeout:              30 * time.Second,
+		DrainTimeout:                 10 * time.Second,
+		ForceCloseTimeout:            5 * time.Second,
 		DefaultConnectionLease:       10 * time.Minute,
 		ProviderReconnectInterval:    30 * time.Second,
 		ProviderMaxReconnectInterval: 5 * time.Minute,
@@ -165,6 +169,14 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.ShutdownTimeout == 0 {
 		cfg.ShutdownTimeout = configDefault.ShutdownTimeout
+	}
+
+	if cfg.DrainTimeout == 0 {
+		cfg.DrainTimeout = configDefault.DrainTimeout
+	}
+
+	if cfg.ForceCloseTimeout == 0 {
+		cfg.ForceCloseTimeout = configDefault.ForceCloseTimeout
 	}
 
 	if cfg.DefaultConnectionLease == 0 {

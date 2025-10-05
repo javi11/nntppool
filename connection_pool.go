@@ -20,62 +20,6 @@ import (
 
 const defaultHealthCheckInterval = 1 * time.Minute
 
-// ReconfigurationStatus tracks the progress of a configuration reconfiguration
-type ReconfigurationStatus struct {
-	ID          string                    `json:"id"`
-	StartTime   time.Time                 `json:"start_time"`
-	Status      string                    `json:"status"` // "running", "completed", "failed", "rolled_back"
-	Changes     []ProviderChange          `json:"changes"`
-	Progress    map[string]ProviderStatus `json:"progress"` // providerID -> status
-	Error       string                    `json:"error,omitempty"`
-	CompletedAt *time.Time                `json:"completed_at,omitempty"`
-}
-
-// ProviderStatus tracks the migration status of a single provider
-type ProviderStatus struct {
-	ProviderID     string     `json:"provider_id"`
-	Status         string     `json:"status"` // "pending", "migrating", "completed", "failed"
-	ConnectionsOld int        `json:"connections_old"`
-	ConnectionsNew int        `json:"connections_new"`
-	StartTime      time.Time  `json:"start_time"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
-	Error          string     `json:"error,omitempty"`
-}
-
-// ProviderChange represents a change to be made to a provider during migration
-type ProviderChange struct {
-	ID         string                `json:"id"`
-	ChangeType ProviderChangeType    `json:"change_type"`
-	OldConfig  *UsenetProviderConfig `json:"old_config,omitempty"`
-	NewConfig  *UsenetProviderConfig `json:"new_config,omitempty"`
-	Priority   int                   `json:"priority"` // Migration priority (0 = highest)
-}
-
-// ProviderChangeType represents the type of change for a provider
-type ProviderChangeType int
-
-const (
-	ProviderChangeKeep   ProviderChangeType = iota // No change needed
-	ProviderChangeUpdate                           // Settings changed, migrate connections
-	ProviderChangeAdd                              // New provider, add gradually
-	ProviderChangeRemove                           // Remove provider, drain connections
-)
-
-func (pct ProviderChangeType) String() string {
-	switch pct {
-	case ProviderChangeKeep:
-		return "keep"
-	case ProviderChangeUpdate:
-		return "update"
-	case ProviderChangeAdd:
-		return "add"
-	case ProviderChangeRemove:
-		return "remove"
-	default:
-		return "unknown"
-	}
-}
-
 type UsenetConnectionPool interface {
 	GetConnection(
 		ctx context.Context,
@@ -100,8 +44,6 @@ type UsenetConnectionPool interface {
 	GetProvidersInfo() []ProviderInfo
 	GetProviderStatus(providerID string) (*ProviderInfo, bool)
 	Reconfigure(...Config) error
-	GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool)
-	GetActiveReconfigurations() map[string]*ReconfigurationStatus
 	GetMetrics() *PoolMetrics
 	GetMetricsSnapshot() PoolMetricsSnapshot
 	Quit()
@@ -183,12 +125,70 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 
 func (p *connectionPool) Quit() {
 	p.shutdownOnce.Do(func() {
+		startTime := time.Now()
+		p.log.Info("Starting connection pool shutdown", "phase", "1-signal")
+
+		// ========== PHASE 1: SIGNAL ==========
+		// Set shutdown flag to stop accepting new connections
 		atomic.StoreInt32(&p.isShutdown, 1)
 
 		// Signal shutdown to background goroutines
 		close(p.closeChan)
 
-		// Wait for background goroutines to finish with 5-second timeout
+		p.log.Info("Shutdown signal sent, rejecting new connections", "phase", "1-signal", "elapsed", time.Since(startTime))
+
+		// ========== PHASE 2: DRAIN ==========
+		// Wait for active operations to complete with drain timeout
+		// Check every 100ms if there are any active connections
+		p.log.Info("Waiting for active operations to complete", "phase", "2-drain", "timeout", p.config.DrainTimeout)
+
+		drainStart := time.Now()
+		drainTicker := time.NewTicker(100 * time.Millisecond)
+		defer drainTicker.Stop()
+
+		drainTimeout := time.After(p.config.DrainTimeout)
+
+	drainLoop:
+		for {
+			select {
+			case <-drainTimeout:
+				p.log.Warn("Drain timeout reached, proceeding with shutdown", "phase", "2-drain", "timeout", p.config.DrainTimeout)
+				break drainLoop
+			case <-drainTicker.C:
+				// Check if there are any active connections
+				p.connPoolsMu.RLock()
+				pools := p.connPools
+				p.connPoolsMu.RUnlock()
+
+				if pools == nil {
+					break drainLoop
+				}
+
+				hasActiveConnections := false
+				for _, pool := range pools {
+					if pool != nil && pool.connectionPool != nil {
+						stats := pool.connectionPool.Stat()
+						if stats.AcquiredResources() > 0 {
+							hasActiveConnections = true
+							break
+						}
+					}
+				}
+
+				if !hasActiveConnections {
+					p.log.Info("No active connections detected, skipping drain period", "phase", "2-drain", "elapsed", time.Since(drainStart))
+					break drainLoop
+				}
+			}
+		}
+
+		p.log.Info("Drain period completed", "phase", "2-drain", "elapsed", time.Since(drainStart))
+
+		// ========== PHASE 3: BACKGROUND CLEANUP ==========
+		// Wait for background goroutines to finish
+		p.log.Info("Waiting for background goroutines to finish", "phase", "3-background")
+
+		backgroundStart := time.Now()
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -197,12 +197,16 @@ func (p *connectionPool) Quit() {
 
 		select {
 		case <-done:
-			// Background goroutines finished normally
-		case <-time.After(5 * time.Second):
-			p.log.Warn("Shutdown timeout exceeded after 5 seconds, forcing close")
+			p.log.Info("Background goroutines finished", "phase", "3-background", "elapsed", time.Since(backgroundStart))
+		case <-time.After(p.config.ForceCloseTimeout):
+			p.log.Warn("Background goroutine timeout exceeded, forcing shutdown", "phase", "3-background", "timeout", p.config.ForceCloseTimeout)
 		}
 
-		// Close all provider connection pools with timeout
+		// ========== PHASE 4: CONNECTION POOL CLEANUP ==========
+		// Close all provider connection pools with explicit connection destruction
+		p.log.Info("Cleaning up connection pools", "phase", "4-pools")
+
+		poolCleanupStart := time.Now()
 		poolCloseDone := make(chan struct{})
 		go func() {
 			defer close(poolCloseDone)
@@ -212,25 +216,50 @@ func (p *connectionPool) Quit() {
 			pools := p.connPools
 			p.connPoolsMu.RUnlock()
 
+			if pools == nil {
+				return
+			}
+
 			for _, cp := range pools {
-				if cp != nil && cp.connectionPool != nil {
-					cp.connectionPool.Close()
+				if cp == nil || cp.connectionPool == nil {
+					continue
 				}
+
+				providerStart := time.Now()
+
+				// Close the pool (this will call destructors for remaining connections)
+				cp.connectionPool.Close()
+
+				p.log.Debug("Provider pool closed", "provider", cp.provider.Host, "elapsed", time.Since(providerStart))
 			}
 		}()
 
-		// Wait for pool close operations with 3-second timeout
+		// Wait for pool close operations with force close timeout
 		select {
 		case <-poolCloseDone:
-			// Pool close operations completed normally
-		case <-time.After(5 * time.Second):
-			p.log.Warn("Pool close timeout exceeded after 3 seconds, forcing shutdown")
+			p.log.Info("Connection pools cleaned up successfully", "phase", "4-pools", "elapsed", time.Since(poolCleanupStart))
+		case <-time.After(p.config.ForceCloseTimeout):
+			p.log.Warn("Pool cleanup timeout exceeded, forcing shutdown", "phase", "4-pools", "timeout", p.config.ForceCloseTimeout)
+		}
+
+		// ========== PHASE 5: FINAL CLEANUP ==========
+		// Clean up metrics and nil out references
+		p.log.Info("Performing final cleanup", "phase", "5-final")
+
+		finalCleanupStart := time.Now()
+
+		// Clean up metrics to prevent memory leaks
+		if p.metrics != nil {
+			p.metrics.Cleanup()
 		}
 
 		// Lock to safely set connPools to nil
 		p.connPoolsMu.Lock()
 		p.connPools = nil
 		p.connPoolsMu.Unlock()
+
+		totalElapsed := time.Since(startTime)
+		p.log.Info("Connection pool shutdown complete", "phase", "5-final", "cleanup_elapsed", time.Since(finalCleanupStart), "total_elapsed", totalElapsed)
 	})
 }
 
@@ -362,18 +391,6 @@ func (p *connectionPool) Reconfigure(c ...Config) error {
 
 	// Simplified reconfigure - just return error indicating hot reload not supported
 	return fmt.Errorf("hot reconfiguration not supported - please restart the pool")
-}
-
-// GetReconfigurationStatus returns the status of a specific reconfiguration
-func (p *connectionPool) GetReconfigurationStatus(migrationID string) (*ReconfigurationStatus, bool) {
-	// No longer supporting hot reconfiguration
-	return nil, false
-}
-
-// GetActiveReconfigurations returns all currently active reconfigurations
-func (p *connectionPool) GetActiveReconfigurations() map[string]*ReconfigurationStatus {
-	// No longer supporting hot reconfiguration
-	return make(map[string]*ReconfigurationStatus)
 }
 
 // GetMetrics returns the pool's metrics instance for real-time monitoring
@@ -1535,13 +1552,8 @@ func (p *connectionPool) checkProviderHealth(ctx context.Context, providersToChe
 		default:
 		}
 
-		// Skip if provider is being migrated or removed
-		state := pool.GetState()
-		if state == ProviderStateMigrating || state == ProviderStateRemoving || state == ProviderStateDraining {
-			continue
-		}
-
 		// Skip authentication failed providers
+		state := pool.GetState()
 		if state == ProviderStateAuthenticationFailed {
 			continue
 		}

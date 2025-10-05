@@ -13,9 +13,6 @@ type ProviderState int
 
 const (
 	ProviderStateActive               ProviderState = iota // Normal operation
-	ProviderStateDraining                                  // Accepting no new connections, existing connections finishing
-	ProviderStateMigrating                                 // In process of updating configuration
-	ProviderStateRemoving                                  // Being removed from pool
 	ProviderStateOffline                                   // Provider is offline/unreachable
 	ProviderStateReconnecting                              // Currently attempting to reconnect
 	ProviderStateAuthenticationFailed                      // Authentication failed, won't retry
@@ -25,12 +22,6 @@ func (ps ProviderState) String() string {
 	switch ps {
 	case ProviderStateActive:
 		return "active"
-	case ProviderStateDraining:
-		return "draining"
-	case ProviderStateMigrating:
-		return "migrating"
-	case ProviderStateRemoving:
-		return "removing"
 	case ProviderStateOffline:
 		return "offline"
 	case ProviderStateReconnecting:
@@ -77,8 +68,6 @@ type providerPool struct {
 	provider              UsenetProviderConfig
 	state                 ProviderState
 	stateMu               sync.RWMutex // Protects state changes
-	drainStarted          time.Time    // When draining started
-	migrationID           string       // ID for tracking migration operations
 	lastConnectionAttempt time.Time    // Last time connection was attempted
 	lastSuccessfulConnect time.Time    // Last successful connection
 	failureReason         string       // Reason for last failure
@@ -118,11 +107,6 @@ func (pp *providerPool) SetState(state ProviderState) {
 	oldState := pp.state
 	pp.state = state
 
-	// Track drain start time
-	if state == ProviderStateDraining && oldState != ProviderStateDraining {
-		pp.drainStarted = time.Now()
-	}
-
 	// Reset retry scheduling when state changes
 	if oldState != state {
 		pp.nextRetryAt = time.Time{}
@@ -131,17 +115,7 @@ func (pp *providerPool) SetState(state ProviderState) {
 
 func (pp *providerPool) IsAcceptingConnections() bool {
 	state := pp.GetState()
-	return state == ProviderStateActive || state == ProviderStateMigrating
-}
-
-func (pp *providerPool) GetDrainDuration() time.Duration {
-	pp.stateMu.RLock()
-	defer pp.stateMu.RUnlock()
-
-	if pp.state != ProviderStateDraining || pp.drainStarted.IsZero() {
-		return 0
-	}
-	return time.Since(pp.drainStarted)
+	return state == ProviderStateActive
 }
 
 // SetConnectionAttempt records a connection attempt

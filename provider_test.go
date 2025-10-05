@@ -15,9 +15,6 @@ func TestProviderStateString(t *testing.T) {
 		expected string
 	}{
 		{ProviderStateActive, "active"},
-		{ProviderStateDraining, "draining"},
-		{ProviderStateMigrating, "migrating"},
-		{ProviderStateRemoving, "removing"},
 		{ProviderStateOffline, "offline"},
 		{ProviderStateReconnecting, "reconnecting"},
 		{ProviderStateAuthenticationFailed, "authentication_failed"},
@@ -50,29 +47,19 @@ func TestProviderPoolStateManagement(t *testing.T) {
 	}
 
 	// Test state change
-	pool.SetState(ProviderStateDraining)
-	if pool.GetState() != ProviderStateDraining {
-		t.Errorf("expected state to be Draining, got %s", pool.GetState())
+	pool.SetState(ProviderStateOffline)
+	if pool.GetState() != ProviderStateOffline {
+		t.Errorf("expected state to be Offline, got %s", pool.GetState())
 	}
 
 	// Test IsAcceptingConnections
 	if pool.IsAcceptingConnections() {
-		t.Error("draining provider should not accept connections")
+		t.Error("offline provider should not accept connections")
 	}
 
 	pool.SetState(ProviderStateActive)
 	if !pool.IsAcceptingConnections() {
 		t.Error("active provider should accept connections")
-	}
-
-	pool.SetState(ProviderStateMigrating)
-	if !pool.IsAcceptingConnections() {
-		t.Error("migrating provider should accept connections")
-	}
-
-	pool.SetState(ProviderStateRemoving)
-	if pool.IsAcceptingConnections() {
-		t.Error("removing provider should not accept connections")
 	}
 
 	// Test new offline states
@@ -92,46 +79,6 @@ func TestProviderPoolStateManagement(t *testing.T) {
 	}
 }
 
-func TestProviderPoolDrainTracking(t *testing.T) {
-	pool := &providerPool{
-		state: ProviderStateActive,
-	}
-
-	// Initially no drain duration
-	if duration := pool.GetDrainDuration(); duration != 0 {
-		t.Errorf("expected drain duration 0, got %v", duration)
-	}
-
-	// Set to draining
-	beforeDrain := time.Now()
-	pool.SetState(ProviderStateDraining)
-	afterDrain := time.Now()
-
-	// Check drain duration is tracked
-	duration := pool.GetDrainDuration()
-	if duration < 0 {
-		t.Error("drain duration should not be negative")
-	}
-	// Allow some tolerance for timing precision (1ms)
-	maxExpected := afterDrain.Sub(beforeDrain) + time.Millisecond
-	if duration > maxExpected {
-		t.Errorf("drain duration %v should not exceed elapsed time %v (with 1ms tolerance)", duration, maxExpected)
-	}
-
-	// Setting to non-draining state should not reset drain time
-	pool.SetState(ProviderStateActive)
-	if pool.GetDrainDuration() != 0 {
-		t.Error("drain duration should be 0 when not draining")
-	}
-
-	// Setting back to draining should start a new drain timer
-	pool.SetState(ProviderStateDraining)
-	newDuration := pool.GetDrainDuration()
-	if newDuration >= duration {
-		t.Error("new drain should have started fresh timer")
-	}
-}
-
 func TestProviderPoolConcurrentStateAccess(t *testing.T) {
 	pool := &providerPool{
 		state: ProviderStateActive,
@@ -143,23 +90,22 @@ func TestProviderPoolConcurrentStateAccess(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		go func(index int) {
 			// Alternate between different operations
-			switch index % 4 {
+			switch index % 3 {
 			case 0:
-				pool.SetState(ProviderStateDraining)
+				pool.SetState(ProviderStateOffline)
 			case 1:
 				pool.GetState()
 			case 2:
 				pool.IsAcceptingConnections()
-			case 3:
-				pool.GetDrainDuration()
 			}
 			done <- true
 		}(i)
 	}
 
-	// Start more goroutines setting migration ID
+	// Start more goroutines reading state
 	for i := 0; i < 50; i++ {
 		go func(index int) {
+			_ = pool.GetState()
 			done <- true
 		}(i)
 	}
@@ -172,7 +118,6 @@ func TestProviderPoolConcurrentStateAccess(t *testing.T) {
 	// Just verify we can still access the state without panic
 	_ = pool.GetState()
 	_ = pool.IsAcceptingConnections()
-	_ = pool.GetDrainDuration()
 }
 
 func TestConnectionProviderInfoID(t *testing.T) {
@@ -279,9 +224,9 @@ func TestProviderPoolIntegration(t *testing.T) {
 		t.Error("new provider pool should accept connections")
 	}
 
-	pool.SetState(ProviderStateDraining)
+	pool.SetState(ProviderStateOffline)
 	if pool.IsAcceptingConnections() {
-		t.Error("draining provider pool should not accept connections")
+		t.Error("offline provider pool should not accept connections")
 	}
 
 	// Clean up
@@ -364,9 +309,6 @@ func TestProviderCanRetryLogic(t *testing.T) {
 		ProviderStateActive,
 		ProviderStateOffline,
 		ProviderStateReconnecting,
-		ProviderStateDraining,
-		ProviderStateMigrating,
-		ProviderStateRemoving,
 	}
 
 	for _, state := range retryableStates {

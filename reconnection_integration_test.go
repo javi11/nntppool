@@ -301,7 +301,7 @@ func TestProviderStateTransitions(t *testing.T) {
 		assert.Equal(t, transition.newState, pool.GetState(), transition.description)
 
 		// Test IsAcceptingConnections for each state
-		expectedAccepting := transition.newState == ProviderStateActive || transition.newState == ProviderStateMigrating
+		expectedAccepting := transition.newState == ProviderStateActive
 		assert.Equal(t, expectedAccepting, pool.IsAcceptingConnections(),
 			"IsAcceptingConnections should be %v for state %s", expectedAccepting, transition.newState)
 	}
