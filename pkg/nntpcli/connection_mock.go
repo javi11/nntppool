@@ -156,6 +156,20 @@ func (mr *MockConnectionMockRecorder) MaxAgeTime() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MaxAgeTime", reflect.TypeOf((*MockConnection)(nil).MaxAgeTime))
 }
 
+// Ping mocks base method.
+func (m *MockConnection) Ping() error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Ping")
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Ping indicates an expected call of Ping.
+func (mr *MockConnectionMockRecorder) Ping() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Ping", reflect.TypeOf((*MockConnection)(nil).Ping))
+}
+
 // Post mocks base method.
 func (m *MockConnection) Post(r io.Reader) (int64, error) {
 	m.ctrl.T.Helper()

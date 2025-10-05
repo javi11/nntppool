@@ -21,11 +21,14 @@ type Connection interface {
 	BodyDecoded(msgID string, w io.Writer, discard int64) (int64, error)
 	BodyReader(msgID string) (ArticleBodyReader, error)
 	Post(r io.Reader) (int64, error)
+	Ping() error
 	CurrentJoinedGroup() string
 	MaxAgeTime() time.Time
 	Stat(msgID string) (int, error)
 	Capabilities() ([]string, error)
 }
+
+var _ Connection = (*connection)(nil)
 
 type connection struct {
 	maxAgeTime         time.Time
@@ -97,6 +100,15 @@ func (c *connection) Authenticate(username, password string) (err error) {
 	_, _, err = c.sendCmd(StatusAuthenticated, "AUTHINFO PASS %s", password)
 	if err != nil {
 		return fmt.Errorf("AUTHINFO PASS (user %s): %w", username, err)
+	}
+
+	return nil
+}
+
+func (c *connection) Ping() error {
+	_, _, err := c.sendCmd(StatusReady, "DATE")
+	if err != nil {
+		return fmt.Errorf("DATE: %w", err)
 	}
 
 	return nil

@@ -271,7 +271,7 @@ func (p *connectionPool) GetConnection(
 
 	conn, err := p.getConnection(ctx, cp, 0)
 	if err != nil {
-		p.metrics.RecordError()
+		p.metrics.RecordError("")
 		return nil, err
 	}
 
@@ -502,6 +502,9 @@ func (p *connectionPool) Body(
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
+
 				if nntpcli.IsArticleNotFoundError(err) {
 					skipProviders = append(skipProviders, provider.ID())
 					p.log.DebugContext(ctx,
@@ -662,6 +665,9 @@ func (p *connectionPool) BodyReader(
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
+
 				if nntpcli.IsArticleNotFoundError(err) {
 					skipProviders = append(skipProviders, provider.ID())
 					p.log.DebugContext(ctx,
@@ -793,6 +799,8 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
 				if nntpcli.IsSegmentAlreadyExistsError(err) {
 					skipProviders = append(skipProviders, provider.ID())
 					p.log.DebugContext(ctx,
@@ -944,6 +952,8 @@ func (p *connectionPool) Stat(
 			if conn != nil {
 				provider := conn.Provider()
 
+				// Record error for this provider
+				p.metrics.RecordError(provider.Host)
 				if nntpcli.IsArticleNotFoundError(err) {
 					_ = conn.Free()
 					conn = nil
@@ -1411,7 +1421,7 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		}
 
 		// Test basic NNTP command to ensure the server is responsive
-		_, err = conn.nntp.Stat("test")
+		err = conn.nntp.Ping()
 		if err != nil {
 			// If is not a textproto.Error, it could be a connection issue
 			var nntpErr *textproto.Error
