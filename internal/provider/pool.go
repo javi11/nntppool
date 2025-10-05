@@ -67,7 +67,6 @@ type Pool struct {
 	state          State
 	stateMu        sync.RWMutex // Protects state changes
 	drainStarted   time.Time    // When draining started
-	migrationID    string       // ID for tracking migration operations
 }
 
 // NewPool creates a new provider pool

@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/avast/retry-go/v4"
-	"github.com/javi11/nntppool/pkg/nntpcli"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 
-	"github.com/javi11/nntppool/internal/config"
+	"github.com/javi11/nntppool/v2/internal/config"
 )
 
 // Logger interface compatible with slog.Logger

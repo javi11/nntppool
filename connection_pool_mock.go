@@ -14,7 +14,7 @@ import (
 	io "io"
 	reflect "reflect"
 
-	nntpcli "github.com/javi11/nntppool/pkg/nntpcli"
+	nntpcli "github.com/javi11/nntppool/v2/pkg/nntpcli"
 	gomock "go.uber.org/mock/gomock"
 )
 

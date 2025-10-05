@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/pkg/nntpcli/test"
+	"github.com/javi11/nntppool/v2/pkg/nntpcli/test"
 
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"

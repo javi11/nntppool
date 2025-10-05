@@ -17,7 +17,7 @@
 - Automatic retry mechanisms with configurable strategies
 - Yenc encoding/decoding for binary data
 
-**Module**: `github.com/javi11/nntppool`
+**Module**: `github.com/javi11/nntppool/v2`
 
 ## Architecture
 
@@ -88,7 +88,7 @@ nntppool/
 
 ### Key Dependencies
 
-- **nntpcli** (`github.com/javi11/nntppool/pkg/nntpcli`): NNTP client library
+- **nntpcli** (`github.com/javi11/nntppool/v2/pkg/nntpcli`): NNTP client library
 - **puddle** (`github.com/jackc/puddle/v2`): Generic resource pool
 - **rapidyenc** (`github.com/mnightingale/rapidyenc`): Fast yenc encoding/decoding (requires CGO)
 - **retry-go** (`github.com/avast/retry-go/v4`): Retry mechanisms
@@ -353,7 +353,7 @@ CGO_ENABLED=1 go build
 CGO_ENABLED=1 go test ./...
 
 # Installing
-CGO_ENABLED=1 go get github.com/javi11/nntppool
+CGO_ENABLED=1 go get github.com/javi11/nntppool/v2
 ```
 
 ### Thread Safety Considerations
@@ -415,6 +415,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for pull request workflow and testing gui
 ## Additional Resources
 
 - [Project README](README.md): Installation and usage
-- [nntpcli Documentation](https://pkg.go.dev/github.com/javi11/nntppool/pkg/nntpcli): NNTP client library
+- [nntpcli Documentation](https://pkg.go.dev/github.com/javi11/nntppool/v2/pkg/nntpcli): NNTP client library
 - [puddle Documentation](https://pkg.go.dev/github.com/jackc/puddle/v2): Resource pooling
 - [Google Go Testing Guide](https://google.github.io/styleguide/go/decisions.html#useful-test-failures)
