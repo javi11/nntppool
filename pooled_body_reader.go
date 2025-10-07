@@ -20,6 +20,11 @@ type pooledBodyReader struct {
 }
 
 func (r *pooledBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
+	// Check if reader is nil
+	if r.reader == nil {
+		return nntpcli.YencHeaders{}, io.EOF
+	}
+
 	// Fast path: check if already closed (lock-free)
 	if r.closed.Load() {
 		return nntpcli.YencHeaders{}, io.EOF
@@ -37,6 +42,11 @@ func (r *pooledBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
 }
 
 func (r *pooledBodyReader) Read(p []byte) (n int, err error) {
+	// Check if reader is nil
+	if r.reader == nil {
+		return 0, io.EOF
+	}
+
 	// Fast path: check if already closed (lock-free)
 	if r.closed.Load() {
 		return 0, io.EOF
