@@ -134,12 +134,12 @@ func (p *connectionPool) Quit() {
 		// Signal shutdown to background goroutines
 		close(p.closeChan)
 
-		p.log.Info("Shutdown signal sent, rejecting new connections", "phase", "1-signal", "elapsed", time.Since(startTime))
+		p.log.Debug("Shutdown signal sent, rejecting new connections", "phase", "1-signal", "elapsed", time.Since(startTime))
 
 		// ========== PHASE 2: DRAIN ==========
 		// Wait for active operations to complete with drain timeout
 		// Check every 100ms if there are any active connections
-		p.log.Info("Waiting for active operations to complete", "phase", "2-drain", "timeout", p.config.DrainTimeout)
+		p.log.Debug("Waiting for active operations to complete", "phase", "2-drain", "timeout", p.config.DrainTimeout)
 
 		drainStart := time.Now()
 		drainTicker := time.NewTicker(100 * time.Millisecond)
@@ -151,7 +151,7 @@ func (p *connectionPool) Quit() {
 		for {
 			select {
 			case <-drainTimeout:
-				p.log.Warn("Drain timeout reached, proceeding with shutdown", "phase", "2-drain", "timeout", p.config.DrainTimeout)
+				p.log.Debug("Drain timeout reached, proceeding with shutdown", "phase", "2-drain", "timeout", p.config.DrainTimeout)
 				break drainLoop
 			case <-drainTicker.C:
 				// Check if there are any active connections
@@ -175,17 +175,17 @@ func (p *connectionPool) Quit() {
 				}
 
 				if !hasActiveConnections {
-					p.log.Info("No active connections detected, skipping drain period", "phase", "2-drain", "elapsed", time.Since(drainStart))
+					p.log.Debug("No active connections detected, skipping drain period", "phase", "2-drain", "elapsed", time.Since(drainStart))
 					break drainLoop
 				}
 			}
 		}
 
-		p.log.Info("Drain period completed", "phase", "2-drain", "elapsed", time.Since(drainStart))
+		p.log.Debug("Drain period completed", "phase", "2-drain", "elapsed", time.Since(drainStart))
 
 		// ========== PHASE 3: BACKGROUND CLEANUP ==========
 		// Wait for background goroutines to finish
-		p.log.Info("Waiting for background goroutines to finish", "phase", "3-background")
+		p.log.Debug("Waiting for background goroutines to finish", "phase", "3-background")
 
 		backgroundStart := time.Now()
 		done := make(chan struct{})
@@ -196,14 +196,14 @@ func (p *connectionPool) Quit() {
 
 		select {
 		case <-done:
-			p.log.Info("Background goroutines finished", "phase", "3-background", "elapsed", time.Since(backgroundStart))
+			p.log.Debug("Background goroutines finished", "phase", "3-background", "elapsed", time.Since(backgroundStart))
 		case <-time.After(p.config.ForceCloseTimeout):
-			p.log.Warn("Background goroutine timeout exceeded, forcing shutdown", "phase", "3-background", "timeout", p.config.ForceCloseTimeout)
+			p.log.Debug("Background goroutine timeout exceeded, forcing shutdown", "phase", "3-background", "timeout", p.config.ForceCloseTimeout)
 		}
 
 		// ========== PHASE 4: CONNECTION POOL CLEANUP ==========
 		// Close all provider connection pools with explicit connection destruction
-		p.log.Info("Cleaning up connection pools", "phase", "4-pools")
+		p.log.Debug("Cleaning up connection pools", "phase", "4-pools")
 
 		poolCleanupStart := time.Now()
 		poolCloseDone := make(chan struct{})
@@ -236,14 +236,14 @@ func (p *connectionPool) Quit() {
 		// Wait for pool close operations with force close timeout
 		select {
 		case <-poolCloseDone:
-			p.log.Info("Connection pools cleaned up successfully", "phase", "4-pools", "elapsed", time.Since(poolCleanupStart))
+			p.log.Debug("Connection pools cleaned up successfully", "phase", "4-pools", "elapsed", time.Since(poolCleanupStart))
 		case <-time.After(p.config.ForceCloseTimeout):
-			p.log.Warn("Pool cleanup timeout exceeded, forcing shutdown", "phase", "4-pools", "timeout", p.config.ForceCloseTimeout)
+			p.log.Debug("Pool cleanup timeout exceeded, forcing shutdown", "phase", "4-pools", "timeout", p.config.ForceCloseTimeout)
 		}
 
 		// ========== PHASE 5: FINAL CLEANUP ==========
 		// Clean up metrics and nil out references
-		p.log.Info("Performing final cleanup", "phase", "5-final")
+		p.log.Debug("Performing final cleanup", "phase", "5-final")
 
 		finalCleanupStart := time.Now()
 
@@ -438,7 +438,7 @@ func (p *connectionPool) Body(
 	var (
 		totalBytesFromPreviousAttempts int64 // Cumulative bytes written across failed retry attempts
 		conn                           PooledConnection
-		finalBytesWritten              int64 // Total bytes written on successful attempt
+		finalBytesWritten              int64  // Total bytes written on successful attempt
 		providerHost                   string // Provider host for metrics tracking
 	)
 
@@ -478,7 +478,7 @@ func (p *connectionPool) Body(
 		}
 
 		n, err := nntpConn.BodyDecoded(msgID, w, totalBytesFromPreviousAttempts)
-		if err != nil && ctx.Err() == nil {
+		if err != nil {
 			totalBytesFromPreviousAttempts += n
 			return fmt.Errorf("error downloading body: %w", err)
 		}
@@ -648,7 +648,7 @@ func (p *connectionPool) BodyReader(
 		}
 
 		reader, err = nntpConn.BodyReader(msgID)
-		if err != nil && ctx.Err() == nil {
+		if err != nil {
 			return fmt.Errorf("error getting body reader: %w", err)
 		}
 
@@ -941,7 +941,7 @@ func (p *connectionPool) Stat(
 		}
 
 		res, err = nntpConn.Stat(msgID)
-		if err != nil && ctx.Err() == nil {
+		if err != nil {
 			return fmt.Errorf("error checking article: %w", err)
 		}
 
