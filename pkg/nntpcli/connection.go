@@ -65,8 +65,14 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
 }
 
 // Close this client.
-func (c *connection) Close() error {
-	_, _, err := c.sendCmd(StatusQuit, "QUIT")
+func (c *connection) Close() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in Close: %v", r)
+		}
+	}()
+
+	_, _, err = c.sendCmd(StatusQuit, "QUIT")
 	e := c.conn.Close()
 
 	if err != nil {
@@ -78,6 +84,12 @@ func (c *connection) Close() error {
 
 // Authenticate against an NNTP server using authinfo user/pass
 func (c *connection) Authenticate(username, password string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in Authenticate: %v", r)
+		}
+	}()
+
 	code, _, err := c.sendCmd(StatusMoreAuthInfoRequired, "AUTHINFO USER %s", username)
 	if err != nil {
 		return fmt.Errorf("AUTHINFO USER %s: %w", username, err)
@@ -105,8 +117,14 @@ func (c *connection) Authenticate(username, password string) (err error) {
 	return nil
 }
 
-func (c *connection) Ping() error {
-	_, _, err := c.sendCmd(StatusReady, "DATE")
+func (c *connection) Ping() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in Ping: %v", r)
+		}
+	}()
+
+	_, _, err = c.sendCmd(StatusReady, "DATE")
 	if err != nil {
 		return fmt.Errorf("DATE: %w", err)
 	}
@@ -114,12 +132,18 @@ func (c *connection) Ping() error {
 	return nil
 }
 
-func (c *connection) JoinGroup(group string) error {
+func (c *connection) JoinGroup(group string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in JoinGroup: %v", r)
+		}
+	}()
+
 	if group == c.currentJoinedGroup {
 		return nil
 	}
 
-	_, _, err := c.sendCmd(StatusGroupSelected, "GROUP %s", group)
+	_, _, err = c.sendCmd(StatusGroupSelected, "GROUP %s", group)
 	if err != nil {
 		return fmt.Errorf("GROUP %s: %w", group, err)
 	}
@@ -129,7 +153,14 @@ func (c *connection) JoinGroup(group string) error {
 	return nil
 }
 
-func (c *connection) CurrentJoinedGroup() string {
+func (c *connection) CurrentJoinedGroup() (group string) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Cannot return error from this method, return empty string
+			group = ""
+		}
+	}()
+
 	return c.currentJoinedGroup
 }
 
@@ -153,7 +184,14 @@ func (c *connection) CurrentJoinedGroup() string {
 // optionally discards the specified number of lines before writing the remaining
 // body to the provided io.Writer. If an error occurs during reading or writing,
 // the function ensures that the decoder is fully read to avoid connection issues.
-func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int64, error) {
+func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n int64, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in BodyDecoded: %v", r)
+			n = 0
+		}
+	}()
+
 	id, err := c.conn.Cmd("BODY <%s>", msgID)
 	if err != nil {
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
@@ -182,7 +220,7 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int6
 		}
 	}
 
-	n, err := io.Copy(w, dec)
+	n, err = io.Copy(w, dec)
 	if err != nil {
 		// Attempt to drain the decoder to avoid connection issues
 		if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
@@ -195,7 +233,14 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (int6
 	return n, nil
 }
 
-func (c *connection) BodyReader(msgID string) (ArticleBodyReader, error) {
+func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in BodyReader: %v", r)
+			reader = nil
+		}
+	}()
+
 	id, err := c.conn.Cmd("BODY <%s>", msgID)
 	if err != nil {
 		return nil, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
@@ -225,20 +270,27 @@ func (c *connection) BodyReader(msgID string) (ArticleBodyReader, error) {
 // RFC822ish format.
 //
 // Returns the number of bytes written and any error encountered.
-func (c *connection) Post(r io.Reader) (int64, error) {
-	_, _, err := c.sendCmd(StatusPasswordRequired, "POST")
+func (c *connection) Post(r io.Reader) (n int64, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic in Post: %v", rec)
+			n = 0
+		}
+	}()
+
+	_, _, err = c.sendCmd(StatusPasswordRequired, "POST")
 	if err != nil {
 		return 0, fmt.Errorf("POST: %w", err)
 	}
 
 	w := c.conn.DotWriter()
 
-	n, err := io.Copy(w, r)
+	n, err = io.Copy(w, r)
 	if err != nil {
 		return 0, fmt.Errorf("POST: copy article content failed: %w", err)
 	}
 
-	if err := w.Close(); err != nil {
+	if err = w.Close(); err != nil {
 		return 0, fmt.Errorf("POST: close writer failed: %w", err)
 	}
 
@@ -261,7 +313,14 @@ func (c *connection) Post(r io.Reader) (int64, error) {
 //
 //	int - The message number if the message exists.
 //	error - An error if the command fails or the response is invalid.
-func (c *connection) Stat(msgID string) (int, error) {
+func (c *connection) Stat(msgID string) (number int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in Stat: %v", r)
+			number = 0
+		}
+	}()
+
 	id, err := c.conn.Cmd("STAT <%s>", msgID)
 	if err != nil {
 		return 0, fmt.Errorf("STAT <%s>: %w", msgID, err)
@@ -280,7 +339,7 @@ func (c *connection) Stat(msgID string) (int, error) {
 		return 0, fmt.Errorf("STAT <%s>: bad response format: %s", msgID, line)
 	}
 
-	number, err := strconv.Atoi(ss[0])
+	number, err = strconv.Atoi(ss[0])
 	if err != nil {
 		return 0, fmt.Errorf("STAT <%s>: invalid article number in response: %w", msgID, err)
 	}
@@ -288,15 +347,29 @@ func (c *connection) Stat(msgID string) (int, error) {
 	return number, nil
 }
 
-func (c *connection) MaxAgeTime() time.Time {
+func (c *connection) MaxAgeTime() (maxAge time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Cannot return error from this method, return zero time
+			maxAge = time.Time{}
+		}
+	}()
+
 	return c.maxAgeTime
 }
 
 // Capabilities returns a list of features this server performs.
 // Not all servers support capabilities.
-func (c *connection) Capabilities() ([]string, error) {
+func (c *connection) Capabilities() (caps []string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in Capabilities: %v", r)
+			caps = nil
+		}
+	}()
+
 	const StatusCapabilities = 101 // Capability list follows
-	_, _, err := c.sendCmd(StatusCapabilities, "CAPABILITIES")
+	_, _, err = c.sendCmd(StatusCapabilities, "CAPABILITIES")
 	if err != nil {
 		return nil, err
 	}
