@@ -70,7 +70,7 @@ func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
 	// Create metrics early so we can pass it to pool creation
 	metrics := NewPoolMetrics()
 
-	pools, err := getPoolsWithLease(config.Providers, config.NntpCli, config.Logger, 10*time.Minute, metrics)
+	pools, err := getPools(config.Providers, config.NntpCli, config.Logger, metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -327,17 +327,16 @@ func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
 		lastAttempt, lastSuccess, nextRetry, reason, retries := pool.GetConnectionStatus()
 
 		pi = append(pi, ProviderInfo{
-			Host:                     pool.provider.Host,
-			Username:                 pool.provider.Username,
-			MaxConnections:           pool.provider.MaxConnections,
-			UsedConnections:          int(pool.connectionPool.Stat().TotalResources()),
-			MaxConnectionIdleTimeout: time.Duration(pool.provider.MaxConnectionIdleTimeInSeconds) * time.Second,
-			State:                    pool.GetState(),
-			LastConnectionAttempt:    lastAttempt,
-			LastSuccessfulConnect:    lastSuccess,
-			FailureReason:            reason,
-			RetryCount:               retries,
-			NextRetryAt:              nextRetry,
+			Host:                  pool.provider.Host,
+			Username:              pool.provider.Username,
+			MaxConnections:        pool.provider.MaxConnections,
+			UsedConnections:       int(pool.connectionPool.Stat().TotalResources()),
+			State:                 pool.GetState(),
+			LastConnectionAttempt: lastAttempt,
+			LastSuccessfulConnect: lastSuccess,
+			FailureReason:         reason,
+			RetryCount:            retries,
+			NextRetryAt:           nextRetry,
 		})
 	}
 
@@ -362,17 +361,16 @@ func (p *connectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bo
 			lastAttempt, lastSuccess, nextRetry, reason, retries := pool.GetConnectionStatus()
 
 			providerInfo := &ProviderInfo{
-				Host:                     pool.provider.Host,
-				Username:                 pool.provider.Username,
-				MaxConnections:           pool.provider.MaxConnections,
-				UsedConnections:          int(pool.connectionPool.Stat().TotalResources()),
-				MaxConnectionIdleTimeout: time.Duration(pool.provider.MaxConnectionIdleTimeInSeconds) * time.Second,
-				State:                    pool.GetState(),
-				LastConnectionAttempt:    lastAttempt,
-				LastSuccessfulConnect:    lastSuccess,
-				FailureReason:            reason,
-				RetryCount:               retries,
-				NextRetryAt:              nextRetry,
+				Host:                  pool.provider.Host,
+				Username:              pool.provider.Username,
+				MaxConnections:        pool.provider.MaxConnections,
+				UsedConnections:       int(pool.connectionPool.Stat().TotalResources()),
+				State:                 pool.GetState(),
+				LastConnectionAttempt: lastAttempt,
+				LastSuccessfulConnect: lastSuccess,
+				FailureReason:         reason,
+				RetryCount:            retries,
+				NextRetryAt:           nextRetry,
 			}
 
 			return providerInfo, true

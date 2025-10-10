@@ -34,11 +34,10 @@ func (ps ProviderState) String() string {
 }
 
 type ConnectionProviderInfo struct {
-	Host                     string        `json:"host"`
-	Username                 string        `json:"username"`
-	MaxConnections           int           `json:"maxConnections"`
-	MaxConnectionIdleTimeout time.Duration `json:"maxConnectionIdleTimeout"`
-	State                    ProviderState `json:"state"`
+	Host           string        `json:"host"`
+	Username       string        `json:"username"`
+	MaxConnections int           `json:"maxConnections"`
+	State          ProviderState `json:"state"`
 }
 
 func (p ConnectionProviderInfo) ID() string {
@@ -46,17 +45,16 @@ func (p ConnectionProviderInfo) ID() string {
 }
 
 type ProviderInfo struct {
-	Host                     string        `json:"host"`
-	Username                 string        `json:"username"`
-	UsedConnections          int           `json:"usedConnections"`
-	MaxConnections           int           `json:"maxConnections"`
-	MaxConnectionIdleTimeout time.Duration `json:"maxConnectionIdleTimeout"`
-	State                    ProviderState `json:"state"`
-	LastConnectionAttempt    time.Time     `json:"lastConnectionAttempt"`
-	LastSuccessfulConnect    time.Time     `json:"lastSuccessfulConnect"`
-	FailureReason            string        `json:"failureReason"`
-	RetryCount               int           `json:"retryCount"`
-	NextRetryAt              time.Time     `json:"nextRetryAt"`
+	Host                  string        `json:"host"`
+	Username              string        `json:"username"`
+	UsedConnections       int           `json:"usedConnections"`
+	MaxConnections        int           `json:"maxConnections"`
+	State                 ProviderState `json:"state"`
+	LastConnectionAttempt time.Time     `json:"lastConnectionAttempt"`
+	LastSuccessfulConnect time.Time     `json:"lastSuccessfulConnect"`
+	FailureReason         string        `json:"failureReason"`
+	RetryCount            int           `json:"retryCount"`
+	NextRetryAt           time.Time     `json:"nextRetryAt"`
 }
 
 func (p ProviderInfo) ID() string {

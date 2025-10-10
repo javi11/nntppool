@@ -198,9 +198,7 @@ func TestProviderPoolIntegration(t *testing.T) {
 	puddlePool, err := puddle.NewPool(&puddle.Config[*internalConnection]{
 		Constructor: func(ctx context.Context) (*internalConnection, error) {
 			return &internalConnection{
-				provider:             provider,
-				leaseExpiry:          time.Now().Add(10 * time.Minute),
-				markedForReplacement: false,
+				provider: provider,
 			}, nil
 		},
 		Destructor: func(value *internalConnection) {
