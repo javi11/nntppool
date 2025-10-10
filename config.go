@@ -52,6 +52,7 @@ type Config struct {
 	ProviderMaxReconnectInterval        time.Duration
 	ProviderHealthCheckStagger          time.Duration
 	ProviderHealthCheckTimeout          time.Duration
+	NntpOperationTimeout                time.Duration
 }
 
 // Adapter methods for internal package interfaces
@@ -128,6 +129,7 @@ var (
 		ProviderMaxReconnectInterval: 5 * time.Minute,
 		ProviderHealthCheckStagger:   10 * time.Second,
 		ProviderHealthCheckTimeout:   5 * time.Second,
+		NntpOperationTimeout:         30 * time.Second,
 	}
 	providerConfigDefault = UsenetProviderConfig{
 		MaxConnections:                 10,
@@ -148,7 +150,9 @@ func mergeWithDefault(config ...Config) Config {
 	}
 
 	if cfg.NntpCli == nil {
-		cfg.NntpCli = nntpcli.New()
+		cfg.NntpCli = nntpcli.New(nntpcli.Config{
+			OperationTimeout: cfg.NntpOperationTimeout,
+		})
 	}
 
 	if cfg.HealthCheckInterval == 0 {
@@ -198,6 +202,10 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.ProviderHealthCheckTimeout == 0 {
 		cfg.ProviderHealthCheckTimeout = configDefault.ProviderHealthCheckTimeout
+	}
+
+	if cfg.NntpOperationTimeout == 0 {
+		cfg.NntpOperationTimeout = configDefault.NntpOperationTimeout
 	}
 
 	for i, p := range cfg.Providers {

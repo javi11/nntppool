@@ -59,7 +59,7 @@ func TestDial(t *testing.T) {
 
 	// Test successful connection
 	t.Run("Dial", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		config := DialConfig{
 			KeepAliveTime: 10 * time.Second,
 			DialTimeout:   5 * time.Second,
@@ -73,7 +73,7 @@ func TestDial(t *testing.T) {
 
 	// Test connection to non-existent server
 	t.Run("DialFail", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		config := DialConfig{
 			DialTimeout: 5 * time.Second,
 		}
@@ -83,7 +83,7 @@ func TestDial(t *testing.T) {
 
 	// Test connection with nil timeout
 	t.Run("DialWithNilTimeout", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		conn, err := c.Dial(context.Background(), host, port, DialConfig{})
 		assert.NoError(t, err)
 		assert.NotNil(t, conn)
@@ -91,7 +91,7 @@ func TestDial(t *testing.T) {
 
 	// Test connection with zero timeout
 	t.Run("DialWithZeroTimeout", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		config := DialConfig{
 			DialTimeout: time.Duration(0),
 		}
@@ -102,7 +102,7 @@ func TestDial(t *testing.T) {
 
 	// Test connection with canceled context
 	t.Run("DialWithCanceledContext", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
@@ -167,7 +167,7 @@ func TestDialTLS(t *testing.T) {
 
 	// Test successful TLS connection with insecure SSL
 	t.Run("DialTLS", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		config := DialConfig{
 			KeepAliveTime: 10 * time.Second,
 			DialTimeout:   5 * time.Second,
@@ -180,7 +180,7 @@ func TestDialTLS(t *testing.T) {
 
 	// Test TLS connection with secure SSL (should fail with self-signed cert)
 	t.Run("DialTLSSecure", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		config := DialConfig{
 			DialTimeout: 5 * time.Second,
 		}
@@ -190,7 +190,7 @@ func TestDialTLS(t *testing.T) {
 
 	// Test TLS connection with nil timeout
 	t.Run("DialTLSWithNilTimeout", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 		conn, err := c.DialTLS(context.Background(), host, port, true, DialConfig{})
 		assert.NoError(t, err)
 		assert.NotNil(t, conn)
@@ -198,7 +198,7 @@ func TestDialTLS(t *testing.T) {
 
 	// Test TLS connection with canceled context
 	t.Run("DialTLSWithCanceledContext", func(t *testing.T) {
-		c := &client{keepAliveTime: 5 * time.Second}
+		c := &client{config: Config{KeepAliveTime: 5 * time.Second, OperationTimeout: 30 * time.Second}}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()

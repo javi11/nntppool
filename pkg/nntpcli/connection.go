@@ -35,9 +35,10 @@ type connection struct {
 	netconn            net.Conn
 	conn               *textproto.Conn
 	currentJoinedGroup string
+	operationTimeout   time.Duration
 }
 
-func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
+func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time.Duration) (Connection, error) {
 	conn := textproto.NewConn(netconn)
 
 	_, _, err := conn.ReadCodeLine(StatusReady)
@@ -46,9 +47,10 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
 		_, _, err = conn.ReadCodeLine(StatusReadyNoPosting)
 		if err == nil {
 			return &connection{
-				conn:       conn,
-				netconn:    netconn,
-				maxAgeTime: maxAgeTime,
+				conn:             conn,
+				netconn:          netconn,
+				maxAgeTime:       maxAgeTime,
+				operationTimeout: operationTimeout,
 			}, nil
 		}
 
@@ -58,9 +60,10 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time) (Connection, error) {
 	}
 
 	return &connection{
-		conn:       conn,
-		netconn:    netconn,
-		maxAgeTime: maxAgeTime,
+		conn:             conn,
+		netconn:          netconn,
+		maxAgeTime:       maxAgeTime,
+		operationTimeout: operationTimeout,
 	}, nil
 }
 
@@ -87,6 +90,15 @@ func (c *connection) Authenticate(username, password string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic in Authenticate: %v", r)
+		}
+	}()
+
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear deadline: %w", clearErr)
 		}
 	}()
 
@@ -124,6 +136,15 @@ func (c *connection) Ping() (err error) {
 		}
 	}()
 
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear deadline: %w", clearErr)
+		}
+	}()
+
 	_, _, err = c.sendCmd(StatusReady, "DATE")
 	if err != nil {
 		return fmt.Errorf("DATE: %w", err)
@@ -142,6 +163,15 @@ func (c *connection) JoinGroup(group string) (err error) {
 	if group == c.currentJoinedGroup {
 		return nil
 	}
+
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear deadline: %w", clearErr)
+		}
+	}()
 
 	_, _, err = c.sendCmd(StatusGroupSelected, "GROUP %s", group)
 	if err != nil {
@@ -189,6 +219,15 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic in BodyDecoded: %v", r)
 			n = 0
+		}
+	}()
+
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return 0, fmt.Errorf("set deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear deadline: %w", clearErr)
 		}
 	}()
 
@@ -241,8 +280,14 @@ func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err err
 		}
 	}()
 
+	// Set timeout for initial command and response
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
+	}
+
 	id, err := c.conn.Cmd("BODY <%s>", msgID)
 	if err != nil {
+		_ = c.clearDeadline()
 		return nil, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
 	}
 
@@ -251,7 +296,14 @@ func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err err
 	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
 	if err != nil {
 		c.conn.EndResponse(id)
+		_ = c.clearDeadline()
 		return nil, fmt.Errorf("BODY <%s>: %w", msgID, err)
+	}
+
+	// Clear deadline after successful response - caller controls read pace
+	if err := c.clearDeadline(); err != nil {
+		c.conn.EndResponse(id)
+		return nil, fmt.Errorf("clear deadline: %w", err)
 	}
 
 	dec := rapidyenc.AcquireDecoder(c.conn.R)
@@ -275,6 +327,15 @@ func (c *connection) Post(r io.Reader) (n int64, err error) {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("panic in Post: %v", rec)
 			n = 0
+		}
+	}()
+
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return 0, fmt.Errorf("set deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear deadline: %w", clearErr)
 		}
 	}()
 
@@ -318,6 +379,15 @@ func (c *connection) Stat(msgID string) (number int, err error) {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic in Stat: %v", r)
 			number = 0
+		}
+	}()
+
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return 0, fmt.Errorf("set deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear deadline: %w", clearErr)
 		}
 	}()
 
@@ -365,6 +435,15 @@ func (c *connection) Capabilities() (caps []string, err error) {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic in Capabilities: %v", r)
 			caps = nil
+		}
+	}()
+
+	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
+	}
+	defer func() {
+		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
+			err = fmt.Errorf("clear deadline: %w", clearErr)
 		}
 	}()
 
@@ -423,4 +502,22 @@ func formatError(err error) error {
 	}
 
 	return err
+}
+
+// setOperationDeadline sets a deadline for the current operation on the underlying network connection.
+// The deadline is calculated as the current time plus the specified timeout duration.
+// Returns an error if setting the deadline fails.
+func (c *connection) setOperationDeadline(timeout time.Duration) error {
+	if timeout <= 0 {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	return c.netconn.SetDeadline(deadline)
+}
+
+// clearDeadline removes any deadline from the underlying network connection.
+// This allows subsequent operations to proceed without timeout constraints.
+// Returns an error if clearing the deadline fails.
+func (c *connection) clearDeadline() error {
+	return c.netconn.SetDeadline(time.Time{})
 }
