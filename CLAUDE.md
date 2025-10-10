@@ -55,9 +55,11 @@
 
 5. **PooledConnection** (`pooled_connection.go`)
 
-   - Wrapper around `nntpcli.Client` connections
-   - Manages connection leases and automatic release
+   - Lightweight wrapper around `puddle.Resource` connections
+   - Provides automatic release on Close/Free with metrics tracking
    - Thread-safe operations
+   - Simplified design: no panic recovery, no manual lease management
+   - Connection IDs generated from resource pointers (no atomic counter)
 
 6. **PooledBodyReader** (`pooled_body_reader.go`)
 
@@ -392,7 +394,7 @@ CGO_ENABLED=1 go get github.com/javi11/nntppool/v2
 - `config.go`: Configuration structures and validation
 - `provider.go`: Provider management
 - `metrics.go`: Metrics system (1,600+ lines)
-- `pooled_connection.go`: Connection wrapper
+- `pooled_connection.go`: Simplified connection wrapper (111 lines, reduced from 198)
 - `pooled_body_reader.go`: Body reader wrapper
 - `helpers.go`: Retry and rotation logic
 - `errors.go`: Error definitions
