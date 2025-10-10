@@ -31,7 +31,7 @@ type Client interface {
 }
 
 type client struct {
-	keepAliveTime time.Duration
+	config Config
 }
 
 // New creates a new NNTP client
@@ -43,7 +43,7 @@ func New(
 	config := mergeWithDefault(c...)
 
 	return &client{
-		keepAliveTime: config.KeepAliveTime,
+		config: config,
 	}
 }
 
@@ -69,7 +69,7 @@ func (c *client) setupTCPConn(ctx context.Context, host string, port int, cfg Di
 		return nil, 0, err
 	}
 
-	keepAlive := c.keepAliveTime
+	keepAlive := c.config.KeepAliveTime
 	if cfg.KeepAliveTime != 0 {
 		keepAlive = cfg.KeepAliveTime
 	}
@@ -117,7 +117,7 @@ func (c *client) Dial(
 
 	maxAgeTime := time.Now().Add(keepAlive)
 
-	return newConnection(conn, maxAgeTime)
+	return newConnection(conn, maxAgeTime, c.config.OperationTimeout)
 }
 
 // DialTLS connects to an NNTP server using a TLS-encrypted connection.
@@ -162,5 +162,5 @@ func (c *client) DialTLS(
 
 	maxAgeTime := time.Now().Add(keepAlive)
 
-	return newConnection(tlsConn, maxAgeTime)
+	return newConnection(tlsConn, maxAgeTime, c.config.OperationTimeout)
 }

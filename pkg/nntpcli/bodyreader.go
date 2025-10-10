@@ -2,6 +2,7 @@ package nntpcli
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"sync"
 
@@ -35,6 +36,13 @@ type articleBodyReader struct {
 }
 
 func (r *articleBodyReader) Read(p []byte) (n int, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic in Read: %v", rec)
+			n = 0
+		}
+	}()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -56,7 +64,14 @@ func (r *articleBodyReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-func (r *articleBodyReader) GetYencHeaders() (YencHeaders, error) {
+func (r *articleBodyReader) GetYencHeaders() (headers YencHeaders, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic in GetYencHeaders: %v", rec)
+			headers = YencHeaders{}
+		}
+	}()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -66,14 +81,14 @@ func (r *articleBodyReader) GetYencHeaders() (YencHeaders, error) {
 
 	if !r.headersRead {
 		buf := make([]byte, 4096)
-		n, err := r.decoder.Read(buf)
+		n, readErr := r.decoder.Read(buf)
 		if n > 0 {
 			r.buffer = bytes.NewBuffer(buf[:n])
 		}
 		r.headersRead = true
 
-		if err != nil && err != io.EOF {
-			return YencHeaders{}, err
+		if readErr != nil && readErr != io.EOF {
+			return YencHeaders{}, readErr
 		}
 	}
 
@@ -90,7 +105,13 @@ func (r *articleBodyReader) GetYencHeaders() (YencHeaders, error) {
 	return *r.yencHeaders, nil
 }
 
-func (r *articleBodyReader) Close() error {
+func (r *articleBodyReader) Close() (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic in Close: %v", rec)
+		}
+	}()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

@@ -276,7 +276,7 @@ func articleReadyToDownload(t *testing.T) Connection {
 	netConn, err := d.DialContext(ctx, "tcp", fmt.Sprintf(":%d", port))
 	assert.NoError(t, err)
 
-	conn, err := newConnection(netConn, time.Now().Add(time.Hour))
+	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout)
 	assert.NoError(t, err)
 
 	t.Cleanup(func() {
