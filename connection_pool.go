@@ -1391,9 +1391,15 @@ func (p *connectionPool) calculateBackoffDelay(retryCount int) time.Duration {
 // performLightweightProviderCheck performs a connectivity test to a provider using the connection pool
 // to respect connection limits and prevent exceeding provider quotas
 func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, pool *providerPool) error {
-	const maxRetries = 2
+	const maxRealErrors = 2 // Allow 3 total real error attempts (0, 1, 2)
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	safetyLimit := pool.provider.MaxConnections
+
+	realErrorAttempts := 0
+	expiredConnectionsDestroyed := 0
+
+	// Loop until we succeed, hit real error limit, or exceed safety limit for expired connections
+	for expiredConnectionsDestroyed < safetyLimit {
 		// Create a timeout context for this specific check
 		checkCtx, cancel := context.WithTimeout(ctx, p.config.ProviderHealthCheckTimeout)
 
@@ -1413,7 +1419,13 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 				return nil
 			}
 
-			return fmt.Errorf("failed to acquire connection for provider %s: %w", pool.provider.Host, err)
+			// This is a real acquisition error
+			realErrorAttempts++
+			if realErrorAttempts > maxRealErrors {
+				return fmt.Errorf("failed to acquire connection for provider %s after %d attempts: %w", pool.provider.Host, realErrorAttempts, err)
+			}
+			// Try again - don't increment expired counter, this is a real error
+			continue
 		}
 
 		// Get the underlying connection
@@ -1421,16 +1433,26 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		if conn == nil || conn.nntp == nil {
 			c.ReleaseUnused()
 			cancel()
-			return fmt.Errorf("provider %s has invalid connection", pool.provider.Host)
+
+			// This is a real error - invalid connection
+			realErrorAttempts++
+			if realErrorAttempts > maxRealErrors {
+				return fmt.Errorf("provider %s has invalid connection after %d attempts", pool.provider.Host, realErrorAttempts)
+			}
+			continue
 		}
 
 		// Check if connection is expired before using it
+		// Expired connections are normal lifecycle events, not health failures
 		if p.isExpired(c) {
-			p.log.Debug(fmt.Sprintf("provider %s health check found expired connection (attempt %d/%d), destroying and retrying",
-				pool.provider.Host, attempt+1, maxRetries+1))
+			expiredConnectionsDestroyed++
+			p.log.Debug(fmt.Sprintf("provider %s health check found expired connection (destroyed %d expired), destroying and retrying",
+				pool.provider.Host, expiredConnectionsDestroyed))
 			c.Destroy() // Destroy expired connection instead of releasing
 			cancel()
-			continue // Try again with a fresh connection
+			// Don't count expired connections as failures - they're normal lifecycle
+			// Continue immediately to try again without incrementing realErrorAttempts
+			continue
 		}
 
 		// Test basic NNTP command to ensure the server is responsive
@@ -1440,17 +1462,26 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 			var nntpErr *textproto.Error
 			if ok := errors.As(err, &nntpErr); !ok {
 				// Check if this error is likely due to connection expiry/staleness
-				if isConnectionExpiredError(err) && attempt < maxRetries {
-					p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (attempt %d/%d): %v, destroying connection and retrying",
-						pool.provider.Host, attempt+1, maxRetries+1, err))
+				if isConnectionExpiredError(err) {
+					expiredConnectionsDestroyed++
+					p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (destroyed %d expired): %v, destroying connection and retrying",
+						pool.provider.Host, expiredConnectionsDestroyed, err))
 					c.Destroy() // Destroy the bad connection
 					cancel()
-					continue // Try again with a fresh connection
+					// Don't count expired connection errors as failures
+					// Continue immediately to try again without incrementing realErrorAttempts
+					continue
 				}
 
+				// This is a real connectivity error
 				c.ReleaseUnused()
 				cancel()
-				return fmt.Errorf("capabilities check failed for provider %s: %w", pool.provider.Host, err)
+
+				realErrorAttempts++
+				if realErrorAttempts > maxRealErrors {
+					return fmt.Errorf("ping failed for provider %s after %d attempts: %w", pool.provider.Host, realErrorAttempts, err)
+				}
+				continue
 			}
 		}
 
@@ -1458,15 +1489,17 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		c.ReleaseUnused()
 		cancel()
 
-		if attempt > 0 {
-			p.log.Debug(fmt.Sprintf("provider %s health check succeeded after %d retries", pool.provider.Host, attempt))
+		if expiredConnectionsDestroyed > 0 {
+			p.log.Debug(fmt.Sprintf("provider %s health check succeeded after destroying %d expired connections", pool.provider.Host, expiredConnectionsDestroyed))
 		}
 
 		return nil
 	}
 
-	// If we get here, all retries were exhausted
-	return fmt.Errorf("provider %s health check failed after %d attempts due to expired connections", pool.provider.Host, maxRetries+1)
+	// If we get here, we exceeded the safety limit for expired connections
+	// This is a pathological case that shouldn't happen in normal operation
+	return fmt.Errorf("provider %s health check exceeded safety limit after destroying %d expired connections (real errors: %d)",
+		pool.provider.Host, expiredConnectionsDestroyed, realErrorAttempts)
 }
 
 // getProvidersToHealthCheck returns a list of providers that should be checked in this cycle
