@@ -1393,7 +1393,7 @@ func (p *connectionPool) calculateBackoffDelay(retryCount int) time.Duration {
 func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, pool *providerPool) error {
 	const maxRealErrors = 2 // Allow 3 total real error attempts (0, 1, 2)
 
-	safetyLimit := pool.provider.MaxConnections
+	safetyLimit := pool.provider.MaxConnections * 2
 
 	realErrorAttempts := 0
 	expiredConnectionsDestroyed := 0
@@ -1446,8 +1446,6 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		// Expired connections are normal lifecycle events, not health failures
 		if p.isExpired(c) {
 			expiredConnectionsDestroyed++
-			p.log.Debug(fmt.Sprintf("provider %s health check found expired connection (destroyed %d expired), destroying and retrying",
-				pool.provider.Host, expiredConnectionsDestroyed))
 			c.Destroy() // Destroy expired connection instead of releasing
 			cancel()
 			// Don't count expired connections as failures - they're normal lifecycle
