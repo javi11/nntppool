@@ -501,11 +501,6 @@ func (p *connectionPool) Body(
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			p.metrics.RecordRetry()
-			p.log.DebugContext(ctx,
-				"Retrying body",
-				"error", err,
-				"retry", n,
-			)
 
 			if conn != nil {
 				provider := conn.Provider()
@@ -519,6 +514,8 @@ func (p *connectionPool) Body(
 						"Article not found in provider, trying another one...",
 						"provider",
 						provider.Host,
+						"segment_id", msgID,
+						"retry", n,
 					)
 
 					if freeErr := conn.Free(); freeErr != nil {
@@ -526,14 +523,6 @@ func (p *connectionPool) Body(
 					}
 					conn = nil
 				} else {
-					p.log.DebugContext(ctx,
-						"Closing connection",
-						"error", err,
-						"retry", n,
-						"error_connection_host", provider.Host,
-						"error_connection_created_at", conn.CreatedAt(),
-					)
-
 					if closeErr := conn.Close(); closeErr != nil {
 						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
 					}
@@ -563,14 +552,13 @@ func (p *connectionPool) Body(
 			}
 		}
 
-		if !errors.Is(err, context.Canceled) {
-			p.log.DebugContext(ctx,
-				"All body retries exhausted",
-				"error", retryErr,
-			)
-		}
-
 		if nntpcli.IsArticleNotFoundError(err) {
+			p.log.DebugContext(ctx,
+				"Segment Not Found in any of the providers",
+				"error", retryErr,
+				"segment_id", msgID,
+			)
+
 			// if article not found, we don't want to retry so mark it as corrupted
 			return finalBytesWritten, ErrArticleNotFoundInProviders
 		}
@@ -664,12 +652,6 @@ func (p *connectionPool) BodyReader(
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			p.metrics.RecordRetry()
-			p.log.DebugContext(ctx,
-				"Retrying body reader",
-				"error", err,
-				"retry", n,
-			)
-
 			if conn != nil {
 				provider := conn.Provider()
 
@@ -679,24 +661,17 @@ func (p *connectionPool) BodyReader(
 				if nntpcli.IsArticleNotFoundError(err) {
 					skipProviders = append(skipProviders, provider.ID())
 					p.log.DebugContext(ctx,
-						"Article not found in provider, trying another one...",
+						"Segment not found in provider, trying another one...",
 						"provider",
 						provider.Host,
+						"segment_id", msgID,
 					)
 
 					if freeErr := conn.Free(); freeErr != nil {
-						p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
+						p.log.DebugContext(ctx, "Failed to free connection after segment not found", "error", freeErr)
 					}
 					conn = nil
 				} else {
-					p.log.DebugContext(ctx,
-						"Closing connection",
-						"error", err,
-						"retry", n,
-						"error_connection_host", provider.Host,
-						"error_connection_created_at", conn.CreatedAt(),
-					)
-
 					if closeErr := conn.Close(); closeErr != nil {
 						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
 					}
@@ -727,14 +702,13 @@ func (p *connectionPool) BodyReader(
 			}
 		}
 
-		if !errors.Is(err, context.Canceled) {
-			p.log.DebugContext(ctx,
-				"All body reader retries exhausted",
-				"error", retryErr,
-			)
-		}
-
 		if nntpcli.IsArticleNotFoundError(err) {
+			p.log.DebugContext(ctx,
+				"Segment Not Found in any of the providers",
+				"error", retryErr,
+				"segment_id", msgID,
+			)
+
 			return nil, ErrArticleNotFoundInProviders
 		}
 
@@ -803,11 +777,6 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			p.metrics.RecordRetry()
-			p.log.DebugContext(ctx,
-				"Retrying post",
-				"error", err,
-				"retry", n,
-			)
 
 			if conn != nil {
 				provider := conn.Provider()
@@ -956,11 +925,6 @@ func (p *connectionPool) Stat(
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			p.metrics.RecordRetry()
-			p.log.DebugContext(ctx,
-				"Retrying stat",
-				"error", err,
-				"retry", n,
-			)
 
 			if conn != nil {
 				provider := conn.Provider()
@@ -968,6 +932,13 @@ func (p *connectionPool) Stat(
 				// Record error for this provider
 				p.metrics.RecordError(provider.Host)
 				if nntpcli.IsArticleNotFoundError(err) {
+					p.log.DebugContext(ctx,
+						"Segment not found in provider, trying another one...",
+						"provider",
+						provider.Host,
+						"segment_id", msgID,
+					)
+
 					_ = conn.Free()
 					conn = nil
 				} else {
@@ -1006,14 +977,13 @@ func (p *connectionPool) Stat(
 			}
 		}
 
-		if !errors.Is(err, context.Canceled) {
-			p.log.DebugContext(ctx,
-				"All stat retries exhausted",
-				"error", retryErr,
-			)
-		}
-
 		if nntpcli.IsArticleNotFoundError(err) {
+			p.log.DebugContext(ctx,
+				"Segment Not Found in any of the providers",
+				"error", retryErr,
+				"segment_id", msgID,
+			)
+
 			// if article not found, we don't want to retry so mark it as corrupted
 			return res, ErrArticleNotFoundInProviders
 		}
@@ -1487,10 +1457,6 @@ func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, po
 		c.ReleaseUnused()
 		cancel()
 
-		if expiredConnectionsDestroyed > 0 {
-			p.log.Debug(fmt.Sprintf("provider %s health check succeeded after destroying %d expired connections", pool.provider.Host, expiredConnectionsDestroyed))
-		}
-
 		return nil
 	}
 
@@ -1567,8 +1533,6 @@ func (p *connectionPool) checkProviderHealth(ctx context.Context, providersToChe
 	if len(providersToCheck) == 0 {
 		return
 	}
-
-	p.log.Debug(fmt.Sprintf("performing health check on %d providers", len(providersToCheck)))
 
 	for _, pool := range providersToCheck {
 		select {
