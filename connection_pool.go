@@ -552,7 +552,7 @@ func (p *connectionPool) Body(
 			}
 		}
 
-		if nntpcli.IsArticleNotFoundError(err) {
+		if !errors.Is(err, context.Canceled) && nntpcli.IsArticleNotFoundError(err) {
 			p.log.DebugContext(ctx,
 				"Segment Not Found in any of the providers",
 				"error", retryErr,
@@ -702,7 +702,7 @@ func (p *connectionPool) BodyReader(
 			}
 		}
 
-		if nntpcli.IsArticleNotFoundError(err) {
+		if !errors.Is(err, context.Canceled) && nntpcli.IsArticleNotFoundError(err) {
 			p.log.DebugContext(ctx,
 				"Segment Not Found in any of the providers",
 				"error", retryErr,
@@ -977,7 +977,7 @@ func (p *connectionPool) Stat(
 			}
 		}
 
-		if nntpcli.IsArticleNotFoundError(err) {
+		if !errors.Is(err, context.Canceled) && nntpcli.IsArticleNotFoundError(err) {
 			p.log.DebugContext(ctx,
 				"Segment Not Found in any of the providers",
 				"error", retryErr,
