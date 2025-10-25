@@ -118,7 +118,7 @@ type Option func(*Config)
 var (
 	configDefault = Config{
 		HealthCheckInterval:          1 * time.Minute,
-		MinConnections:               5,
+		MinConnections:               0,
 		MaxRetries:                   4,
 		RetryDelay:                   5 * time.Second,
 		ShutdownTimeout:              30 * time.Second,
@@ -157,10 +157,6 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.HealthCheckInterval == 0 {
 		cfg.HealthCheckInterval = configDefault.HealthCheckInterval
-	}
-
-	if cfg.MinConnections == 0 {
-		cfg.MinConnections = configDefault.MinConnections
 	}
 
 	if cfg.MaxRetries == 0 {
