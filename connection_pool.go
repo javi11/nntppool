@@ -537,7 +537,34 @@ func (p *connectionPool) Body(
 		var e retry.Error
 
 		if errors.As(err, &e) {
-			err = errors.Join(e.WrappedErrors()...)
+			wrappedErrors := e.WrappedErrors()
+			lastError := wrappedErrors[len(wrappedErrors)-1]
+
+			if conn != nil {
+				if errors.Is(lastError, context.Canceled) {
+					if freeErr := conn.Free(); freeErr != nil {
+						p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+					}
+				} else {
+					if closeErr := conn.Close(); closeErr != nil {
+						p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+					}
+				}
+			}
+
+			// Check only the last error to determine if article was not found
+			if !errors.Is(lastError, context.Canceled) && nntpcli.IsArticleNotFoundError(lastError) {
+				p.log.DebugContext(ctx,
+					"Segment Not Found in any of the providers",
+					"error", lastError,
+					"segment_id", msgID,
+				)
+
+				// if article not found, we don't want to retry so mark it as corrupted
+				return finalBytesWritten, ErrArticleNotFoundInProviders
+			}
+
+			return finalBytesWritten, lastError
 		}
 
 		if conn != nil {
@@ -550,17 +577,6 @@ func (p *connectionPool) Body(
 					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
 				}
 			}
-		}
-
-		if !errors.Is(err, context.Canceled) && nntpcli.IsArticleNotFoundError(err) {
-			p.log.DebugContext(ctx,
-				"Segment Not Found in any of the providers",
-				"error", retryErr,
-				"segment_id", msgID,
-			)
-
-			// if article not found, we don't want to retry so mark it as corrupted
-			return finalBytesWritten, ErrArticleNotFoundInProviders
 		}
 
 		return finalBytesWritten, err
@@ -687,7 +703,33 @@ func (p *connectionPool) BodyReader(
 		var e retry.Error
 
 		if errors.As(err, &e) {
-			err = errors.Join(e.WrappedErrors()...)
+			wrappedErrors := e.WrappedErrors()
+			lastError := wrappedErrors[len(wrappedErrors)-1]
+
+			if conn != nil {
+				if errors.Is(lastError, context.Canceled) {
+					if freeErr := conn.Free(); freeErr != nil {
+						p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+					}
+				} else {
+					if closeErr := conn.Close(); closeErr != nil {
+						p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+					}
+				}
+			}
+
+			// Check only the last error to determine if article was not found
+			if !errors.Is(lastError, context.Canceled) && nntpcli.IsArticleNotFoundError(lastError) {
+				p.log.DebugContext(ctx,
+					"Segment Not Found in any of the providers",
+					"error", lastError,
+					"segment_id", msgID,
+				)
+
+				return nil, ErrArticleNotFoundInProviders
+			}
+
+			return nil, lastError
 		}
 
 		if conn != nil {
@@ -700,16 +742,6 @@ func (p *connectionPool) BodyReader(
 					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
 				}
 			}
-		}
-
-		if !errors.Is(err, context.Canceled) && nntpcli.IsArticleNotFoundError(err) {
-			p.log.DebugContext(ctx,
-				"Segment Not Found in any of the providers",
-				"error", retryErr,
-				"segment_id", msgID,
-			)
-
-			return nil, ErrArticleNotFoundInProviders
 		}
 
 		return nil, err
@@ -962,7 +994,34 @@ func (p *connectionPool) Stat(
 		var e retry.Error
 
 		if errors.As(err, &e) {
-			err = errors.Join(e.WrappedErrors()...)
+			wrappedErrors := e.WrappedErrors()
+			lastError := wrappedErrors[len(wrappedErrors)-1]
+
+			if conn != nil {
+				if errors.Is(lastError, context.Canceled) {
+					if freeErr := conn.Free(); freeErr != nil {
+						p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+					}
+				} else {
+					if closeErr := conn.Close(); closeErr != nil {
+						p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
+					}
+				}
+			}
+
+			// Check only the last error to determine if article was not found
+			if !errors.Is(lastError, context.Canceled) && nntpcli.IsArticleNotFoundError(lastError) {
+				p.log.DebugContext(ctx,
+					"Segment Not Found in any of the providers",
+					"error", lastError,
+					"segment_id", msgID,
+				)
+
+				// if article not found, we don't want to retry so mark it as corrupted
+				return res, ErrArticleNotFoundInProviders
+			}
+
+			return res, lastError
 		}
 
 		if conn != nil {
@@ -975,17 +1034,6 @@ func (p *connectionPool) Stat(
 					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
 				}
 			}
-		}
-
-		if !errors.Is(err, context.Canceled) && nntpcli.IsArticleNotFoundError(err) {
-			p.log.DebugContext(ctx,
-				"Segment Not Found in any of the providers",
-				"error", retryErr,
-				"segment_id", msgID,
-			)
-
-			// if article not found, we don't want to retry so mark it as corrupted
-			return res, ErrArticleNotFoundInProviders
 		}
 
 		return res, err
