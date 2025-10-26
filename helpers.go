@@ -252,8 +252,6 @@ func dialNNTP(
 		err error
 	)
 
-	log.Debug(fmt.Sprintf("connecting to %s:%v", p.Host, p.Port))
-
 	ttl := time.Duration(p.MaxConnectionTTLInSeconds) * time.Second
 
 	if p.TLS {

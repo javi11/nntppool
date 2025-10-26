@@ -183,8 +183,6 @@ func DialNNTP(ctx context.Context, cli NNTPClient, p ProviderConfig, log Logger)
 		err error
 	)
 
-	log.Debug(fmt.Sprintf("connecting to %s:%v", p.GetHost(), p.GetPort()))
-
 	ttl := time.Duration(p.GetMaxConnectionTTLInSeconds()) * time.Second
 
 	if p.GetTLS() {
