@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/textproto"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/jackc/puddle/v2"
 	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"golang.org/x/net/proxy"
 )
 
 func joinGroup(c nntpcli.Connection, groups []string) error {
@@ -60,10 +62,7 @@ func getPools(
 					}, nil
 				},
 				Destructor: func(value *internalConnection) {
-					err := value.nntp.Close()
-					if err != nil {
-						log.Debug(fmt.Sprintf("error closing connection: %v", err))
-					}
+					_ = value.nntp.Close()
 
 					// Record connection destruction
 					if metrics != nil {
@@ -254,15 +253,28 @@ func dialNNTP(
 
 	ttl := time.Duration(p.MaxConnectionTTLInSeconds) * time.Second
 
+	// Create proxy dialer if configured
+	var proxyDialer nntpcli.ContextDialer
+	if p.ProxyURL != "" {
+		proxyDialer, err = createProxyDialer(p.ProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create proxy dialer for %s: %w", p.Host, err)
+		}
+		log.Debug(fmt.Sprintf("using proxy for provider %s", p.Host))
+	}
+
+	dialConfig := nntpcli.DialConfig{
+		KeepAliveTime: ttl,
+		Dialer:        proxyDialer,
+	}
+
 	if p.TLS {
 		c, err = cli.DialTLS(
 			ctx,
 			p.Host,
 			p.Port,
 			p.InsecureSSL,
-			nntpcli.DialConfig{
-				KeepAliveTime: ttl,
-			},
+			dialConfig,
 		)
 		if err != nil {
 			var netErr net.Error
@@ -274,15 +286,11 @@ func dialNNTP(
 			return nil, fmt.Errorf("error dialing to %v/%v TLS: %w", p.Host, p.Username, err)
 		}
 	} else {
-		var err error
-
 		c, err = cli.Dial(
 			ctx,
 			p.Host,
 			p.Port,
-			nntpcli.DialConfig{
-				KeepAliveTime: ttl,
-			},
+			dialConfig,
 		)
 		if err != nil {
 			var netErr net.Error
@@ -302,4 +310,79 @@ func dialNNTP(
 	}
 
 	return c, nil
+}
+
+// socks5ContextDialer wraps proxy.Dialer to support DialContext
+type socks5ContextDialer struct {
+	dialer proxy.Dialer
+}
+
+func (s *socks5ContextDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	// Check if the dialer supports DialContext directly
+	if ctxDialer, ok := s.dialer.(proxy.ContextDialer); ok {
+		return ctxDialer.DialContext(ctx, network, address)
+	}
+
+	// Fallback: dial with basic context cancellation check
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan dialResult, 1)
+
+	go func() {
+		conn, err := s.dialer.Dial(network, address)
+		done <- dialResult{conn, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-done:
+		return result.conn, result.err
+	}
+}
+
+// createProxyDialer creates a SOCKS5 dialer from a proxy URL.
+// Returns nil, nil if proxyURL is empty.
+// Format: socks5://[user:password@]host:port
+func createProxyDialer(proxyURL string) (nntpcli.ContextDialer, error) {
+	if proxyURL == "" {
+		return nil, nil
+	}
+
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+
+	if u.Scheme != "socks5" {
+		return nil, fmt.Errorf("unsupported proxy scheme: %s (only socks5 is supported)", u.Scheme)
+	}
+
+	var auth *proxy.Auth
+	if u.User != nil {
+		password, _ := u.User.Password()
+		auth = &proxy.Auth{
+			User:     u.User.Username(),
+			Password: password,
+		}
+	}
+
+	dialer, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
+	}
+
+	return &socks5ContextDialer{dialer: dialer}, nil
+}
+
+// isProxyError checks if the error is related to proxy connection failure
+func isProxyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "socks") ||
+		strings.Contains(errStr, "proxy")
 }

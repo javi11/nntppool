@@ -78,6 +78,7 @@ type ProviderConfig interface {
 	GetInsecureSSL() bool
 	GetIsBackupProvider() bool
 	GetVerifyCapabilities() []string
+	GetProxyURL() string
 }
 
 type UsenetProviderConfig struct {
@@ -85,6 +86,11 @@ type UsenetProviderConfig struct {
 	Username                       string
 	Password                       string
 	VerifyCapabilities             []string
+	// ProxyURL is an optional SOCKS5 proxy URL for this provider.
+	// Format: socks5://[user:password@]host:port
+	// Example: socks5://proxy.example.com:1080
+	// Example with auth: socks5://user:pass@proxy.example.com:1080
+	ProxyURL                       string
 	Port                           int
 	MaxConnections                 int
 	MaxConnectionIdleTimeInSeconds int
@@ -112,6 +118,7 @@ func (u *UsenetProviderConfig) GetTLS() bool                      { return u.TLS
 func (u *UsenetProviderConfig) GetInsecureSSL() bool              { return u.InsecureSSL }
 func (u *UsenetProviderConfig) GetIsBackupProvider() bool         { return u.IsBackupProvider }
 func (u *UsenetProviderConfig) GetVerifyCapabilities() []string   { return u.VerifyCapabilities }
+func (u *UsenetProviderConfig) GetProxyURL() string               { return u.ProxyURL }
 
 type Option func(*Config)
 

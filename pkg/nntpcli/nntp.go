@@ -9,9 +9,18 @@ import (
 	"time"
 )
 
+// ContextDialer is a dialer that supports context.
+// Use this for proxy connections or custom dialing behavior.
+type ContextDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
 type DialConfig struct {
 	KeepAliveTime time.Duration
 	DialTimeout   time.Duration
+	// Dialer is an optional custom dialer. If nil, net.Dialer is used.
+	// Use this for proxy connections.
+	Dialer ContextDialer
 }
 
 type Client interface {
@@ -47,24 +56,22 @@ func New(
 	}
 }
 
-// setupTCPConn configures a TCP connection with keep-alive and other options
+// setupTCPConn configures a TCP connection with keep-alive and other options.
+// If cfg.Dialer is set, it will be used for dialing (e.g., for proxy connections).
 func (c *client) setupTCPConn(ctx context.Context, host string, port int, cfg DialConfig) (net.Conn, time.Duration, error) {
-	var d net.Dialer
-	if cfg.DialTimeout != 0 {
-		d = net.Dialer{Timeout: cfg.DialTimeout}
+	var dialer ContextDialer
+
+	if cfg.Dialer != nil {
+		dialer = cfg.Dialer
+	} else {
+		d := &net.Dialer{}
+		if cfg.DialTimeout != 0 {
+			d.Timeout = cfg.DialTimeout
+		}
+		dialer = d
 	}
 
-	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		return nil, 0, err
-	}
-
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return nil, 0, fmt.Errorf("expected TCP connection, got %T", conn)
-	}
-
-	err = tcpConn.SetKeepAlive(true)
+	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", host, port))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -74,14 +81,19 @@ func (c *client) setupTCPConn(ctx context.Context, host string, port int, cfg Di
 		keepAlive = cfg.KeepAliveTime
 	}
 
-	err = tcpConn.SetKeepAlivePeriod(keepAlive)
-	if err != nil {
-		return nil, 0, err
-	}
+	// Configure TCP options only for direct TCP connections (not proxied)
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		if err = tcpConn.SetKeepAlive(true); err != nil {
+			return nil, 0, err
+		}
 
-	err = tcpConn.SetNoDelay(true)
-	if err != nil {
-		return nil, 0, err
+		if err = tcpConn.SetKeepAlivePeriod(keepAlive); err != nil {
+			return nil, 0, err
+		}
+
+		if err = tcpConn.SetNoDelay(true); err != nil {
+			return nil, 0, err
+		}
 	}
 
 	return conn, keepAlive, nil
