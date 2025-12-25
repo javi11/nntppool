@@ -2,6 +2,7 @@ package nntpcli
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -13,7 +14,6 @@ import (
 	"github.com/javi11/nntppool/v2/pkg/nntpcli/test"
 
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/net/context"
 )
 
 const examplepost = `From: <nobody@example.com>
