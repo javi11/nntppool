@@ -109,7 +109,7 @@ nntppool/
 
 ### Go Standards
 
-- **Go Version**: 1.24.4 or later
+- **Go Version**: 1.25.1 or later
 - **CGO**: Required for rapidyenc (yenc encoding/decoding)
 - **Build**: `CGO_ENABLED=1 go build`
 
