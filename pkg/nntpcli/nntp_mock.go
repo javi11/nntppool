@@ -11,10 +11,50 @@ package nntpcli
 
 import (
 	context "context"
+	net "net"
 	reflect "reflect"
 
 	gomock "go.uber.org/mock/gomock"
 )
+
+// MockContextDialer is a mock of ContextDialer interface.
+type MockContextDialer struct {
+	ctrl     *gomock.Controller
+	recorder *MockContextDialerMockRecorder
+	isgomock struct{}
+}
+
+// MockContextDialerMockRecorder is the mock recorder for MockContextDialer.
+type MockContextDialerMockRecorder struct {
+	mock *MockContextDialer
+}
+
+// NewMockContextDialer creates a new mock instance.
+func NewMockContextDialer(ctrl *gomock.Controller) *MockContextDialer {
+	mock := &MockContextDialer{ctrl: ctrl}
+	mock.recorder = &MockContextDialerMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockContextDialer) EXPECT() *MockContextDialerMockRecorder {
+	return m.recorder
+}
+
+// DialContext mocks base method.
+func (m *MockContextDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DialContext", ctx, network, address)
+	ret0, _ := ret[0].(net.Conn)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DialContext indicates an expected call of DialContext.
+func (mr *MockContextDialerMockRecorder) DialContext(ctx, network, address any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DialContext", reflect.TypeOf((*MockContextDialer)(nil).DialContext), ctx, network, address)
+}
 
 // MockClient is a mock of Client interface.
 type MockClient struct {
