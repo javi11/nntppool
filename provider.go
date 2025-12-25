@@ -37,6 +37,7 @@ type ConnectionProviderInfo struct {
 	Host           string        `json:"host"`
 	Username       string        `json:"username"`
 	MaxConnections int           `json:"maxConnections"`
+	PipelineDepth  int           `json:"pipelineDepth"`
 	State          ProviderState `json:"state"`
 }
 

@@ -104,6 +104,7 @@ func (p pooledConnection) Provider() ConnectionProviderInfo {
 		Host:           prov.Host,
 		Username:       prov.Username,
 		MaxConnections: prov.MaxConnections,
+		PipelineDepth:  prov.PipelineDepth,
 		State:          ProviderStateActive, // Default state, actual state managed by pool
 	}
 }

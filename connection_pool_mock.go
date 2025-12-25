@@ -57,6 +57,20 @@ func (mr *MockUsenetConnectionPoolMockRecorder) Body(ctx, msgID, w, nntpGroups a
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Body", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Body), ctx, msgID, w, nntpGroups)
 }
 
+// BodyBatch mocks base method.
+func (m *MockUsenetConnectionPool) BodyBatch(ctx context.Context, group string, requests []BodyBatchRequest) []BodyBatchResult {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "BodyBatch", ctx, group, requests)
+	ret0, _ := ret[0].([]BodyBatchResult)
+	return ret0
+}
+
+// BodyBatch indicates an expected call of BodyBatch.
+func (mr *MockUsenetConnectionPoolMockRecorder) BodyBatch(ctx, group, requests any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyBatch", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyBatch), ctx, group, requests)
+}
+
 // BodyReader mocks base method.
 func (m *MockUsenetConnectionPool) BodyReader(ctx context.Context, msgID string, nntpGroups []string) (nntpcli.ArticleBodyReader, error) {
 	m.ctrl.T.Helper()
@@ -183,4 +197,20 @@ func (m *MockUsenetConnectionPool) Stat(ctx context.Context, msgID string, nntpG
 func (mr *MockUsenetConnectionPoolMockRecorder) Stat(ctx, msgID, nntpGroups any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stat", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Stat), ctx, msgID, nntpGroups)
+}
+
+// TestProviderPipelineSupport mocks base method.
+func (m *MockUsenetConnectionPool) TestProviderPipelineSupport(ctx context.Context, providerHost, testMsgID string) (bool, int, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "TestProviderPipelineSupport", ctx, providerHost, testMsgID)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(int)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// TestProviderPipelineSupport indicates an expected call of TestProviderPipelineSupport.
+func (mr *MockUsenetConnectionPoolMockRecorder) TestProviderPipelineSupport(ctx, providerHost, testMsgID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TestProviderPipelineSupport", reflect.TypeOf((*MockUsenetConnectionPool)(nil).TestProviderPipelineSupport), ctx, providerHost, testMsgID)
 }

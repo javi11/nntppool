@@ -74,6 +74,7 @@ type ProviderConfig interface {
 	GetMaxConnections() int
 	GetMaxConnectionIdleTimeInSeconds() int
 	GetMaxConnectionTTLInSeconds() int
+	GetPipelineDepth() int
 	GetTLS() bool
 	GetInsecureSSL() bool
 	GetIsBackupProvider() bool
@@ -95,6 +96,11 @@ type UsenetProviderConfig struct {
 	MaxConnections                 int
 	MaxConnectionIdleTimeInSeconds int
 	MaxConnectionTTLInSeconds      int
+	// PipelineDepth is the number of BODY commands to send in a pipeline before
+	// waiting for responses. Set to 0 or 1 to disable pipelining (default).
+	// Recommended values: 2-4 for low latency (<50ms), 4-8 for high latency (100ms+).
+	// Higher values can improve throughput on high-latency connections.
+	PipelineDepth                  int
 	TLS                            bool
 	InsecureSSL                    bool
 	IsBackupProvider               bool
@@ -114,6 +120,7 @@ func (u *UsenetProviderConfig) GetMaxConnectionIdleTimeInSeconds() int {
 	return u.MaxConnectionIdleTimeInSeconds
 }
 func (u *UsenetProviderConfig) GetMaxConnectionTTLInSeconds() int { return u.MaxConnectionTTLInSeconds }
+func (u *UsenetProviderConfig) GetPipelineDepth() int             { return u.PipelineDepth }
 func (u *UsenetProviderConfig) GetTLS() bool                      { return u.TLS }
 func (u *UsenetProviderConfig) GetInsecureSSL() bool              { return u.InsecureSSL }
 func (u *UsenetProviderConfig) GetIsBackupProvider() bool         { return u.IsBackupProvider }

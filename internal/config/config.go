@@ -10,6 +10,7 @@ type ProviderConfig interface {
 	GetMaxConnections() int
 	GetMaxConnectionIdleTimeInSeconds() int
 	GetMaxConnectionTTLInSeconds() int
+	GetPipelineDepth() int
 	GetTLS() bool
 	GetInsecureSSL() bool
 	GetIsBackupProvider() bool
