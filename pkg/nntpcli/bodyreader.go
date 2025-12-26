@@ -123,7 +123,6 @@ func (r *articleBodyReader) Close() (err error) {
 
 	if r.decoder != nil {
 		_, _ = io.Copy(io.Discard, r.decoder)
-		rapidyenc.ReleaseDecoder(r.decoder)
 		r.decoder = nil
 	}
 

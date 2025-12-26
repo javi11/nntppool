@@ -2,6 +2,7 @@
 package nntpcli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -256,12 +257,26 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, err)
 	}
 
-	dec := rapidyenc.AcquireDecoder(c.conn.R)
-	defer rapidyenc.ReleaseDecoder(dec)
+	dec := rapidyenc.NewDecoder(c.conn.R)
 
-	// Discard the first n lines
+	// If we need to discard bytes, we must first initialize the decoder with a read
+	// The new rapidyenc version requires reading some data before it's ready for operations
+	var reader io.Reader = dec
 	if discard > 0 {
-		if _, err = io.CopyN(io.Discard, dec, discard); err != nil {
+		// Read initial chunk to initialize decoder (similar to GetYencHeaders)
+		initBuf := make([]byte, 4096)
+		initN, initErr := dec.Read(initBuf)
+		if initN > 0 {
+			// We have data - create a multi-reader with buffer + decoder
+			reader = io.MultiReader(bytes.NewReader(initBuf[:initN]), dec)
+		}
+		if initErr != nil && initErr != io.EOF {
+			_, _ = io.Copy(io.Discard, dec)
+			return 0, fmt.Errorf("BODY <%s>: decoder initialization failed: %w", msgID, initErr)
+		}
+
+		// Now discard from the buffered reader
+		if _, err = io.CopyN(io.Discard, reader, discard); err != nil {
 			// Attempt to drain the decoder to avoid connection issues
 			if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
 				return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w (drain also failed: %v)", msgID, discard, err, drainErr)
@@ -271,7 +286,7 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		}
 	}
 
-	n, err = io.Copy(w, dec)
+	n, err = io.Copy(w, reader)
 	if err != nil {
 		// Attempt to drain the decoder to avoid connection issues
 		if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
@@ -318,12 +333,26 @@ func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err err
 		return nil, fmt.Errorf("clear deadline: %w", err)
 	}
 
-	dec := rapidyenc.AcquireDecoder(c.conn.R)
+	dec := rapidyenc.NewDecoder(c.conn.R)
+
+	// Initialize decoder with a read (new rapidyenc requires this)
+	initBuf := make([]byte, 4096)
+	initN, initErr := dec.Read(initBuf)
+	var buffer *bytes.Buffer
+	if initN > 0 {
+		buffer = bytes.NewBuffer(initBuf[:initN])
+	}
+	if initErr != nil && initErr != io.EOF {
+		_, _ = io.Copy(io.Discard, dec)
+		c.conn.EndResponse(id)
+		return nil, fmt.Errorf("BODY <%s>: decoder initialization failed: %w", msgID, initErr)
+	}
 
 	return &articleBodyReader{
 		decoder:    dec,
 		conn:       c,
 		responseID: id,
+		buffer:     buffer,
 		closed:     false,
 	}, nil
 }
