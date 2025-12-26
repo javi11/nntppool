@@ -7,8 +7,8 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/jackc/puddle/v2 v2.2.2
 	github.com/javi11/nntp-server-mock v0.0.1
-	github.com/mnightingale/rapidyenc v0.0.0-20250628164132-aaf36ba945ef
-	github.com/stretchr/testify v1.10.0
+	github.com/mnightingale/rapidyenc v0.0.0-20251128204712-7aafef1eaf1c
+	github.com/stretchr/testify v1.11.1
 	go.uber.org/mock v0.5.2
 	golang.org/x/net v0.48.0
 	golang.org/x/text v0.32.0
