@@ -7,13 +7,83 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
+
+// nntpConn wraps the custom reader/writer/pipeline for NNTP operations.
+// This replaces textproto.Conn to remove the dependency on net/textproto.
+type nntpConn struct {
+	reader   *nntpReader
+	writer   *nntpWriter
+	pipeline *pipeline
+	conn     net.Conn
+}
+
+// newNNTPConn creates a new nntpConn wrapping the given net.Conn.
+func newNNTPConn(conn net.Conn) *nntpConn {
+	return &nntpConn{
+		reader:   newNNTPReader(conn),
+		writer:   newNNTPWriter(conn),
+		pipeline: newPipeline(),
+		conn:     conn,
+	}
+}
+
+// Cmd sends a command and returns a pipeline ID for response tracking.
+func (c *nntpConn) Cmd(format string, args ...any) (uint, error) {
+	id := c.pipeline.Next()
+	c.pipeline.StartRequest(id)
+	err := c.writer.PrintfLine(format, args...)
+	if err != nil {
+		c.pipeline.EndRequest(id)
+		return 0, err
+	}
+	err = c.writer.Flush()
+	c.pipeline.EndRequest(id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// StartResponse blocks until it is time to read the response for the given ID.
+func (c *nntpConn) StartResponse(id uint) {
+	c.pipeline.StartResponse(id)
+}
+
+// EndResponse signals that the response for the given ID has been read.
+func (c *nntpConn) EndResponse(id uint) {
+	c.pipeline.EndResponse(id)
+}
+
+// ReadCodeLine reads a response line and parses the status code.
+func (c *nntpConn) ReadCodeLine(expectCode int) (int, string, error) {
+	return c.reader.ReadCodeLine(expectCode)
+}
+
+// ReadLine reads a single line from the connection.
+func (c *nntpConn) ReadLine() (string, error) {
+	return c.reader.ReadLine()
+}
+
+// DotWriter returns an io.WriteCloser for dot-stuffed writing.
+func (c *nntpConn) DotWriter() io.WriteCloser {
+	return c.writer.DotWriter()
+}
+
+// Reader returns the underlying reader for use with rapidyenc.
+func (c *nntpConn) Reader() io.Reader {
+	return c.reader.Reader()
+}
+
+// Close closes the underlying connection.
+func (c *nntpConn) Close() error {
+	return c.conn.Close()
+}
 
 type Connection interface {
 	io.Closer
@@ -46,13 +116,13 @@ var _ Connection = (*connection)(nil)
 type connection struct {
 	maxAgeTime         time.Time
 	netconn            net.Conn
-	conn               *textproto.Conn
+	conn               *nntpConn
 	currentJoinedGroup string
 	operationTimeout   time.Duration
 }
 
 func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time.Duration) (Connection, error) {
-	conn := textproto.NewConn(netconn)
+	conn := newNNTPConn(netconn)
 
 	_, _, err := conn.ReadCodeLine(StatusReady)
 	if err != nil {
@@ -257,42 +327,21 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, err)
 	}
 
-	dec := rapidyenc.NewDecoder(c.conn.R)
+	dec := newIncrementalDecoder(c.conn.Reader())
 
-	// If we need to discard bytes, we must first initialize the decoder with a read
-	// The new rapidyenc version requires reading some data before it's ready for operations
-	var reader io.Reader = dec
+	// Discard the first n bytes if requested
 	if discard > 0 {
-		// Read initial chunk to initialize decoder (similar to GetYencHeaders)
-		initBuf := make([]byte, 4096)
-		initN, initErr := dec.Read(initBuf)
-		if initN > 0 {
-			// We have data - create a multi-reader with buffer + decoder
-			reader = io.MultiReader(bytes.NewReader(initBuf[:initN]), dec)
-		}
-		if initErr != nil && initErr != io.EOF {
-			_, _ = io.Copy(io.Discard, dec)
-			return 0, fmt.Errorf("BODY <%s>: decoder initialization failed: %w", msgID, initErr)
-		}
-
-		// Now discard from the buffered reader
-		if _, err = io.CopyN(io.Discard, reader, discard); err != nil {
+		if _, err = io.CopyN(io.Discard, dec, discard); err != nil {
 			// Attempt to drain the decoder to avoid connection issues
-			if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-				return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w (drain also failed: %v)", msgID, discard, err, drainErr)
-			}
-
+			_, _ = io.Copy(io.Discard, dec)
 			return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", msgID, discard, err)
 		}
 	}
 
-	n, err = io.Copy(w, reader)
+	n, err = io.Copy(w, dec)
 	if err != nil {
 		// Attempt to drain the decoder to avoid connection issues
-		if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-			return n, fmt.Errorf("BODY <%s>: copy failed: %w (drain also failed: %v)", msgID, err, drainErr)
-		}
-
+		_, _ = io.Copy(io.Discard, dec)
 		return n, fmt.Errorf("BODY <%s>: copy failed: %w", msgID, err)
 	}
 
@@ -333,7 +382,7 @@ func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err err
 		return nil, fmt.Errorf("clear deadline: %w", err)
 	}
 
-	dec := rapidyenc.NewDecoder(c.conn.R)
+	dec := rapidyenc.NewDecoder(c.conn.Reader())
 
 	// Initialize decoder with a read (new rapidyenc requires this)
 	initBuf := make([]byte, 4096)

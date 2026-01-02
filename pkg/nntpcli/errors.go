@@ -2,8 +2,19 @@ package nntpcli
 
 import (
 	"errors"
-	"net/textproto"
+	"fmt"
 )
+
+// NNTPError represents a numeric error response from an NNTP server.
+// It replaces textproto.Error to remove the dependency on net/textproto.
+type NNTPError struct {
+	Code int
+	Msg  string
+}
+
+func (e *NNTPError) Error() string {
+	return fmt.Sprintf("%d %s", e.Code, e.Msg)
+}
 
 var (
 	ErrCapabilitiesUnpopulated = errors.New("capabilities unpopulated")
@@ -21,7 +32,7 @@ const (
 )
 
 func IsArticleNotFoundError(err error) bool {
-	var nntpErr *textproto.Error
+	var nntpErr *NNTPError
 	if ok := errors.As(err, &nntpErr); ok {
 		return nntpErr.Code == ArticleNotFoundErrCode
 	}
@@ -30,7 +41,7 @@ func IsArticleNotFoundError(err error) bool {
 }
 
 func IsSegmentAlreadyExistsError(err error) bool {
-	var nntpErr *textproto.Error
+	var nntpErr *NNTPError
 	if ok := errors.As(err, &nntpErr); ok {
 		return nntpErr.Code == SegmentAlreadyExistsErrCode
 	}

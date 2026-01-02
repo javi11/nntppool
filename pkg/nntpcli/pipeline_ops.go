@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 	"time"
-
-	"github.com/mnightingale/rapidyenc"
 )
 
 // PipelineRequest represents a single body request in a pipeline.
@@ -34,7 +32,7 @@ type PipelineResult struct {
 // This method sends all BODY commands before reading any responses, which can significantly
 // improve throughput on high-latency connections.
 //
-// The method uses the textproto.Conn's native pipelining support via Cmd(), StartResponse(),
+// The method uses the nntpConn's pipelining support via Cmd(), StartResponse(),
 // and EndResponse() to properly sequence the requests and responses.
 //
 // If requests is empty, returns an empty slice.
@@ -125,8 +123,8 @@ func (c *connection) BodyPipelined(requests []PipelineRequest) (results []Pipeli
 			continue
 		}
 
-		// Decode body with rapidyenc
-		dec := rapidyenc.NewDecoder(c.conn.R)
+		// Decode body with incremental decoder
+		dec := newIncrementalDecoder(c.conn.Reader())
 
 		// Discard the first n bytes if requested
 		if req.Discard > 0 {
