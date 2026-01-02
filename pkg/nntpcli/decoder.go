@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/mnightingale/rapidyenc"
@@ -32,7 +33,7 @@ const (
 var ErrDecoderMaxIterations = errors.New("decoder: max iterations exceeded, possible malformed data")
 
 // incrementalDecoder wraps rapidyenc.DecodeIncremental to provide an io.Reader interface.
-// This decoder handles yenc headers (=ybegin, =ypart) by skipping them, then uses
+// It parses yenc headers (=ybegin, =ypart) to extract file size, then uses
 // DecodeIncremental for the actual encoded body data.
 type incrementalDecoder struct {
 	r            *bufio.Reader
@@ -41,9 +42,11 @@ type incrementalDecoder struct {
 	bufStart     int    // start of unconsumed data in buf
 	bufEnd       int    // end of data in buf
 	decoded      []byte // decoded data not yet consumed by caller
-	headersRead  bool   // true after headers have been parsed/skipped
+	headersRead  bool   // true after headers have been parsed
 	eof          bool   // true when end of yenc data reached
 	readErr      error  // stored read error
+	expectedSize int64  // expected decoded size from =ybegin size=
+	decodedTotal int64  // total bytes decoded so far
 }
 
 // newIncrementalDecoder creates a new incremental yenc decoder.
@@ -54,31 +57,35 @@ func newIncrementalDecoder(r io.Reader) *incrementalDecoder {
 	}
 }
 
-// skipHeaders reads and skips the yenc header lines (=ybegin, =ypart).
+// parseHeaders reads and parses the yenc header lines (=ybegin, =ypart).
+// Extracts the expected file size from =ybegin size=N.
 // After this, the reader is positioned at the start of the encoded body.
-func (d *incrementalDecoder) skipHeaders() error {
+func (d *incrementalDecoder) parseHeaders() error {
 	for {
 		line, err := d.r.ReadString('\n')
 		if err != nil {
 			return err
 		}
 
-		// Trim the line for comparison
 		trimmed := strings.TrimSpace(line)
 
 		if strings.HasPrefix(trimmed, "=ybegin") {
-			// Found =ybegin, continue to check for =ypart
+			// Extract size= parameter from =ybegin line
+			d.expectedSize = parseYencParam(trimmed, "size")
+			debugLog("decoder.parseHeaders: =ybegin found, expectedSize=%d", d.expectedSize)
 			continue
 		}
 
 		if strings.HasPrefix(trimmed, "=ypart") {
-			// Found =ypart, body starts after this
+			// Multi-part article - could extract begin/end for partial downloads
+			debugLog("decoder.parseHeaders: =ypart found")
 			continue
 		}
 
 		// This line is not a header - it's the start of the body
-		// Put this data back into our buffer
+		// Put this data back into our buffer for decoding
 		d.bufEnd = copy(d.buf, []byte(line))
+		debugLog("decoder.parseHeaders: first body line buffered, bufEnd=%d", d.bufEnd)
 		break
 	}
 
@@ -86,17 +93,44 @@ func (d *incrementalDecoder) skipHeaders() error {
 	return nil
 }
 
+// parseYencParam extracts a named parameter value from a yenc header line.
+// For example, parseYencParam("=ybegin line=128 size=12345 name=file.txt", "size") returns 12345.
+func parseYencParam(line, param string) int64 {
+	// Look for "param=" in the line
+	prefix := param + "="
+	idx := strings.Index(line, prefix)
+	if idx == -1 {
+		return 0
+	}
+
+	// Extract value starting after "param="
+	start := idx + len(prefix)
+	end := start
+
+	// Find end of value (space or end of string)
+	for end < len(line) && line[end] != ' ' && line[end] != '\t' && line[end] != '\r' && line[end] != '\n' {
+		end++
+	}
+
+	valueStr := line[start:end]
+	value, err := strconv.ParseInt(valueStr, 10, 64)
+	if err != nil {
+		return 0
+	}
+
+	return value
+}
+
 // Read implements io.Reader. It reads yenc-encoded data from the underlying
 // reader and returns decoded data.
 func (d *incrementalDecoder) Read(p []byte) (int, error) {
-	// Skip headers on first read
+	// Parse headers on first read
 	if !d.headersRead {
-		debugLog("decoder.Read: skipping headers")
-		if err := d.skipHeaders(); err != nil {
-			debugLog("decoder.Read: skipHeaders error: %v", err)
+		debugLog("decoder.Read: parsing headers")
+		if err := d.parseHeaders(); err != nil {
+			debugLog("decoder.Read: parseHeaders error: %v", err)
 			return 0, err
 		}
-		debugLog("decoder.Read: headers skipped, bufEnd=%d", d.bufEnd)
 	}
 
 	// If we have leftover decoded data, return that first
@@ -110,6 +144,13 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 	// If we've reached EOF, return EOF
 	if d.eof {
 		debugLog("decoder.Read: already at EOF")
+		return 0, io.EOF
+	}
+
+	// Check if we've decoded all expected data
+	if d.expectedSize > 0 && d.decodedTotal >= d.expectedSize {
+		debugLog("decoder.Read: reached expectedSize (%d >= %d)", d.decodedTotal, d.expectedSize)
+		d.eof = true
 		return 0, io.EOF
 	}
 
@@ -134,15 +175,12 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		// Get the data to decode
+		// Get the data to decode - use in-place decoding (same buffer for input/output)
 		input := d.buf[d.bufStart:d.bufEnd]
 
-		// Create output buffer - decode into a separate buffer to avoid overwrites
-		output := make([]byte, len(input))
-
-		// Decode
-		nDst, nSrc, end, decErr := rapidyenc.DecodeIncremental(output, input, &d.state)
-		debugLog("decoder.Read: iter=%d decode: nDst=%d nSrc=%d end=%v decErr=%v inputLen=%d", iteration, nDst, nSrc, end, decErr, len(input))
+		// Decode in-place
+		nDst, nSrc, end, decErr := rapidyenc.DecodeIncremental(input, input, &d.state)
+		debugLog("decoder.Read: iter=%d decode: nDst=%d nSrc=%d end=%v decErr=%v inputLen=%d decodedTotal=%d", iteration, nDst, nSrc, end, decErr, len(input), d.decodedTotal)
 		if decErr != nil {
 			debugLog("decoder.Read: iter=%d decode error: %v", iteration, decErr)
 			return 0, decErr
@@ -164,7 +202,7 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 			d.bufStart = 0
 		}
 
-		// Check if we reached the end
+		// Check if we reached the end marker
 		if end != rapidyenc.EndNone {
 			debugLog("decoder.Read: iter=%d reached yenc end marker (end=%v)", iteration, end)
 			d.eof = true
@@ -172,15 +210,26 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 
 		// Return decoded data if we have any
 		if nDst > 0 {
-			copied := copy(p, output[:nDst])
+			// Track total decoded bytes
+			d.decodedTotal += int64(nDst)
+
+			// Copy to caller's buffer
+			copied := copy(p, input[:nDst])
 			if copied < nDst {
 				// Save the rest for next Read call
 				d.decoded = make([]byte, nDst-copied)
-				copy(d.decoded, output[copied:nDst])
-				debugLog("decoder.Read: iter=%d returning %d bytes, saved %d for later", iteration, copied, nDst-copied)
+				copy(d.decoded, input[copied:nDst])
+				debugLog("decoder.Read: iter=%d returning %d bytes, saved %d for later, decodedTotal=%d", iteration, copied, nDst-copied, d.decodedTotal)
 			} else {
-				debugLog("decoder.Read: iter=%d returning %d bytes", iteration, copied)
+				debugLog("decoder.Read: iter=%d returning %d bytes, decodedTotal=%d", iteration, copied, d.decodedTotal)
 			}
+
+			// Check if we've reached the expected size
+			if d.expectedSize > 0 && d.decodedTotal >= d.expectedSize {
+				debugLog("decoder.Read: reached expectedSize after this read (%d >= %d)", d.decodedTotal, d.expectedSize)
+				d.eof = true
+			}
+
 			return copied, nil
 		}
 
