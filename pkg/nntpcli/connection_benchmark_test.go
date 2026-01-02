@@ -103,7 +103,10 @@ func benchmarkSetup(b *testing.B, fixtureFile string) (Connection, func()) {
 	}
 
 	if err := conn.JoinGroup("misc.test"); err != nil {
-		conn.Close()
+		err := conn.Close()
+		if err != nil {
+			b.Fatalf("failed to close connection: %v", err)
+		}
 		cancel()
 		s.Close()
 		wg.Wait()
@@ -113,7 +116,10 @@ func benchmarkSetup(b *testing.B, fixtureFile string) (Connection, func()) {
 	// Post the test article
 	encoded, err := os.ReadFile(fixtureFile)
 	if err != nil {
-		conn.Close()
+		err := conn.Close()
+		if err != nil {
+			b.Fatalf("failed to close connection: %v", err)
+		}
 		cancel()
 		s.Close()
 		wg.Wait()
@@ -125,7 +131,10 @@ func benchmarkSetup(b *testing.B, fixtureFile string) (Connection, func()) {
 	buf.Write(encoded)
 
 	if _, err := conn.Post(buf); err != nil {
-		conn.Close()
+		err := conn.Close()
+		if err != nil {
+			b.Fatalf("failed to close connection: %v", err)
+		}
 		cancel()
 		s.Close()
 		wg.Wait()
@@ -133,7 +142,10 @@ func benchmarkSetup(b *testing.B, fixtureFile string) (Connection, func()) {
 	}
 
 	cleanup := func() {
-		conn.Close()
+		err := conn.Close()
+		if err != nil {
+			b.Fatalf("failed to close connection: %v", err)
+		}
 		cancel()
 		s.Close()
 		wg.Wait()
@@ -227,15 +239,16 @@ func BenchmarkBodyReader_Large(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		reader, err := conn.BodyReader("1234")
 		if err != nil {
+			_ = reader.Close()
 			b.Fatalf("BodyReader failed: %v", err)
 		}
 
 		n, err := io.Copy(io.Discard, reader)
 		if err != nil {
-			reader.Close()
+			_ = reader.Close()
 			b.Fatalf("Copy failed: %v", err)
 		}
-		reader.Close()
+		_ = reader.Close()
 
 		if n != largeFixtureSize {
 			b.Fatalf("expected %d bytes, got %d", largeFixtureSize, n)
