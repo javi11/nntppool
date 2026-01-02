@@ -2,6 +2,7 @@ package nntpcli
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"strings"
 
@@ -11,7 +12,12 @@ import (
 const (
 	// decoderBufferSize is the buffer size for incremental decoding.
 	decoderBufferSize = 32 * 1024
+	// maxDecodeIterations prevents infinite loops on malformed data.
+	maxDecodeIterations = 10000
 )
+
+// ErrDecoderMaxIterations is returned when the decoder exceeds max iterations.
+var ErrDecoderMaxIterations = errors.New("decoder: max iterations exceeded, possible malformed data")
 
 // incrementalDecoder wraps rapidyenc.DecodeIncremental to provide an io.Reader interface.
 // This decoder handles yenc headers (=ybegin, =ypart) by skipping them, then uses
@@ -90,73 +96,85 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	// Try to fill the buffer if we have space
-	if d.bufEnd < len(d.buf) && d.readErr == nil {
-		n, err := d.r.Read(d.buf[d.bufEnd:])
-		d.bufEnd += n
-		if err != nil {
-			d.readErr = err
+	// Use bounded iteration instead of recursion to prevent infinite loops
+	for iteration := 0; iteration < maxDecodeIterations; iteration++ {
+		// Try to fill the buffer if we have space
+		if d.bufEnd < len(d.buf) && d.readErr == nil {
+			n, err := d.r.Read(d.buf[d.bufEnd:])
+			d.bufEnd += n
+			if err != nil {
+				d.readErr = err
+			}
 		}
-	}
 
-	// If we have no data to process, return
-	if d.bufStart >= d.bufEnd {
+		// If we have no data to process, return
+		if d.bufStart >= d.bufEnd {
+			if d.readErr != nil {
+				return 0, d.readErr
+			}
+			return 0, io.EOF
+		}
+
+		// Get the data to decode
+		input := d.buf[d.bufStart:d.bufEnd]
+
+		// Create output buffer - decode into a separate buffer to avoid overwrites
+		output := make([]byte, len(input))
+
+		// Decode
+		nDst, nSrc, end, decErr := rapidyenc.DecodeIncremental(output, input, &d.state)
+		if decErr != nil {
+			return 0, decErr
+		}
+
+		// Advance the buffer start by consumed bytes
+		d.bufStart += nSrc
+
+		// If we've consumed all data, reset the buffer positions
+		if d.bufStart >= d.bufEnd {
+			d.bufStart = 0
+			d.bufEnd = 0
+		} else if d.bufStart > len(d.buf)/2 {
+			// Compact the buffer if we've consumed more than half
+			copy(d.buf, d.buf[d.bufStart:d.bufEnd])
+			d.bufEnd -= d.bufStart
+			d.bufStart = 0
+		}
+
+		// Check if we reached the end
+		if end != rapidyenc.EndNone {
+			d.eof = true
+		}
+
+		// Return decoded data if we have any
+		if nDst > 0 {
+			copied := copy(p, output[:nDst])
+			if copied < nDst {
+				// Save the rest for next Read call
+				d.decoded = make([]byte, nDst-copied)
+				copy(d.decoded, output[copied:nDst])
+			}
+			return copied, nil
+		}
+
+		// Check for termination conditions
+		if d.eof {
+			return 0, io.EOF
+		}
+
 		if d.readErr != nil {
 			return 0, d.readErr
 		}
-		return 0, io.EOF
-	}
 
-	// Get the data to decode
-	input := d.buf[d.bufStart:d.bufEnd]
-
-	// Create output buffer - decode into a separate buffer to avoid overwrites
-	output := make([]byte, len(input))
-
-	// Decode
-	nDst, nSrc, end, decErr := rapidyenc.DecodeIncremental(output, input, &d.state)
-	if decErr != nil {
-		return 0, decErr
-	}
-
-	// Advance the buffer start by consumed bytes
-	d.bufStart += nSrc
-
-	// If we've consumed all data, reset the buffer positions
-	if d.bufStart >= d.bufEnd {
-		d.bufStart = 0
-		d.bufEnd = 0
-	} else if d.bufStart > len(d.buf)/2 {
-		// Compact the buffer if we've consumed more than half
-		copy(d.buf, d.buf[d.bufStart:d.bufEnd])
-		d.bufEnd -= d.bufStart
-		d.bufStart = 0
-	}
-
-	// Check if we reached the end
-	if end != rapidyenc.EndNone {
-		d.eof = true
-	}
-
-	// Return decoded data
-	if nDst > 0 {
-		copied := copy(p, output[:nDst])
-		if copied < nDst {
-			// Save the rest for next Read call
-			d.decoded = make([]byte, nDst-copied)
-			copy(d.decoded, output[copied:nDst])
+		// Zero progress check: if no bytes consumed and no bytes produced,
+		// we're stuck on malformed data - return error instead of looping forever
+		if nSrc == 0 && nDst == 0 {
+			return 0, io.ErrUnexpectedEOF
 		}
-		return copied, nil
+
+		// Continue loop to process more data
 	}
 
-	// If no data was decoded but we haven't reached EOF, try again
-	if !d.eof && d.readErr == nil {
-		return d.Read(p)
-	}
-
-	if d.eof {
-		return 0, io.EOF
-	}
-
-	return 0, d.readErr
+	// Max iterations exceeded - likely malformed data causing infinite loop
+	return 0, ErrDecoderMaxIterations
 }
