@@ -228,7 +228,7 @@ func (c *connection) Ping() (err error) {
 		}
 	}()
 
-	_, _, err = c.sendCmd(StatusReady, "DATE")
+	_, _, err = c.sendCmd(StatusDate, "DATE")
 	if err != nil {
 		return fmt.Errorf("DATE: %w", err)
 	}
