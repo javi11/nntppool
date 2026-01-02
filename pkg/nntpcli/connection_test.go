@@ -301,3 +301,259 @@ func articleReadyToDownload(t *testing.T) Connection {
 
 	return conn
 }
+
+func TestBodyDecoded_MultipleSequentialCalls(t *testing.T) {
+	conn := articleReadyToDownload(t)
+
+	for i := 0; i < 10; i++ {
+		callNum := i + 1
+		t.Logf("Starting BodyDecoded call %d", callNum)
+
+		done := make(chan struct{})
+		var n int64
+		var err error
+
+		go func() {
+			buf := bytes.NewBuffer(nil)
+			n, err = conn.BodyDecoded("1234", buf, 0)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			t.Logf("Call %d completed: n=%d, err=%v", callNum, n, err)
+			if err != nil {
+				t.Fatalf("Call %d failed: %v", callNum, err)
+			}
+			if n != 9 {
+				t.Fatalf("Call %d: expected 9 bytes, got %d", callNum, n)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Call %d timed out after 5s - blocking detected!", callNum)
+		}
+	}
+}
+
+func TestBodyDecoded_MultipleSequentialCalls_WithDiscard(t *testing.T) {
+	conn := articleReadyToDownload(t)
+
+	// Test with various discard values
+	discardValues := []int64{1, 2, 3, 4, 5}
+
+	for i, discard := range discardValues {
+		callNum := i + 1
+		t.Logf("Starting BodyDecoded call %d with discard=%d", callNum, discard)
+
+		done := make(chan struct{})
+		var n int64
+		var err error
+
+		go func() {
+			buf := bytes.NewBuffer(nil)
+			n, err = conn.BodyDecoded("1234", buf, discard)
+			close(done)
+		}()
+
+		expectedSize := int64(9) - discard
+
+		select {
+		case <-done:
+			t.Logf("Call %d completed: n=%d, err=%v", callNum, n, err)
+			if err != nil {
+				t.Fatalf("Call %d (discard=%d) failed: %v", callNum, discard, err)
+			}
+			if n != expectedSize {
+				t.Fatalf("Call %d (discard=%d): expected %d bytes, got %d", callNum, discard, expectedSize, n)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Call %d (discard=%d) timed out after 5s - blocking detected!", callNum, discard)
+		}
+	}
+}
+
+func TestBodyDecoded_MultipleSequentialCalls_LargeWithDiscard(t *testing.T) {
+	// Use large fixture if it exists
+	largeFixture := "test/fixtures/large.yenc"
+	if _, err := os.Stat(largeFixture); os.IsNotExist(err) {
+		t.Skip("large.yenc fixture not found, skipping")
+	}
+
+	wg := &sync.WaitGroup{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s, err := test.NewServer()
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cancel()
+		s.Close()
+		wg.Wait()
+	})
+
+	port := s.Port()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.Serve(ctx)
+	}()
+
+	var d net.Dialer
+	netConn, err := d.DialContext(ctx, "tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout)
+	if err != nil {
+		t.Fatalf("failed to create connection: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+
+	if err := conn.JoinGroup("misc.test"); err != nil {
+		t.Fatalf("failed to join group: %v", err)
+	}
+
+	// Post large article
+	encoded, err := os.ReadFile(largeFixture)
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+
+	buf := bytes.NewBuffer(nil)
+	buf.WriteString(examplepost)
+	buf.Write(encoded)
+
+	if _, err := conn.Post(buf); err != nil {
+		t.Fatalf("failed to post article: %v", err)
+	}
+
+	totalSize := int64(100 * 1024) // 100KB
+	discardValues := []int64{1024, 2048, 4096, 8192, 16384}
+
+	for i, discard := range discardValues {
+		callNum := i + 1
+		t.Logf("Starting large BodyDecoded call %d with discard=%d", callNum, discard)
+
+		done := make(chan struct{})
+		var n int64
+		var decodeErr error
+
+		go func() {
+			outBuf := bytes.NewBuffer(nil)
+			n, decodeErr = conn.BodyDecoded("1234", outBuf, discard)
+			close(done)
+		}()
+
+		expectedSize := totalSize - discard
+
+		select {
+		case <-done:
+			t.Logf("Call %d completed: n=%d, err=%v", callNum, n, decodeErr)
+			if decodeErr != nil {
+				t.Fatalf("Call %d (discard=%d) failed: %v", callNum, discard, decodeErr)
+			}
+			if n != expectedSize {
+				t.Fatalf("Call %d (discard=%d): expected %d bytes, got %d", callNum, discard, expectedSize, n)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("Call %d (discard=%d) timed out after 30s - blocking detected!", callNum, discard)
+		}
+	}
+}
+
+func TestBodyDecoded_MultipleSequentialCalls_LargeFixture(t *testing.T) {
+	// Use large fixture if it exists
+	largeFixture := "test/fixtures/large.yenc"
+	if _, err := os.Stat(largeFixture); os.IsNotExist(err) {
+		t.Skip("large.yenc fixture not found, skipping")
+	}
+
+	wg := &sync.WaitGroup{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s, err := test.NewServer()
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+
+	t.Cleanup(func() {
+		cancel()
+		s.Close()
+		wg.Wait()
+	})
+
+	port := s.Port()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.Serve(ctx)
+	}()
+
+	var d net.Dialer
+	netConn, err := d.DialContext(ctx, "tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout)
+	if err != nil {
+		t.Fatalf("failed to create connection: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+
+	if err := conn.JoinGroup("misc.test"); err != nil {
+		t.Fatalf("failed to join group: %v", err)
+	}
+
+	// Post large article
+	encoded, err := os.ReadFile(largeFixture)
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+
+	buf := bytes.NewBuffer(nil)
+	buf.WriteString(examplepost)
+	buf.Write(encoded)
+
+	if _, err := conn.Post(buf); err != nil {
+		t.Fatalf("failed to post article: %v", err)
+	}
+
+	expectedSize := int64(100 * 1024) // 100KB
+
+	for i := 0; i < 5; i++ {
+		callNum := i + 1
+		t.Logf("Starting large BodyDecoded call %d", callNum)
+
+		done := make(chan struct{})
+		var n int64
+		var decodeErr error
+
+		go func() {
+			outBuf := bytes.NewBuffer(nil)
+			n, decodeErr = conn.BodyDecoded("1234", outBuf, 0)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			t.Logf("Call %d completed: n=%d, err=%v", callNum, n, decodeErr)
+			if decodeErr != nil {
+				t.Fatalf("Call %d failed: %v", callNum, decodeErr)
+			}
+			if n != expectedSize {
+				t.Fatalf("Call %d: expected %d bytes, got %d", callNum, expectedSize, n)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("Call %d timed out after 30s - blocking detected!", callNum)
+		}
+	}
+}
