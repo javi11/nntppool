@@ -4,10 +4,22 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"log"
+	"os"
 	"strings"
 
 	"github.com/mnightingale/rapidyenc"
 )
+
+// debugEnabled controls debug logging. Set NNTPCLI_DEBUG=1 to enable.
+var debugEnabled = os.Getenv("NNTPCLI_DEBUG") == "1"
+
+// debugLog logs a message if debug mode is enabled.
+func debugLog(format string, args ...any) {
+	if debugEnabled {
+		log.Printf("[NNTPCLI DEBUG] "+format, args...)
+	}
+}
 
 const (
 	// decoderBufferSize is the buffer size for incremental decoding.
@@ -79,20 +91,25 @@ func (d *incrementalDecoder) skipHeaders() error {
 func (d *incrementalDecoder) Read(p []byte) (int, error) {
 	// Skip headers on first read
 	if !d.headersRead {
+		debugLog("decoder.Read: skipping headers")
 		if err := d.skipHeaders(); err != nil {
+			debugLog("decoder.Read: skipHeaders error: %v", err)
 			return 0, err
 		}
+		debugLog("decoder.Read: headers skipped, bufEnd=%d", d.bufEnd)
 	}
 
 	// If we have leftover decoded data, return that first
 	if len(d.decoded) > 0 {
 		n := copy(p, d.decoded)
 		d.decoded = d.decoded[n:]
+		debugLog("decoder.Read: returned %d bytes from leftover (remaining=%d)", n, len(d.decoded))
 		return n, nil
 	}
 
 	// If we've reached EOF, return EOF
 	if d.eof {
+		debugLog("decoder.Read: already at EOF")
 		return 0, io.EOF
 	}
 
@@ -101,6 +118,7 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 		// Try to fill the buffer if we have space
 		if d.bufEnd < len(d.buf) && d.readErr == nil {
 			n, err := d.r.Read(d.buf[d.bufEnd:])
+			debugLog("decoder.Read: iter=%d underlying read: n=%d err=%v bufEnd=%d->%d", iteration, n, err, d.bufEnd, d.bufEnd+n)
 			d.bufEnd += n
 			if err != nil {
 				d.readErr = err
@@ -109,6 +127,7 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 
 		// If we have no data to process, return
 		if d.bufStart >= d.bufEnd {
+			debugLog("decoder.Read: iter=%d no data to process, bufStart=%d bufEnd=%d readErr=%v", iteration, d.bufStart, d.bufEnd, d.readErr)
 			if d.readErr != nil {
 				return 0, d.readErr
 			}
@@ -123,7 +142,9 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 
 		// Decode
 		nDst, nSrc, end, decErr := rapidyenc.DecodeIncremental(output, input, &d.state)
+		debugLog("decoder.Read: iter=%d decode: nDst=%d nSrc=%d end=%v decErr=%v inputLen=%d", iteration, nDst, nSrc, end, decErr, len(input))
 		if decErr != nil {
+			debugLog("decoder.Read: iter=%d decode error: %v", iteration, decErr)
 			return 0, decErr
 		}
 
@@ -132,10 +153,12 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 
 		// If we've consumed all data, reset the buffer positions
 		if d.bufStart >= d.bufEnd {
+			debugLog("decoder.Read: iter=%d buffer reset (all consumed)", iteration)
 			d.bufStart = 0
 			d.bufEnd = 0
 		} else if d.bufStart > len(d.buf)/2 {
 			// Compact the buffer if we've consumed more than half
+			debugLog("decoder.Read: iter=%d buffer compact bufStart=%d bufEnd=%d", iteration, d.bufStart, d.bufEnd)
 			copy(d.buf, d.buf[d.bufStart:d.bufEnd])
 			d.bufEnd -= d.bufStart
 			d.bufStart = 0
@@ -143,6 +166,7 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 
 		// Check if we reached the end
 		if end != rapidyenc.EndNone {
+			debugLog("decoder.Read: iter=%d reached yenc end marker (end=%v)", iteration, end)
 			d.eof = true
 		}
 
@@ -153,28 +177,36 @@ func (d *incrementalDecoder) Read(p []byte) (int, error) {
 				// Save the rest for next Read call
 				d.decoded = make([]byte, nDst-copied)
 				copy(d.decoded, output[copied:nDst])
+				debugLog("decoder.Read: iter=%d returning %d bytes, saved %d for later", iteration, copied, nDst-copied)
+			} else {
+				debugLog("decoder.Read: iter=%d returning %d bytes", iteration, copied)
 			}
 			return copied, nil
 		}
 
 		// Check for termination conditions
 		if d.eof {
+			debugLog("decoder.Read: iter=%d EOF after decode", iteration)
 			return 0, io.EOF
 		}
 
 		if d.readErr != nil {
+			debugLog("decoder.Read: iter=%d readErr after decode: %v", iteration, d.readErr)
 			return 0, d.readErr
 		}
 
 		// Zero progress check: if no bytes consumed and no bytes produced,
 		// we're stuck on malformed data - return error instead of looping forever
 		if nSrc == 0 && nDst == 0 {
+			debugLog("decoder.Read: iter=%d ZERO PROGRESS - nSrc=0 nDst=0, bufStart=%d bufEnd=%d", iteration, d.bufStart, d.bufEnd)
 			return 0, io.ErrUnexpectedEOF
 		}
 
+		debugLog("decoder.Read: iter=%d continuing loop (nDst=0 but nSrc=%d)", iteration, nSrc)
 		// Continue loop to process more data
 	}
 
 	// Max iterations exceeded - likely malformed data causing infinite loop
+	debugLog("decoder.Read: MAX ITERATIONS EXCEEDED (%d)", maxDecodeIterations)
 	return 0, ErrDecoderMaxIterations
 }

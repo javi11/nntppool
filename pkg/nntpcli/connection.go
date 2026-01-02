@@ -305,7 +305,10 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		}
 	}()
 
+	debugLog("BodyDecoded: starting msgID=<%s> discard=%d", msgID, discard)
+
 	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		debugLog("BodyDecoded: set deadline error: %v", err)
 		return 0, fmt.Errorf("set deadline: %w", err)
 	}
 	defer func() {
@@ -316,6 +319,7 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 
 	id, err := c.conn.Cmd("BODY <%s>", msgID)
 	if err != nil {
+		debugLog("BodyDecoded: BODY command error: %v", err)
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
 	}
 
@@ -324,27 +328,40 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 
 	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
 	if err != nil {
+		debugLog("BodyDecoded: ReadCodeLine error: %v", err)
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, err)
 	}
 
+	debugLog("BodyDecoded: got 222 response, creating decoder")
 	dec := newIncrementalDecoder(c.conn.Reader())
 
 	// Discard the first n bytes if requested
 	if discard > 0 {
-		if _, err = io.CopyN(io.Discard, dec, discard); err != nil {
+		debugLog("BodyDecoded: starting discard of %d bytes", discard)
+		discarded, discardErr := io.CopyN(io.Discard, dec, discard)
+		debugLog("BodyDecoded: discard result: discarded=%d err=%v", discarded, discardErr)
+		if discardErr != nil {
 			// Attempt to drain the decoder to avoid connection issues
-			_, _ = io.Copy(io.Discard, dec)
-			return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", msgID, discard, err)
+			debugLog("BodyDecoded: draining decoder after discard error")
+			drained, drainErr := io.Copy(io.Discard, dec)
+			debugLog("BodyDecoded: drain result: drained=%d err=%v", drained, drainErr)
+			return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", msgID, discard, discardErr)
 		}
+		debugLog("BodyDecoded: discard completed successfully")
 	}
 
+	debugLog("BodyDecoded: starting main copy")
 	n, err = io.Copy(w, dec)
+	debugLog("BodyDecoded: copy result: n=%d err=%v", n, err)
 	if err != nil {
 		// Attempt to drain the decoder to avoid connection issues
-		_, _ = io.Copy(io.Discard, dec)
+		debugLog("BodyDecoded: draining decoder after copy error")
+		drained, drainErr := io.Copy(io.Discard, dec)
+		debugLog("BodyDecoded: drain result: drained=%d err=%v", drained, drainErr)
 		return n, fmt.Errorf("BODY <%s>: copy failed: %w", msgID, err)
 	}
 
+	debugLog("BodyDecoded: completed successfully, total bytes=%d", n)
 	return n, nil
 }
 
