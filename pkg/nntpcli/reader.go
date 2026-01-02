@@ -108,31 +108,33 @@ func (d *dotReader) Read(p []byte) (n int, err error) {
 
 		switch d.state {
 		case dotReaderStateBeginLine:
-			if b == '.' {
+			switch b {
+			case '.':
 				d.state = dotReaderStateDot
-			} else if b == '\r' {
+			case '\r':
 				d.state = dotReaderStateCR
 				p[n] = b
 				n++
-			} else {
+			default:
 				d.state = dotReaderStateData
 				p[n] = b
 				n++
 			}
 
 		case dotReaderStateDot:
-			if b == '\r' {
+			switch b {
+			case '\r':
 				d.state = dotReaderStateDotCR
-			} else if b == '\n' {
+			case '\n':
 				// Bare ".\n" is also a terminator
 				d.state = dotReaderStateEOF
 				return n, io.EOF
-			} else if b == '.' {
+			case '.':
 				// Dot-stuffing: ".." at line start becomes "."
 				d.state = dotReaderStateData
 				p[n] = '.'
 				n++
-			} else {
+			default:
 				// Regular line starting with dot
 				d.state = dotReaderStateData
 				p[n] = '.'
@@ -140,11 +142,6 @@ func (d *dotReader) Read(p []byte) (n int, err error) {
 				if n < len(p) {
 					p[n] = b
 					n++
-				} else {
-					// Need to push back - we'll handle this by resetting state
-					// Actually we should not reach here often, just output the dot
-					// and let the next read get this byte
-					// This is a limitation; let's handle it by just writing both
 				}
 			}
 
@@ -183,9 +180,10 @@ func (d *dotReader) Read(p []byte) (n int, err error) {
 			}
 
 		case dotReaderStateData:
-			if b == '\r' {
+			switch b {
+			case '\r':
 				d.state = dotReaderStateCR
-			} else if b == '\n' {
+			case '\n':
 				d.state = dotReaderStateBeginLine
 			}
 			p[n] = b
