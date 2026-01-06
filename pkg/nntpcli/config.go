@@ -10,6 +10,11 @@ type Config struct {
 	// OperationTimeout is the timeout for NNTP operations.
 	// Set to 0 to disable timeouts.
 	OperationTimeout time.Duration
+	// DrainTimeout is the timeout for draining remaining data when closing
+	// a reader or recovering from errors. This prevents indefinite blocking
+	// if the connection is stuck.
+	// Set to 0 to disable drain timeouts (not recommended).
+	DrainTimeout time.Duration
 }
 
 type Option func(*Config)
@@ -17,6 +22,7 @@ type Option func(*Config)
 var configDefault = Config{
 	KeepAliveTime:    10 * time.Minute,
 	OperationTimeout: 30 * time.Second,
+	DrainTimeout:     5 * time.Second,
 }
 
 func mergeWithDefault(config ...Config) Config {
@@ -32,6 +38,10 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.OperationTimeout == 0 {
 		cfg.OperationTimeout = configDefault.OperationTimeout
+	}
+
+	if cfg.DrainTimeout == 0 {
+		cfg.DrainTimeout = configDefault.DrainTimeout
 	}
 
 	return cfg

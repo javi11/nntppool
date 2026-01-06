@@ -276,7 +276,7 @@ func articleReadyToDownload(t *testing.T) Connection {
 	netConn, err := d.DialContext(ctx, "tcp", fmt.Sprintf(":%d", port))
 	assert.NoError(t, err)
 
-	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout)
+	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout, configDefault.DrainTimeout)
 	assert.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -405,7 +405,7 @@ func TestBodyDecoded_MultipleSequentialCalls_LargeWithDiscard(t *testing.T) {
 		t.Fatalf("failed to dial: %v", err)
 	}
 
-	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout)
+	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout, configDefault.DrainTimeout)
 	if err != nil {
 		t.Fatalf("failed to create connection: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestBodyDecoded_MultipleSequentialCalls_LargeFixture(t *testing.T) {
 		t.Fatalf("failed to dial: %v", err)
 	}
 
-	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout)
+	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout, configDefault.DrainTimeout)
 	if err != nil {
 		t.Fatalf("failed to create connection: %v", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
@@ -25,14 +26,15 @@ type ArticleBodyReader interface {
 }
 
 type articleBodyReader struct {
-	mu          sync.Mutex
-	decoder     *rapidyenc.Decoder
-	conn        *connection
-	responseID  uint
-	buffer      *bytes.Buffer
-	headersRead bool
-	yencHeaders *YencHeaders
-	closed      bool
+	mu           sync.Mutex
+	decoder      *rapidyenc.Decoder
+	conn         *connection
+	responseID   uint
+	buffer       *bytes.Buffer
+	headersRead  bool
+	yencHeaders  *YencHeaders
+	closed       bool
+	drainTimeout time.Duration
 }
 
 func (r *articleBodyReader) Read(p []byte) (n int, err error) {
@@ -122,8 +124,18 @@ func (r *articleBodyReader) Close() (err error) {
 	r.closed = true
 
 	if r.decoder != nil {
+		// Set drain timeout before draining to prevent indefinite blocking
+		if r.drainTimeout > 0 && r.conn != nil {
+			_ = r.conn.netconn.SetDeadline(time.Now().Add(r.drainTimeout))
+		}
+
 		_, _ = io.Copy(io.Discard, r.decoder)
 		r.decoder = nil
+
+		// Clear deadline after drain
+		if r.conn != nil {
+			_ = r.conn.netconn.SetDeadline(time.Time{})
+		}
 	}
 
 	if r.conn != nil {

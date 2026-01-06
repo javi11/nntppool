@@ -119,9 +119,10 @@ type connection struct {
 	conn               *nntpConn
 	currentJoinedGroup string
 	operationTimeout   time.Duration
+	drainTimeout       time.Duration
 }
 
-func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time.Duration) (Connection, error) {
+func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout, drainTimeout time.Duration) (Connection, error) {
 	conn := newNNTPConn(netconn)
 
 	_, _, err := conn.ReadCodeLine(StatusReady)
@@ -134,6 +135,7 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time
 				netconn:          netconn,
 				maxAgeTime:       maxAgeTime,
 				operationTimeout: operationTimeout,
+				drainTimeout:     drainTimeout,
 			}, nil
 		}
 
@@ -147,6 +149,7 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time
 		netconn:          netconn,
 		maxAgeTime:       maxAgeTime,
 		operationTimeout: operationTimeout,
+		drainTimeout:     drainTimeout,
 	}, nil
 }
 
@@ -341,6 +344,10 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		discarded, discardErr := io.CopyN(io.Discard, dec, discard)
 		debugLog("BodyDecoded: discard result: discarded=%d err=%v", discarded, discardErr)
 		if discardErr != nil {
+			// Set drain timeout before draining to prevent indefinite blocking
+			if c.drainTimeout > 0 {
+				_ = c.netconn.SetDeadline(time.Now().Add(c.drainTimeout))
+			}
 			// Attempt to drain the decoder to avoid connection issues
 			debugLog("BodyDecoded: draining decoder after discard error")
 			drained, drainErr := io.Copy(io.Discard, dec)
@@ -354,6 +361,10 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 	n, err = io.Copy(w, dec)
 	debugLog("BodyDecoded: copy result: n=%d err=%v", n, err)
 	if err != nil {
+		// Set drain timeout before draining to prevent indefinite blocking
+		if c.drainTimeout > 0 {
+			_ = c.netconn.SetDeadline(time.Now().Add(c.drainTimeout))
+		}
 		// Attempt to drain the decoder to avoid connection issues
 		debugLog("BodyDecoded: draining decoder after copy error")
 		drained, drainErr := io.Copy(io.Discard, dec)
@@ -415,11 +426,12 @@ func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err err
 	}
 
 	return &articleBodyReader{
-		decoder:    dec,
-		conn:       c,
-		responseID: id,
-		buffer:     buffer,
-		closed:     false,
+		decoder:      dec,
+		conn:         c,
+		responseID:   id,
+		buffer:       buffer,
+		closed:       false,
+		drainTimeout: c.drainTimeout,
 	}, nil
 }
 

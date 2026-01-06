@@ -94,7 +94,7 @@ func benchmarkSetup(b *testing.B, fixtureFile string) (Connection, func()) {
 		b.Fatalf("failed to dial: %v", err)
 	}
 
-	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout)
+	conn, err := newConnection(netConn, time.Now().Add(time.Hour), configDefault.OperationTimeout, configDefault.DrainTimeout)
 	if err != nil {
 		cancel()
 		s.Close()
