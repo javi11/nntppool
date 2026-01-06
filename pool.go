@@ -191,24 +191,9 @@ func (p *Pool) tryProviders(
 		// Mark as tried
 		triedProviders[provider] = true
 
-		// Create a buffer to capture the response if we need to retry
-		var buf *bytes.Buffer
-		var writeTarget io.Writer = w
-		if w != nil {
-			buf = &bytes.Buffer{}
-			writeTarget = buf
-		}
-
-		resp, err := provider.Send(ctx, payload, writeTarget)
+		// Write directly to target - no buffering for streaming performance
+		resp, err := provider.Send(ctx, payload, w)
 		if err == nil {
-			// Success! Write buffered data to original writer if applicable
-			if buf != nil && w != nil {
-				written, writeErr := io.Copy(w, buf)
-				if writeErr != nil {
-					return resp, 0, writeErr
-				}
-				return resp, written, nil
-			}
 			return resp, int64(resp.Meta.BytesDecoded), nil
 		}
 
