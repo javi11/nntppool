@@ -12,6 +12,36 @@ import (
 	"github.com/mnightingale/rapidyenc"
 )
 
+// lineReader is an interface for readers that support line-based reading.
+// This allows reusing existing buffered readers (like readBuffer) without
+// wrapping them in another bufio.Reader, which would cause data loss due
+// to double buffering.
+type lineReader interface {
+	io.Reader
+	ReadLine() (string, error)
+}
+
+// bufioLineReader adapts a bufio.Reader to implement lineReader.
+// Used only when the underlying reader doesn't already implement lineReader.
+type bufioLineReader struct {
+	r *bufio.Reader
+}
+
+func (b *bufioLineReader) Read(p []byte) (int, error) {
+	return b.r.Read(p)
+}
+
+func (b *bufioLineReader) ReadLine() (string, error) {
+	line, err := b.r.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return "", err
+	}
+	// Strip trailing \r\n or \n to match readBuffer.ReadLine() behavior
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	return line, err
+}
+
 // debugEnabled controls debug logging. Set NNTPCLI_DEBUG=1 to enable.
 var debugEnabled = os.Getenv("NNTPCLI_DEBUG") == "1"
 
@@ -36,7 +66,7 @@ var ErrDecoderMaxIterations = errors.New("decoder: max iterations exceeded, poss
 // It parses yenc headers (=ybegin, =ypart) to extract file size, then uses
 // DecodeIncremental for the actual encoded body data.
 type incrementalDecoder struct {
-	r            *bufio.Reader
+	r            lineReader
 	state        rapidyenc.State
 	buf          []byte // read buffer for body data
 	bufStart     int    // start of unconsumed data in buf
@@ -50,9 +80,19 @@ type incrementalDecoder struct {
 }
 
 // newIncrementalDecoder creates a new incremental yenc decoder.
+// If the reader already implements lineReader (like readBuffer), it will be
+// used directly to avoid double buffering which causes data loss.
 func newIncrementalDecoder(r io.Reader) *incrementalDecoder {
+	// Check if reader already implements lineReader to avoid double buffering.
+	// Double buffering causes data loss when the inner bufio.Reader is discarded
+	// with unread buffered data.
+	lr, ok := r.(lineReader)
+	if !ok {
+		// Wrap in a bufioLineReader for readers that don't implement lineReader
+		lr = &bufioLineReader{r: bufio.NewReaderSize(r, decoderBufferSize)}
+	}
 	return &incrementalDecoder{
-		r:   bufio.NewReaderSize(r, decoderBufferSize),
+		r:   lr,
 		buf: make([]byte, decoderBufferSize),
 	}
 }
@@ -62,7 +102,7 @@ func newIncrementalDecoder(r io.Reader) *incrementalDecoder {
 // After this, the reader is positioned at the start of the encoded body.
 func (d *incrementalDecoder) parseHeaders() error {
 	for {
-		line, err := d.r.ReadString('\n')
+		line, err := d.r.ReadLine()
 		if err != nil {
 			return err
 		}
@@ -83,8 +123,10 @@ func (d *incrementalDecoder) parseHeaders() error {
 		}
 
 		// This line is not a header - it's the start of the body
-		// Put this data back into our buffer for decoding
-		d.bufEnd = copy(d.buf, []byte(line))
+		// Put this data back into our buffer for decoding.
+		// Add back the newline that ReadLine() stripped since the yenc decoder expects it.
+		lineWithNewline := line + "\r\n"
+		d.bufEnd = copy(d.buf, []byte(lineWithNewline))
 		debugLog("decoder.parseHeaders: first body line buffered, bufEnd=%d", d.bufEnd)
 		break
 	}
