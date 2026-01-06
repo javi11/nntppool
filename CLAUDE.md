@@ -183,43 +183,6 @@ func (cp *ConnectionPool) shutdown(ctx context.Context) {
 }
 ```
 
-### Common Code Patterns
-
-#### 1. Connection Acquisition with Retry
-
-```go
-conn, err := retry.Do(
-    func() (PooledConnection, error) {
-        return pool.GetConnection(ctx, skipProviders, useBackup)
-    },
-    retry.Context(ctx),
-    retry.Attempts(maxRetries),
-    retry.DelayType(retry.BackOffDelay),
-)
-```
-
-#### 2. Provider Rotation on Failure
-
-```go
-skipProviders := []string{}
-for attempt := 0; attempt < maxRetries; attempt++ {
-    conn, err := pool.GetConnection(ctx, skipProviders, false)
-    if err == nil {
-        return conn, nil
-    }
-    skipProviders = append(skipProviders, lastProviderHost)
-}
-```
-
-#### 3. Metrics Collection
-
-```go
-startTime := time.Now()
-defer func() {
-    pool.metrics.RecordOperation("body", time.Since(startTime), err)
-}()
-```
-
 ## Testing Philosophy
 
 ### Guidelines (from CONTRIBUTING.md)
