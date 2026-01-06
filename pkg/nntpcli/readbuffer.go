@@ -8,7 +8,10 @@ import (
 )
 
 const (
-	defaultReadBufSize = 32 * 1024
+	// defaultReadBufSize is the initial buffer size for network reads.
+	// 256KB provides good throughput by reducing syscall frequency for typical
+	// NNTP article sizes (500KB-1MB).
+	defaultReadBufSize = 256 * 1024
 	maxReadBufSize     = 8 * 1024 * 1024
 )
 

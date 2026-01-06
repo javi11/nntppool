@@ -19,6 +19,21 @@ const (
 )
 
 // ProviderConfig defines the configuration for a single NNTP provider.
+//
+// # Performance Tuning
+//
+// For optimal throughput, configure MaxConnections based on your concurrency needs:
+//
+//	Total concurrent requests = MaxConnections × InflightPerConn
+//
+// If using N goroutines to download articles concurrently, ensure:
+//
+//	MaxConnections × InflightPerConn >= N
+//
+// When using io.Writer implementations with buffering (like bufio.Writer wrapping
+// an io.Pipe), use larger buffer sizes (e.g., 256KB) and ensure Flush() is called
+// after each article download completes. The pool automatically flushes writers
+// that implement the Flush() method.
 type ProviderConfig struct {
 	// Name is a human-readable identifier for the provider.
 	Name string
@@ -43,6 +58,8 @@ type ProviderConfig struct {
 	Password string
 
 	// MaxConnections is the maximum number of concurrent connections to this provider.
+	// For best throughput, set this to at least the number of concurrent goroutines
+	// that will be calling Body() or BodyReader().
 	MaxConnections int
 
 	// Priority determines the order in which providers are tried.
@@ -55,7 +72,8 @@ type ProviderConfig struct {
 	IsBackup bool
 
 	// InflightPerConn is the maximum number of pipelined requests per connection.
-	// Default is 1 (no pipelining).
+	// Default is 1 (no pipelining). Increase for providers that support pipelining
+	// to improve throughput.
 	InflightPerConn int
 
 	// ConnectTimeout is the timeout for establishing a connection.

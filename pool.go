@@ -194,6 +194,10 @@ func (p *Pool) tryProviders(
 		// Write directly to target - no buffering for streaming performance
 		resp, err := provider.Send(ctx, payload, w)
 		if err == nil {
+			// Flush buffered writers to ensure all data reaches underlying writer
+			if f, ok := w.(interface{ Flush() error }); ok {
+				_ = f.Flush()
+			}
 			return resp, int64(resp.Meta.BytesDecoded), nil
 		}
 
