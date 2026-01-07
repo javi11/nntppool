@@ -187,6 +187,11 @@ func safeClose[T any](ch chan T) {
 	close(ch)
 }
 
+func safeSend[T any](ch chan T, v T) {
+	defer func() { _ = recover() }()
+	ch <- v
+}
+
 func (c *NNTPConnection) failOutstanding() {
 	c.failMu.Do(func() {
 		for {
@@ -418,11 +423,8 @@ func (c *NNTPConnection) readerLoop() {
 		resp.Meta = decoder
 
 		if deliver {
-			// Best effort: don't block forever if the receiver abandoned the channel.
-			select {
-			case req.RespCh <- resp:
-			default:
-			}
+			// Best effort: use safeSend to handle closed channel race with failOutstanding()
+			safeSend(req.RespCh, resp)
 		}
 		safeClose(req.RespCh)
 
