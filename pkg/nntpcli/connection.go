@@ -327,9 +327,6 @@ func (c *NNTPConnection) Run() {
 		default:
 		}
 
-		// track FIFO ordering
-		c.pending <- req
-
 		// per-request write deadline
 		if dl, ok := req.Ctx.Deadline(); ok {
 			_ = c.conn.SetWriteDeadline(dl)
@@ -337,7 +334,8 @@ func (c *NNTPConnection) Run() {
 			_ = c.conn.SetWriteDeadline(time.Time{})
 		}
 
-		// pipeline write
+		// pipeline write - must succeed BEFORE enqueuing to pending
+		// to prevent response misalignment on write failure
 		if _, err := c.conn.Write(req.Payload); err != nil {
 			<-c.inflightSem
 			safeClose(req.RespCh)
@@ -346,6 +344,10 @@ func (c *NNTPConnection) Run() {
 			return
 		}
 		_ = c.conn.SetWriteDeadline(time.Time{})
+
+		// track FIFO ordering - enqueue AFTER successful write
+		// to ensure readerLoop only expects responses for actually-sent requests
+		c.pending <- req
 	}
 }
 
