@@ -4,106 +4,107 @@
 
 **nntppool** is a Go library that provides intelligent NNTP (Network News Transfer Protocol) connection pooling with advanced features for reliable Usenet operations.
 
-**Purpose**: Enable reliable, high-performance Usenet article downloads and posts through connection pooling, automatic retries, provider rotation, and yenc encoding/decoding.
+**Purpose**: Enable reliable, high-performance Usenet article downloads through connection pooling, provider failover, round-robin load balancing, and yenc streaming decoding.
 
 **Key Features**:
 
-- Connection pooling with configurable min/max connections per provider
-- Multiple provider support with automatic rotation on failures
-- Backup provider support for block account usage
-- Dynamic reconfiguration without service interruption
-- Comprehensive metrics system with rolling windows and memory management
+- Connection pooling with configurable connections per provider
+- Multiple provider support with priority-based selection
+- Backup provider support for fallback scenarios
+- Round-robin load balancing within same priority level
+- Automatic health checks with configurable intervals
 - TLS support for secure connections
-- Automatic retry mechanisms with configurable strategies
-- Yenc encoding/decoding for binary data
+- Pipelining support for high throughput
+- Streaming yenc decoding with metadata extraction
+- Automatic writer flushing for data integrity
 
-**Module**: `github.com/javi11/nntppool/v2`
+**Module**: `github.com/javi11/nntppool/v3`
 
 ## Architecture
 
 ### Core Components
 
-1. **ConnectionPool** (`connection_pool.go`)
+1. **Pool** (`pool.go`)
 
-   - Main interface and implementation for connection pooling
-   - Manages lifecycle of connections across multiple providers
-   - Implements retry logic and provider rotation
-   - Handles dynamic reconfiguration
-   - Thread-safe with extensive use of mutexes and atomic operations
+   - Main connection pool managing multiple NNTP providers
+   - Implements provider failover with primary/backup separation
+   - Round-robin load balancing per priority level
+   - Periodic health checks using DATE command
+   - Thread-safe with mutex protection and atomic operations
 
-2. **Provider** (`provider.go`, `internal/provider/`)
+2. **Provider** (`provider.go`)
 
-   - Represents a single NNTP provider (primary or backup)
-   - Manages provider-specific connection pools using `puddle`
-   - Tracks provider health and status
-   - Implements connection lifecycle management
+   - Wraps `nntpcli.Client` with health tracking and metrics
+   - Manages provider-specific configuration and state
+   - Tracks request counts, errors, and article-not-found statistics
+   - Thread-safe health status with mutex protection
 
-3. **Configuration** (`config.go`, `internal/config/`)
+3. **Configuration** (`config.go`)
 
-   - `Config`: Main pool configuration
-   - `UsenetProviderConfig`: Per-provider settings
-   - `MetricRetentionConfig`: Metrics system configuration
-   - Supports validation and reconfiguration
+   - `PoolConfig`: Pool-level configuration with providers list
+   - `ProviderConfig`: Per-provider settings (host, TLS, auth, connections)
+   - Default values and validation for all settings
 
-4. **Metrics System** (`metrics.go`)
+4. **BodyResult** (`body_reader.go`)
 
-   - Comprehensive metrics with rolling time windows (default: 1 hour)
-   - Automatic cleanup to prevent memory growth
-   - Connection tracking with stale connection detection
-   - Performance metrics (download/upload speeds, error rates)
-   - Memory usage monitoring
+   - Streaming reader for article bodies with io.Pipe
+   - `YencMeta`: Extracted yenc header metadata (filename, size, CRC, etc.)
+   - Background goroutine for async download with proper cleanup
+   - Thread-safe metadata access with channel synchronization
 
-5. **PooledConnection** (`pooled_connection.go`)
+5. **Errors** (`errors.go`)
 
-   - Lightweight wrapper around `puddle.Resource` connections
-   - Provides automatic release on Close/Free with metrics tracking
-   - Thread-safe operations
-   - Simplified design: no panic recovery, no manual lease management
-   - Connection IDs generated from resource pointers (no atomic counter)
+   - Sentinel errors: `ErrArticleNotFound`, `ErrPoolClosed`, `ErrNoProvidersAvailable`, etc.
+   - `ProviderError`: Rich error type with provider context and status codes
+   - NNTP status code constants (220, 221, 222, 430, 411, 412, etc.)
+   - Helper functions: `IsArticleNotFound()`, `IsRetryable()`
 
-6. **PooledBodyReader** (`pooled_body_reader.go`)
-
-   - Wraps article body readers with automatic connection release
-   - Handles yenc header extraction
-   - Thread-safe with mutex protection
-
-7. **Helper Functions** (`helpers.go`)
-   - Retry logic for NNTP operations
-   - Provider selection and rotation
-   - Error handling utilities
+6. **nntpcli Package** (`pkg/nntpcli/`)
+   - Low-level NNTP client library with pipelining support
+   - `Client`: Manages pool of connections with shared request channel
+   - `NNTPConnection`: Single connection with inflight request management
+   - `Request`/`Response`: Command/response structures
+   - `NNTPResponse`: Parsed response with yenc metadata
+   - `readBuffer`: Efficient buffered reading with windowing
 
 ### Package Structure
 
 ```
 nntppool/
-├── *.go                      # Main package implementation
-├── *_test.go                 # Unit and integration tests
-├── *_mock.go                 # Generated mocks
-├── internal/
-│   ├── config/              # Internal configuration utilities
-│   ├── provider/            # Provider pooling implementation
-│   ├── helpers/             # Internal helper functions
-│   └── budget/              # Budget management utilities
-├── .github/                 # CI/CD workflows
-└── test-results/            # Test output directory
+├── pool.go                      # Main Pool implementation (~460 lines)
+├── provider.go                  # Provider wrapper with health tracking (~290 lines)
+├── config.go                    # Configuration structures (~190 lines)
+├── body_reader.go               # Streaming body reader with yenc metadata (~270 lines)
+├── errors.go                    # Error types and helpers (~100 lines)
+├── pool_throughput_test.go      # Throughput benchmarks (~760 lines)
+├── pkg/
+│   └── nntpcli/                 # Low-level NNTP client library
+│       ├── client.go            # Client managing connection pool (~120 lines)
+│       ├── connection.go        # NNTPConnection with pipelining (~400 lines)
+│       ├── reader.go            # Response parsing & yenc decoding (~370 lines)
+│       └── readbuffer.go        # Efficient read buffering (~150 lines)
+├── .github/
+│   └── workflows/
+│       ├── go.yml               # CI/CD pipeline
+│       └── release.yml          # Release automation
+├── Makefile                     # Build & test automation
+├── .golangci.yml                # Linter configuration
+└── .goreleaser.yaml             # Release configuration
 ```
 
 ### Key Dependencies
 
-- **nntpcli** (`github.com/javi11/nntppool/v2/pkg/nntpcli`): NNTP client library
-- **puddle** (`github.com/jackc/puddle/v2`): Generic resource pool
 - **rapidyenc** (`github.com/mnightingale/rapidyenc`): Fast yenc encoding/decoding (requires CGO)
-- **retry-go** (`github.com/avast/retry-go/v4`): Retry mechanisms
-- **multierror** (`github.com/hashicorp/go-multierror`): Error aggregation
+- **nntp-server-mock** (`github.com/javi11/nntp-server-mock`): Testing mock server
 
 ### Design Patterns
 
-1. **Resource Pooling**: Uses puddle for efficient connection reuse
-2. **Provider Pattern**: Abstracts NNTP provider details
-3. **Strategy Pattern**: Configurable retry strategies (fixed, random, exponential)
-4. **Observer Pattern**: Metrics collection and monitoring
-5. **State Machine**: Connection lifecycle management
-6. **Graceful Degradation**: Backup providers for resilience
+1. **Connection Pooling**: Client manages connections with shared request channel
+2. **Provider Abstraction**: Wraps client with health tracking and metrics
+3. **Round-Robin Load Balancing**: Per-priority level rotation with atomic counters
+4. **Streaming Pipeline**: io.Pipe for async body streaming with metadata
+5. **Graceful Degradation**: Primary/backup provider separation with automatic fallback
+6. **Health Monitoring**: Periodic DATE command checks with automatic recovery
 
 ## Development Guidelines
 
@@ -125,7 +126,7 @@ nntppool/
 
    - Always handle errors explicitly
    - Use `fmt.Errorf` with `%w` for error wrapping
-   - Use `multierror` for aggregating multiple errors
+   - Use `ProviderError` for provider-specific errors with context
    - Return errors rather than logging and continuing
 
 3. **Concurrency**
@@ -135,6 +136,7 @@ nntppool/
    - Use `atomic` for simple counters and flags
    - Always use `defer` for mutex unlocks
    - Context-aware operations with proper cancellation
+   - Channel-based coordination for request distribution
 
 4. **Documentation**
 
@@ -142,44 +144,46 @@ nntppool/
    - Use complete sentences starting with the name
    - Include usage examples for complex functions
 
-5. **Logging**
-   - Use structured logging via the `Logger` interface (slog-compatible)
-   - Include relevant context (provider, connection ID, message ID)
-   - Use appropriate log levels (Debug, Info, Warn, Error)
-
 ### Thread Safety Patterns
 
 This codebase emphasizes thread safety:
 
 ```go
 // Pattern 1: Mutex-protected state access
-type ConnectionPool struct {
-    mu sync.RWMutex
-    providers []*provider
+type Pool struct {
+    mu     sync.RWMutex
+    closed bool
 }
 
-func (cp *ConnectionPool) GetProvider() *provider {
-    cp.mu.RLock()
-    defer cp.mu.RUnlock()
-    return cp.providers[0]
-}
-
-// Pattern 2: Atomic operations for counters
-type metrics struct {
-    activeConnections atomic.Int32
-}
-
-// Pattern 3: Channel-based coordination
-func (cp *ConnectionPool) shutdown(ctx context.Context) {
-    done := make(chan struct{})
-    go func() {
-        // cleanup work
-        close(done)
-    }()
-    select {
-    case <-done:
-    case <-ctx.Done():
+func (p *Pool) executeWithFallback(ctx context.Context, payload []byte, w io.Writer) (int64, error) {
+    p.mu.RLock()
+    if p.closed {
+        p.mu.RUnlock()
+        return 0, ErrPoolClosed
     }
+    p.mu.RUnlock()
+    // ... continue with operation
+}
+
+// Pattern 2: Atomic operations for round-robin
+type Pool struct {
+    rrIndex map[int]*atomic.Uint64
+}
+
+func (p *Pool) orderProvidersWithRoundRobin(providers []*Provider, ...) []*Provider {
+    startIdx := int(counter.Add(1)-1) % len(group)
+    // ... rotate starting position
+}
+
+// Pattern 3: Channel-based request distribution
+type Client struct {
+    reqCh chan *Request
+}
+
+func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer) <-chan Response {
+    req := &Request{Ctx: ctx, Payload: payload, RespCh: make(chan Response, 1)}
+    c.reqCh <- req
+    return req.RespCh
 }
 ```
 
@@ -198,21 +202,21 @@ func (cp *ConnectionPool) shutdown(ctx context.Context) {
 ### Test Structure
 
 ```go
-func TestConnectionPool_Body(t *testing.T) {
+func TestPool_Body(t *testing.T) {
     tests := []struct {
         name    string
-        setup   func(*testing.T) *ConnectionPool
+        setup   func(*testing.T) *Pool
         msgID   string
         want    int64
         wantErr bool
     }{
         {
             name: "successful download",
-            setup: func(t *testing.T) *ConnectionPool {
+            setup: func(t *testing.T) *Pool {
                 // setup code
             },
-            msgID: "<test@example.com>",
-            want: 1024,
+            msgID:   "<test@example.com>",
+            want:    1024,
             wantErr: false,
         },
         // more test cases...
@@ -221,7 +225,10 @@ func TestConnectionPool_Body(t *testing.T) {
     for _, tt := range tests {
         t.Run(tt.name, func(t *testing.T) {
             pool := tt.setup(t)
-            got, err := pool.Body(context.Background(), tt.msgID, io.Discard, nil)
+            defer pool.Close()
+
+            var buf bytes.Buffer
+            got, err := pool.Body(context.Background(), tt.msgID, &buf)
 
             if (err != nil) != tt.wantErr {
                 t.Errorf("Body() error = %v, wantErr %v", err, tt.wantErr)
@@ -242,24 +249,18 @@ func TestConnectionPool_Body(t *testing.T) {
 - **Convention**: Mock files named `*_mock.go`
 - **Command**: `make generate` to regenerate mocks
 
-Example:
-
-```go
-//go:generate go tool mockgen -source=./connection_pool.go -destination=./connection_pool_mock.go -package=nntppool UsenetConnectionPool
-```
-
 ## Common Tasks
 
 ### Makefile Targets
 
 ```bash
 # Development workflow
-make check          # Run all checks (test, lint, coverage)
+make check          # Run all checks (generate, tidy, lint, test-race)
 make test           # Run all tests
 make test-race      # Run tests with race detector
 make coverage       # Generate coverage report
 make coverage-html  # View coverage in browser
-make lint           # Run golangci-lint
+make lint           # Run tidy + golangci-lint
 make generate       # Generate mocks and other code
 
 # Code quality
@@ -270,7 +271,7 @@ make tidy                # Clean up go.mod
 
 # CI/CD
 make junit          # Generate JUnit test report
-make coverage-ci    # Coverage for CI
+make coverage-ci    # Coverage for CI with race detector
 make release        # Create release
 make snapshot       # Create snapshot build
 ```
@@ -288,20 +289,20 @@ make snapshot       # Create snapshot build
 
 ```bash
 # All tests
-go test ./...
+CGO_ENABLED=1 go test ./...
 
 # Specific test
-go test -run TestConnectionPool_Body
+CGO_ENABLED=1 go test -run TestPool_Body
 
 # With race detector
-go test -race ./...
+CGO_ENABLED=1 go test -race ./...
 
 # With coverage
-go test -coverprofile=coverage.out ./...
+CGO_ENABLED=1 go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Verbose output
-go test -v ./...
+CGO_ENABLED=1 go test -v ./...
 ```
 
 ## Important Notes
@@ -318,60 +319,129 @@ CGO_ENABLED=1 go build
 CGO_ENABLED=1 go test ./...
 
 # Installing
-CGO_ENABLED=1 go get github.com/javi11/nntppool/v2
+CGO_ENABLED=1 go get github.com/javi11/nntppool/v3
 ```
 
 ### Thread Safety Considerations
 
-- All public methods on `ConnectionPool` are thread-safe
-- Connections from the pool are safe for concurrent use
-- Metrics collection is thread-safe
-- Provider reconfiguration uses careful locking to avoid deadlocks
+- All public methods on `Pool` are thread-safe
+- Provider health status is mutex-protected
+- Round-robin counters use atomic operations
+- Request channel provides thread-safe distribution to connections
+- BodyResult uses io.Pipe for thread-safe streaming
 
 ### Context Usage
 
 - All operations accept `context.Context` for cancellation
 - Respect context deadlines and cancellations
 - Pass context to all downstream operations
-- Use `context.WithTimeout` for operations with time limits
+- ReadTimeout from ProviderConfig creates operation-level context timeouts
 
-### Provider Health Checks
+### Provider Selection Algorithm
+
+1. **Primary First**: Always try primary providers before backup providers
+2. **Priority Order**: Lower priority value = higher priority (tried first)
+3. **Round-Robin**: Within same priority, rotate starting position
+4. **Health Filter**: Skip unhealthy providers automatically
+5. **Host Dedup**: Skip providers with same host if article was not found
+6. **Backup Fallback**: Use backup providers only after all primaries return "not found"
+
+### Health Check System
 
 - Health checks run periodically (default: 1 minute)
-- Failed providers are marked and can be temporarily skipped
-- Automatic recovery when providers become healthy again
-- Configure via `HealthCheckInterval` in `Config`
+- Uses `DATE` command which returns status 111
+- Failed providers are marked unhealthy and skipped
+- Automatic recovery when health check succeeds
+- Configure interval via `PoolConfig.HealthCheckInterval` (0 to disable)
 
-### Memory Management
+### Performance Tuning
 
-- Metrics system automatically cleans up old data
-- Connection pools respect `MaxConnections` limits
-- Idle connections are closed after timeout
-- Configure retention via `MetricRetentionConfig`
+```go
+// For optimal throughput, configure MaxConnections based on concurrency needs:
+// Total concurrent requests = MaxConnections × InflightPerConn
 
-## File Structure Reference
+cfg := nntppool.ProviderConfig{
+    Host:            "news.example.com",
+    MaxConnections:  20,      // Number of concurrent connections
+    InflightPerConn: 1,       // Pipelined requests per connection
+    // With 20 connections × 1 inflight = 20 concurrent requests
+}
+```
 
-### Key Files
+### Streaming Body Reader
 
-- `connection_pool.go`: Main pool implementation (1,300+ lines)
-- `config.go`: Configuration structures and validation
-- `provider.go`: Provider management
-- `metrics.go`: Metrics system (1,600+ lines)
-- `pooled_connection.go`: Simplified connection wrapper (111 lines, reduced from 198)
-- `pooled_body_reader.go`: Body reader wrapper
-- `helpers.go`: Retry and rotation logic
-- `errors.go`: Error definitions
+```go
+// BodyReader returns a streaming reader with yenc metadata
+result, err := pool.BodyReader(ctx, "message-id@example.com")
+if err != nil {
+    return err
+}
+defer result.Close()
+
+// Read decoded body data
+_, err = io.Copy(outputFile, result)
+
+// Access metadata (blocks until headers parsed)
+meta := result.Meta()
+fmt.Printf("File: %s, Part: %d/%d, CRC: %08x\n",
+    meta.FileName, meta.Part, meta.Total, meta.ActualCRC)
+```
+
+## API Reference
+
+### Pool Methods
+
+| Method | Description |
+|--------|-------------|
+| `NewPool(ctx, cfg)` | Create new connection pool |
+| `Body(ctx, msgID, w)` | Download article body to writer |
+| `Article(ctx, msgID, w)` | Download complete article to writer |
+| `Head(ctx, msgID)` | Get article headers (not yet implemented) |
+| `Group(ctx, name)` | Select newsgroup on all connections |
+| `BodyReader(ctx, msgID)` | Get streaming body reader with metadata |
+| `Stats()` | Get statistics for all providers |
+| `HealthyProviderCount()` | Count of healthy providers |
+| `Close()` | Close pool and all connections |
+
+### Configuration Defaults
+
+| Setting | Default Value |
+|---------|---------------|
+| MaxConnections | 10 |
+| InflightPerConn | 1 |
+| ConnectTimeout | 30s |
+| ReadTimeout | 60s |
+| WriteTimeout | 30s |
+| HealthCheckInterval | 1 minute |
+| Port (non-TLS) | 119 |
+| Port (TLS) | 563 |
+
+## File Reference
+
+### Main Package Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `pool.go` | ~460 | Main Pool with provider management and failover |
+| `provider.go` | ~290 | Provider wrapper with health tracking |
+| `config.go` | ~190 | Configuration structures and validation |
+| `body_reader.go` | ~270 | BodyResult streaming reader with YencMeta |
+| `errors.go` | ~100 | Sentinel errors and ProviderError type |
+
+### nntpcli Package Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `client.go` | ~120 | Client managing connection pool |
+| `connection.go` | ~400 | NNTPConnection with pipelining |
+| `reader.go` | ~370 | Response parsing and yenc decoding |
+| `readbuffer.go` | ~150 | Efficient read buffering |
 
 ### Test Files
 
-- `*_test.go`: Unit tests
-- `*_integration_test.go`: Integration tests
-- `standalone_connectivity_test.go`: Full end-to-end tests
-- `example_metrics_usage.go`: Metrics usage examples
-
-### Generated Files
-
-- `*_mock.go`: Generated mocks (regenerate with `make generate`)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `pool_throughput_test.go` | ~760 | Throughput benchmarks and concurrent tests |
 
 ## Contributing
 
@@ -380,6 +450,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for pull request workflow and testing gui
 ## Additional Resources
 
 - [Project README](README.md): Installation and usage
-- [nntpcli Documentation](https://pkg.go.dev/github.com/javi11/nntppool/v2/pkg/nntpcli): NNTP client library
-- [puddle Documentation](https://pkg.go.dev/github.com/jackc/puddle/v2): Resource pooling
+- [nntpcli Package](https://pkg.go.dev/github.com/javi11/nntppool/v3/pkg/nntpcli): NNTP client library
 - [Google Go Testing Guide](https://google.github.io/styleguide/go/decisions.html#useful-test-failures)

@@ -9,7 +9,10 @@ tool (
 	golang.org/x/vuln/cmd/govulncheck
 )
 
-require github.com/mnightingale/rapidyenc v0.0.0-20251128204712-7aafef1eaf1c
+require (
+	github.com/javi11/nntp-server-mock v0.0.1
+	github.com/mnightingale/rapidyenc v0.0.0-20251128204712-7aafef1eaf1c
+)
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.3.0 // indirect
@@ -83,6 +86,8 @@ require (
 	github.com/go-xmlfmt/xmlfmt v1.1.3 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/godoc-lint/godoc-lint v0.10.2 // indirect
+	github.com/gofiber/storage/bbolt v1.3.5 // indirect
+	github.com/gofiber/utils v1.0.1 // indirect
 	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golangci/asciicheck v0.5.0 // indirect
@@ -203,6 +208,7 @@ require (
 	go-simpler.org/sloglint v0.11.1 // indirect
 	go.augendre.info/arangolint v0.3.1 // indirect
 	go.augendre.info/fatcontext v0.9.0 // indirect
+	go.etcd.io/bbolt v1.3.9 // indirect
 	go.uber.org/automaxprocs v1.6.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect

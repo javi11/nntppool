@@ -195,14 +195,27 @@ func (p *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 		}
 	}
 
-	// Check for article not found
-	if resp.StatusCode == StatusArticleNotFound {
-		p.notFoundCount.Add(1)
+	// Verify we got a valid success response (2xx status codes)
+	// For BODY/ARTICLE/HEAD commands, we expect 220/221/222
+	isSuccess := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	if !isSuccess {
+		// Track article not found separately for metrics
+		if resp.StatusCode == StatusArticleNotFound {
+			p.notFoundCount.Add(1)
+		}
+
+		// Determine error message
+		message := resp.Status
+		if message == "" {
+			message = fmt.Sprintf("unexpected status code: %d", resp.StatusCode)
+		}
+
 		return resp, &ProviderError{
 			ProviderName: p.config.Name,
 			Host:         p.config.Host,
 			StatusCode:   resp.StatusCode,
-			Message:      resp.Status,
+			Message:      message,
 			Temporary:    false,
 		}
 	}

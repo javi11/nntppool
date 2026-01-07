@@ -122,6 +122,87 @@ func (p *Pool) Head(ctx context.Context, messageID string) ([]string, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
+// GroupResponse contains the result of a GROUP command.
+type GroupResponse struct {
+	Count int64  // Estimated number of articles
+	Low   int64  // Low water mark (first article number)
+	High  int64  // High water mark (last article number)
+	Name  string // Group name
+}
+
+// Group selects a newsgroup on all provider connections.
+// This sends the GROUP command multiple times to ensure the group
+// is selected on all connections in the pool (NNTP state is per-connection).
+func (p *Pool) Group(ctx context.Context, groupName string) (*GroupResponse, error) {
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return nil, ErrPoolClosed
+	}
+	providers := p.allProviders
+	p.mu.RUnlock()
+
+	if len(providers) == 0 {
+		return nil, ErrNoProvidersAvailable
+	}
+
+	payload := []byte(fmt.Sprintf("GROUP %s\r\n", groupName))
+	var lastResp *GroupResponse
+	var lastErr error
+
+	// Send GROUP to all healthy providers, multiple times per provider
+	// to ensure all connections in the pool have the group selected
+	for _, provider := range providers {
+		if !provider.IsHealthy() {
+			continue
+		}
+
+		// Send GROUP command multiple times to cover all connections in the provider's pool
+		// MaxConnections determines how many connections the provider has
+		maxConns := provider.config.MaxConnections
+		if maxConns <= 0 {
+			maxConns = 1
+		}
+
+		for i := 0; i < maxConns; i++ {
+			resp, err := provider.Send(ctx, payload, nil)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			// Parse response: "211 count low high name"
+			groupResp, err := parseGroupResponse(resp.Status)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			lastResp = groupResp
+		}
+	}
+
+	if lastResp != nil {
+		return lastResp, nil
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	return nil, ErrNoProvidersAvailable
+}
+
+func parseGroupResponse(status string) (*GroupResponse, error) {
+	// Expected format: "211 count low high name"
+	var count, low, high int64
+	var name string
+	_, err := fmt.Sscanf(status, "211 %d %d %d %s", &count, &low, &high, &name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse GROUP response: %s", status)
+	}
+	return &GroupResponse{Count: count, Low: low, High: high, Name: name}, nil
+}
+
 // executeWithFallback executes a request with automatic failover across providers.
 func (p *Pool) executeWithFallback(ctx context.Context, payload []byte, w io.Writer) (int64, error) {
 	p.mu.RLock()
@@ -135,40 +216,28 @@ func (p *Pool) executeWithFallback(ctx context.Context, payload []byte, w io.Wri
 	notFoundHosts := make(map[string]bool)
 	triedProviders := make(map[*Provider]bool)
 
-	// PHASE 1: Try primary providers first
-	resp, bytesWritten, err := p.tryProviders(ctx, p.primaryProviders, payload, w, notFoundHosts, triedProviders)
+	// PHASE 1: Try primary providers
+	_, bytesWritten, err := p.tryProviders(ctx, p.primaryProviders, payload, w, notFoundHosts, triedProviders)
 	if err == nil {
 		return bytesWritten, nil
 	}
 
-	// If we got a non-"not found" error (connection error), it might be retryable
-	// but we'll continue to try other providers
+	// Only try backup providers if error is "article not found"
+	// For any other error (412, connection errors, etc.), return the actual error
 	if !IsArticleNotFound(err) {
-		// Check if we have more primaries to try
-		if len(triedProviders) < len(p.primaryProviders) {
-			// Continue trying primaries
-			resp, bytesWritten, err = p.tryProviders(ctx, p.primaryProviders, payload, w, notFoundHosts, triedProviders)
-			if err == nil {
-				return bytesWritten, nil
-			}
+		return 0, err
+	}
+
+	// PHASE 2: Try backup providers (only for article not found)
+	if len(p.backupProviders) > 0 {
+		_, bytesWritten, err = p.tryProviders(ctx, p.backupProviders, payload, w, notFoundHosts, triedProviders)
+		if err == nil {
+			return bytesWritten, nil
 		}
 	}
 
-	// PHASE 2: Try all remaining providers (primary + backup) sorted by priority
-	// Merge and sort all providers by priority
-	allSorted := p.getAllProvidersSorted()
-	resp, bytesWritten, err = p.tryProviders(ctx, allSorted, payload, w, notFoundHosts, triedProviders)
-	if err == nil {
-		return bytesWritten, nil
-	}
-
-	// All providers exhausted
-	if len(notFoundHosts) > 0 {
-		return 0, ErrArticleNotFound
-	}
-
-	_ = resp // suppress unused warning
-	return 0, ErrAllProvidersFailed
+	// All providers exhausted with "not found"
+	return 0, ErrArticleNotFound
 }
 
 // tryProviders attempts to execute the request on the given providers.

@@ -28,6 +28,7 @@ const (
 	StatusArticleNotFound      = 430
 	StatusNoSuchArticle        = 430
 	StatusNoSuchGroup          = 411
+	StatusNoNewsgroupSelected  = 412
 	StatusAuthRequired         = 480
 	StatusAuthRejected         = 482
 	StatusPostingNotAllowed    = 440
