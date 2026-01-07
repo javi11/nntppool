@@ -1164,3 +1164,200 @@ func TestLazyConnectionsWithGroupSelection(t *testing.T) {
 		t.Errorf("Expected %d successful requests, got %d", expectedRequests, reqTotal)
 	}
 }
+
+// failingWriter is a writer that fails after writing a specified number of bytes.
+// Used to test connection draining when a writer fails mid-download.
+type failingWriter struct {
+	failAfter int
+	written   int
+	failErr   error
+}
+
+func (fw *failingWriter) Write(p []byte) (n int, err error) {
+	if fw.written+len(p) > fw.failAfter {
+		// Fail partway through
+		canWrite := fw.failAfter - fw.written
+		if canWrite > 0 {
+			fw.written += canWrite
+		}
+		return canWrite, fw.failErr
+	}
+	fw.written += len(p)
+	return len(p), nil
+}
+
+// TestConnectionDrainsOnWriterFailure verifies that when a writer fails mid-download,
+// the connection properly drains remaining data and can be reused for subsequent requests.
+// This is critical for HTTP range request scenarios where a reader may close early.
+func TestConnectionDrainsOnWriterFailure(t *testing.T) {
+	ctx := context.Background()
+
+	server := newMockServer(t, filepath.Join(t.TempDir(), "drain_test.db"))
+	defer server.Close()
+
+	// Create a large article (100KB) to ensure partial reads
+	articleSize := 100 * 1024
+	messageIDs := createTestArticles(t, server, articleSize, 5)
+
+	host, port := parseAddr(server.Addr().String())
+
+	// Use single connection to force reuse and verify draining
+	pool, err := NewPool(ctx, PoolConfig{
+		Providers: []ProviderConfig{{
+			Host:              host,
+			Port:              port,
+			MaxConnections:    1, // Single connection to force reuse
+			InflightPerConn:   1, // No pipelining to simplify test
+			WarmupConnections: 1,
+			ConnectTimeout:    5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Select newsgroup
+	if _, err := pool.Group(ctx, "test"); err != nil {
+		t.Fatalf("Failed to select group: %v", err)
+	}
+
+	// Request 1: Use a failing writer that breaks after 10KB
+	fw := &failingWriter{
+		failAfter: 10 * 1024,                           // Fail after 10KB
+		failErr:   fmt.Errorf("simulated broken pipe"), // Simulate pipe broken
+	}
+
+	_, err = pool.Body(ctx, messageIDs[0], fw)
+	if err == nil {
+		t.Log("Request 1 (with failing writer): No error returned (writer failure may have been handled)")
+	} else {
+		t.Logf("Request 1 (with failing writer): Error as expected: %v", err)
+	}
+
+	// Small delay to allow drain to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Request 2: Use a normal buffer - should succeed if connection was properly drained
+	var buf2 bytes.Buffer
+	n2, err := pool.Body(ctx, messageIDs[1], &buf2)
+	if err != nil {
+		t.Fatalf("Request 2 failed (connection may not have been drained): %v", err)
+	}
+
+	t.Logf("Request 2 succeeded: received %d bytes", n2)
+
+	// Verify the data is reasonable (not corrupted with leftover from request 1)
+	if buf2.Len() == 0 {
+		t.Error("Request 2: Expected non-empty response")
+	}
+
+	// Request 3-5: Additional requests to verify connection remains stable
+	for i := 2; i < 5; i++ {
+		var buf bytes.Buffer
+		_, err := pool.Body(ctx, messageIDs[i], &buf)
+		if err != nil {
+			t.Errorf("Request %d failed: %v", i+1, err)
+			continue
+		}
+		t.Logf("Request %d succeeded: received %d bytes", i+1, buf.Len())
+	}
+
+	t.Log("Connection draining test completed - connection was properly reused")
+}
+
+// TestConnectionDrainsWithPipelining tests drain behavior with pipelined requests.
+// When one pipelined request's writer fails, subsequent responses should still
+// be correctly matched and the connection reused.
+func TestConnectionDrainsWithPipelining(t *testing.T) {
+	ctx := context.Background()
+
+	server := newMockServer(t, filepath.Join(t.TempDir(), "drain_pipeline.db"))
+	defer server.Close()
+
+	// Create articles of varying sizes
+	messageIDs := createTestArticles(t, server, 50*1024, 20) // 50KB each
+
+	host, port := parseAddr(server.Addr().String())
+
+	// Use single connection with pipelining
+	pool, err := NewPool(ctx, PoolConfig{
+		Providers: []ProviderConfig{{
+			Host:              host,
+			Port:              port,
+			MaxConnections:    1, // Single connection to force sequential processing
+			InflightPerConn:   4, // Pipeline depth of 4
+			WarmupConnections: 1,
+			ConnectTimeout:    5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	if _, err := pool.Group(ctx, "test"); err != nil {
+		t.Fatalf("Failed to select group: %v", err)
+	}
+
+	var (
+		successCount atomic.Int64
+		failCount    atomic.Int64
+		wg           sync.WaitGroup
+	)
+
+	// Launch 20 concurrent requests, some with failing writers
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			var w interface {
+				Write([]byte) (int, error)
+			}
+
+			// Every 5th request uses a failing writer
+			if idx%5 == 0 {
+				w = &failingWriter{
+					failAfter: 5 * 1024,                            // Fail after 5KB
+					failErr:   fmt.Errorf("simulated broken pipe"), // Simulate pipe broken
+				}
+			} else {
+				w = &bytes.Buffer{}
+			}
+
+			_, err := pool.Body(ctx, messageIDs[idx%len(messageIDs)], w)
+			if err != nil {
+				failCount.Add(1)
+			} else {
+				successCount.Add(1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	successes := successCount.Load()
+	failures := failCount.Load()
+
+	t.Logf("Pipelining drain test: %d successes, %d failures", successes, failures)
+
+	// We expect ~4 failures (idx 0, 5, 10, 15 have failing writers)
+	// But other requests should succeed
+	if successes < 12 {
+		t.Errorf("Expected at least 12 successes (16 requests with good writers), got %d", successes)
+	}
+
+	// Final verification: make a few more requests to ensure connection is still good
+	for i := 0; i < 3; i++ {
+		var buf bytes.Buffer
+		_, err := pool.Body(ctx, messageIDs[i], &buf)
+		if err != nil {
+			t.Errorf("Post-test request %d failed: %v", i, err)
+		}
+	}
+
+	t.Log("Pipelining drain test completed")
+}

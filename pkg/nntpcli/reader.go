@@ -50,6 +50,11 @@ type NNTPResponse struct {
 	hasBaddata   bool
 }
 
+// Done returns true if the response has been fully parsed.
+func (r *NNTPResponse) Done() bool {
+	return r.eof
+}
+
 // Feed implements streamFeeder for incremental response parsing.
 func (r *NNTPResponse) Feed(buf []byte, out io.Writer) (consumed int, done bool, err error) {
 	if out == nil {

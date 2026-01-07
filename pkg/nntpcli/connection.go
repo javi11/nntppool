@@ -413,6 +413,31 @@ func (c *NNTPConnection) readerLoop() {
 			return req.Ctx.Deadline()
 		})
 		_ = c.conn.SetReadDeadline(time.Time{})
+
+		// If feedUntilDone returned an error but response not complete,
+		// drain remaining data to io.Discard to preserve connection for reuse.
+		// This handles writer failures (broken pipe) where network is fine.
+		if err != nil && !decoder.Done() {
+			drainErr := c.rb.feedUntilDone(c.conn, &decoder, io.Discard, func() (time.Time, bool) {
+				// Use a reasonable timeout for draining (5 seconds)
+				return time.Now().Add(5 * time.Second), true
+			})
+			if drainErr != nil {
+				// Drain failed (network error) - close connection
+				resp.Err = err
+				if deliver {
+					safeSend(req.RespCh, resp)
+				}
+				safeClose(req.RespCh)
+				<-c.inflightSem
+				c.updateActivity()
+				_ = c.conn.Close()
+				c.failOutstanding()
+				return
+			}
+			// Drain succeeded - connection is clean for reuse
+		}
+
 		if err != nil {
 			resp.Err = err
 		}
