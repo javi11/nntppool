@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,9 @@ import (
 
 	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 )
+
+// debugEnabled controls debug logging. Set NNTPPOOL_DEBUG=1 to enable.
+var debugEnabled = os.Getenv("NNTPPOOL_DEBUG") != ""
 
 // Pool manages multiple NNTP providers with automatic failover and load balancing.
 type Pool struct {
@@ -158,14 +163,23 @@ func (p *Pool) Group(ctx context.Context, groupName string) (*GroupResponse, err
 		}
 
 		// Send GROUP command multiple times to cover all connections in the provider's pool
-		// MaxConnections determines how many connections the provider has
+		// With pipelining (InflightPerConn > 1), a connection may pick up multiple GROUP
+		// commands from the channel before others get a chance. So we send more GROUP
+		// commands than connections to ensure all connections receive at least one.
+		// Formula: MaxConnections * InflightPerConn ensures even in worst case distribution,
+		// every connection gets at least one GROUP.
 		maxConns := provider.config.MaxConnections
 		if maxConns <= 0 {
 			maxConns = 1
 		}
+		inflightPerConn := provider.config.InflightPerConn
+		if inflightPerConn <= 0 {
+			inflightPerConn = 1
+		}
+		groupCommands := maxConns * inflightPerConn
 
 		successCount := 0
-		for i := 0; i < maxConns; i++ {
+		for i := 0; i < groupCommands; i++ {
 			resp, err := provider.Send(ctx, payload, nil)
 			if err != nil {
 				lastErr = err
@@ -264,6 +278,11 @@ func (p *Pool) tryProviders(
 	// Get providers ordered by priority with round-robin within same priority
 	orderedProviders := p.orderProvidersWithRoundRobin(providers, notFoundHosts, triedProviders)
 
+	// If no providers are available, return error immediately
+	if len(orderedProviders) == 0 {
+		return nntpcli.Response{}, 0, ErrNoProvidersAvailable
+	}
+
 	for _, provider := range orderedProviders {
 		// Mark as tried
 		triedProviders[provider] = true
@@ -275,7 +294,13 @@ func (p *Pool) tryProviders(
 			if f, ok := w.(interface{ Flush() error }); ok {
 				_ = f.Flush()
 			}
+			if debugEnabled {
+				log.Printf("[pool] tryProviders success: status=%d bytes=%d", resp.StatusCode, resp.Meta.BytesDecoded)
+			}
 			return resp, int64(resp.Meta.BytesDecoded), nil
+		}
+		if debugEnabled {
+			log.Printf("[pool] tryProviders error: status=%d bytes=%d err=%v", resp.StatusCode, resp.Meta.BytesDecoded, err)
 		}
 
 		lastErr = err
@@ -285,6 +310,11 @@ func (p *Pool) tryProviders(
 		if IsArticleNotFound(err) {
 			notFoundHosts[provider.Host()] = true
 			continue // Try next provider
+		}
+
+		// Don't mark provider unhealthy for context cancellation - that's client-side
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			continue
 		}
 
 		// Connection or other error - mark unhealthy and try next

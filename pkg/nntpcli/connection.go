@@ -7,11 +7,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// debugEnabled controls debug logging. Set NNTPPOOL_DEBUG=1 to enable.
+var debugEnabled = os.Getenv("NNTPPOOL_DEBUG") != ""
+
+func debugLog(format string, args ...any) {
+	if debugEnabled {
+		log.Printf("[nntpcli] "+format, args...)
+	}
+}
 
 // Request represents an NNTP command to be sent to the server.
 type Request struct {
@@ -376,6 +387,15 @@ func (c *NNTPConnection) readerLoop() {
 			req.Ctx = context.Background()
 		}
 
+		// Extract message-id from payload for logging (format: "BODY <msgid>\r\n")
+		msgID := ""
+		if idx := bytes.Index(req.Payload, []byte("<")); idx >= 0 {
+			if end := bytes.Index(req.Payload[idx:], []byte(">")); end >= 0 {
+				msgID = string(req.Payload[idx : idx+end+1])
+			}
+		}
+		debugLog("conn=%p req start msgid=%s", c, msgID)
+
 		resp := Response{
 			Request: req,
 		}
@@ -387,6 +407,7 @@ func (c *NNTPConnection) readerLoop() {
 		select {
 		case <-req.Ctx.Done():
 			deliver = false
+			debugLog("conn=%p msgid=%s cancelled BEFORE processing", c, msgID)
 		default:
 		}
 
@@ -407,6 +428,7 @@ func (c *NNTPConnection) readerLoop() {
 				case <-req.Ctx.Done():
 					deliver = false
 					outRef.w = io.Discard
+					debugLog("conn=%p msgid=%s cancelled DURING processing, switching to Discard", c, msgID)
 				default:
 				}
 			}
@@ -418,12 +440,14 @@ func (c *NNTPConnection) readerLoop() {
 		// drain remaining data to io.Discard to preserve connection for reuse.
 		// This handles writer failures (broken pipe) where network is fine.
 		if err != nil && !decoder.Done() {
+			debugLog("conn=%p msgid=%s drain start err=%v bytesDecoded=%d", c, msgID, err, decoder.BytesDecoded)
 			drainErr := c.rb.feedUntilDone(c.conn, &decoder, io.Discard, func() (time.Time, bool) {
 				// Use a reasonable timeout for draining (5 seconds)
 				return time.Now().Add(5 * time.Second), true
 			})
 			if drainErr != nil {
 				// Drain failed (network error) - close connection
+				debugLog("conn=%p msgid=%s drain FAILED err=%v", c, msgID, drainErr)
 				resp.Err = err
 				if deliver {
 					safeSend(req.RespCh, resp)
@@ -436,6 +460,7 @@ func (c *NNTPConnection) readerLoop() {
 				return
 			}
 			// Drain succeeded - connection is clean for reuse
+			debugLog("conn=%p msgid=%s drain OK totalBytes=%d", c, msgID, decoder.BytesDecoded)
 		}
 
 		if err != nil {
@@ -449,9 +474,14 @@ func (c *NNTPConnection) readerLoop() {
 
 		if deliver {
 			// Best effort: use safeSend to handle closed channel race with failOutstanding()
+			debugLog("conn=%p msgid=%s DELIVERING response status=%d bytes=%d", c, msgID, decoder.StatusCode, decoder.BytesDecoded)
 			safeSend(req.RespCh, resp)
+		} else {
+			debugLog("conn=%p msgid=%s NOT delivering (cancelled) status=%d bytes=%d", c, msgID, decoder.StatusCode, decoder.BytesDecoded)
 		}
 		safeClose(req.RespCh)
+
+		debugLog("conn=%p msgid=%s complete status=%d bytes=%d err=%v", c, msgID, decoder.StatusCode, decoder.BytesDecoded, resp.Err)
 
 		// release inflight slot
 		<-c.inflightSem
@@ -463,6 +493,7 @@ func (c *NNTPConnection) readerLoop() {
 		if resp.Err != nil {
 			var ne net.Error
 			if errors.As(resp.Err, &ne) && ne.Timeout() {
+				debugLog("conn=%p msgid=%s timeout, closing connection", c, msgID)
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return

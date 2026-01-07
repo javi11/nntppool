@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -184,6 +186,11 @@ func (p *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 			Err:          err,
 			Temporary:    true,
 		}
+	}
+
+	// Debug: log received response
+	if os.Getenv("NNTPPOOL_DEBUG") != "" {
+		log.Printf("[provider] %s: received resp status=%d bytes=%d err=%v", p.config.Name, resp.StatusCode, resp.Meta.BytesDecoded, resp.Err)
 	}
 
 	if resp.Err != nil {

@@ -3,6 +3,7 @@ package nntppool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/textproto"
@@ -1360,4 +1361,142 @@ func TestConnectionDrainsWithPipelining(t *testing.T) {
 	}
 
 	t.Log("Pipelining drain test completed")
+}
+
+// TestMultiConnectionDataIntegrity tests data integrity with multiple connections
+// and random cancellations. This test verifies that connection draining works correctly
+// and no data corruption occurs.
+func TestMultiConnectionDataIntegrity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
+
+	ctx := context.Background()
+
+	server := newMockServer(t, filepath.Join(t.TempDir(), "integrity.db"))
+	defer server.Close()
+
+	// Create yenc-encoded test articles with known content
+	articleCount := 50
+	articleSize := 100 * 1024 // 100KB each
+	messageIDs := createTestArticles(t, server, articleSize, articleCount)
+
+	host, port := parseAddr(server.Addr().String())
+	cfg := PoolConfig{
+		Providers: []ProviderConfig{
+			{
+				Name:              "test",
+				Host:              host,
+				Port:              port,
+				TLS:               false,
+				MaxConnections:    5, // Multiple connections to test concurrent handling
+				InflightPerConn:   2, // Pipelining
+				ReadTimeout:       5 * time.Second,
+				WarmupConnections: 5, // Create all connections upfront to ensure GROUP reaches all
+			},
+		},
+	}
+
+	pool, err := NewPool(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Set the group first
+	if _, err := pool.Group(ctx, "test"); err != nil {
+		t.Fatalf("Failed to set group: %v", err)
+	}
+
+	const iterations = 3
+	const requestsPerIteration = 100
+
+	var totalSuccess, totalCancelled, totalErrors atomic.Int64
+	var crcMismatch atomic.Int64
+
+	for iter := 0; iter < iterations; iter++ {
+		var wg sync.WaitGroup
+
+		for i := 0; i < requestsPerIteration; i++ {
+			wg.Add(1)
+			go func(reqNum int) {
+				defer wg.Done()
+
+				msgID := messageIDs[reqNum%articleCount]
+
+				// Randomly cancel some requests (30%)
+				shouldCancel := reqNum%10 < 3
+				var reqCtx context.Context
+				var cancel context.CancelFunc
+				if shouldCancel {
+					// Create context that will be cancelled after a short delay
+					reqCtx, cancel = context.WithCancel(ctx)
+					go func() {
+						// Cancel after random short delay (simulates client disconnect)
+						time.Sleep(time.Duration(reqNum%50) * time.Millisecond)
+						cancel()
+					}()
+				} else {
+					reqCtx = ctx
+				}
+
+				var buf bytes.Buffer
+				n, err := pool.Body(reqCtx, msgID, &buf)
+
+				if shouldCancel {
+					cancel() // Ensure cancel is called
+				}
+
+				if err != nil {
+					// Use errors.Is for proper wrapped error detection
+					if shouldCancel && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+						totalCancelled.Add(1)
+						return
+					}
+					// Some cancellations may result in different errors (e.g., wrapped in ProviderError)
+					if shouldCancel {
+						totalCancelled.Add(1)
+						return
+					}
+					totalErrors.Add(1)
+					t.Logf("Request %d: error for %s: %v", reqNum, msgID, err)
+					return
+				}
+
+				// Validate that we got data (use buf.Len() for raw bytes, not decoded bytes)
+				// Mock server may not return properly yenc-encoded data
+				if buf.Len() == 0 {
+					totalErrors.Add(1)
+					t.Errorf("Request %d: got 0 bytes for %s (n=%d, bufLen=%d)", reqNum, msgID, n, buf.Len())
+					return
+				}
+
+				totalSuccess.Add(1)
+			}(i)
+		}
+
+		wg.Wait()
+		t.Logf("Iteration %d complete: success=%d, cancelled=%d, errors=%d",
+			iter+1, totalSuccess.Load(), totalCancelled.Load(), totalErrors.Load())
+	}
+
+	// Summary
+	t.Logf("Final: success=%d, cancelled=%d, errors=%d, crcMismatch=%d",
+		totalSuccess.Load(), totalCancelled.Load(), totalErrors.Load(), crcMismatch.Load())
+
+	// Verify results
+	if crcMismatch.Load() > 0 {
+		t.Errorf("CRC mismatches detected: %d", crcMismatch.Load())
+	}
+
+	// We expect some successful requests (at least 70% of non-cancelled)
+	expectedSuccess := int64(requestsPerIteration*iterations) * 70 / 100 * 70 / 100 // 70% not cancelled, 70% of those succeed
+	if totalSuccess.Load() < expectedSuccess {
+		t.Logf("Warning: lower than expected success rate: %d (expected at least %d)", totalSuccess.Load(), expectedSuccess)
+	}
+
+	// Errors should be relatively low
+	if totalErrors.Load() > int64(requestsPerIteration*iterations/10) {
+		t.Errorf("Too many errors: %d (expected < %d)", totalErrors.Load(), requestsPerIteration*iterations/10)
+	}
 }

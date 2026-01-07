@@ -260,7 +260,14 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 	if produced > 0 {
 		r.CRC = crc32.Update(r.CRC, crc32.IEEETable, buf[:produced])
 		r.BytesDecoded += produced
-		if _, werr := out.Write(buf[:produced]); werr != nil {
+		written, werr := out.Write(buf[:produced])
+		// Check if it's a writerRef and log the underlying writer
+		if wr, ok := out.(*writerRef); ok {
+			debugLog("decodeYenc: produced=%d written=%d underlyingWriter=%T", produced, written, wr.w)
+		} else {
+			debugLog("decodeYenc: produced=%d written=%d writerType=%T", produced, written, out)
+		}
+		if werr != nil {
 			return n, werr
 		}
 	}
