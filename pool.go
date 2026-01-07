@@ -164,6 +164,7 @@ func (p *Pool) Group(ctx context.Context, groupName string) (*GroupResponse, err
 			maxConns = 1
 		}
 
+		successCount := 0
 		for i := 0; i < maxConns; i++ {
 			resp, err := provider.Send(ctx, payload, nil)
 			if err != nil {
@@ -178,6 +179,13 @@ func (p *Pool) Group(ctx context.Context, groupName string) (*GroupResponse, err
 				continue
 			}
 			lastResp = groupResp
+			successCount++
+		}
+
+		// If at least one GROUP succeeded, set the group on the provider
+		// so new connections will automatically select it
+		if successCount > 0 {
+			provider.SetGroup(groupName)
 		}
 	}
 

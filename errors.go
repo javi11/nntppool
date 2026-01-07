@@ -75,6 +75,18 @@ func IsRetryable(err error) bool {
 	return false
 }
 
+// IsNoGroupSelected checks if the error indicates no newsgroup is selected (412).
+func IsNoGroupSelected(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		return pe.StatusCode == StatusNoNewsgroupSelected
+	}
+	return false
+}
+
 // ProviderError wraps an error from a specific provider.
 type ProviderError struct {
 	ProviderName string

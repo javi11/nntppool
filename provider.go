@@ -51,18 +51,24 @@ func NewProvider(ctx context.Context, cfg ProviderConfig) (*Provider, error) {
 		}
 	}
 
-	// Create the underlying client
-	client, err := nntpcli.NewClient(
-		ctx,
-		cfg.Address(),
-		tlsConfig,
-		cfg.MaxConnections,
-		cfg.InflightPerConn,
-		nntpcli.Auth{
-			Username: cfg.Username,
-			Password: cfg.Password,
-		},
-	)
+	// Create connection factory
+	addr := cfg.Address()
+	factory := func(_ context.Context) (net.Conn, error) {
+		if tlsConfig != nil {
+			return tls.Dial("tcp", addr, tlsConfig)
+		}
+		return net.Dial("tcp", addr)
+	}
+
+	// Create the underlying client with lazy connection support
+	client, err := nntpcli.NewClientLazy(ctx, nntpcli.ClientConfig{
+		MaxConnections:    cfg.MaxConnections,
+		InflightPerConn:   cfg.InflightPerConn,
+		Auth:              nntpcli.Auth{Username: cfg.Username, Password: cfg.Password},
+		Factory:           factory,
+		IdleTimeout:       cfg.IdleTimeout,
+		WarmupConnections: cfg.WarmupConnections,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client for %s: %w", cfg.Name, err)
 	}
@@ -82,16 +88,14 @@ func NewProviderWithConnFactory(ctx context.Context, cfg ProviderConfig, factory
 		return nil, err
 	}
 
-	client, err := nntpcli.NewClientWithConnFactory(
-		ctx,
-		cfg.MaxConnections,
-		cfg.InflightPerConn,
-		nntpcli.Auth{
-			Username: cfg.Username,
-			Password: cfg.Password,
-		},
-		factory,
-	)
+	client, err := nntpcli.NewClientLazy(ctx, nntpcli.ClientConfig{
+		MaxConnections:    cfg.MaxConnections,
+		InflightPerConn:   cfg.InflightPerConn,
+		Auth:              nntpcli.Auth{Username: cfg.Username, Password: cfg.Password},
+		Factory:           factory,
+		IdleTimeout:       cfg.IdleTimeout,
+		WarmupConnections: cfg.WarmupConnections,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client for %s: %w", cfg.Name, err)
 	}
@@ -256,6 +260,12 @@ func (p *Provider) HealthCheck(ctx context.Context) error {
 // Close closes the provider's client.
 func (p *Provider) Close() error {
 	return p.client.Close()
+}
+
+// SetGroup sets the current newsgroup for this provider.
+// New connections will automatically select this group.
+func (p *Provider) SetGroup(group string) {
+	p.client.SetGroup(group)
 }
 
 // Stats returns the provider's statistics.

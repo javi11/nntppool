@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,6 +71,12 @@ type NNTPConnection struct {
 	doneMu sync.Once
 
 	failMu sync.Once
+
+	// Idle tracking
+	lastActivity atomic.Int64 // Unix nanoseconds of last completed request
+
+	// Callback invoked when connection closes (for pool management)
+	onClose func(*NNTPConnection)
 }
 
 func newNetConn(addr string, tlsConfig *tls.Config) (net.Conn, error) {
@@ -209,6 +216,50 @@ func (c *NNTPConnection) Close() error {
 	return nil
 }
 
+// LastActivity returns the time of the last completed request.
+// Returns zero time if no requests have been completed yet.
+func (c *NNTPConnection) LastActivity() time.Time {
+	ns := c.lastActivity.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// updateActivity updates the last activity timestamp to now.
+func (c *NNTPConnection) updateActivity() {
+	c.lastActivity.Store(time.Now().UnixNano())
+}
+
+// SetOnClose sets the callback invoked when the connection closes.
+// This is used by the Client to remove the connection from its pool.
+func (c *NNTPConnection) SetOnClose(fn func(*NNTPConnection)) {
+	c.onClose = fn
+}
+
+// SendGroup sends a GROUP command and waits for the response.
+// This is used to set the initial group on a connection before it starts
+// processing requests from the shared channel.
+// Must be called before Run().
+func (c *NNTPConnection) SendGroup(ctx context.Context, group string) error {
+	cmd := fmt.Sprintf("GROUP %s\r\n", group)
+	if _, err := c.conn.Write([]byte(cmd)); err != nil {
+		return fmt.Errorf("group command: %w", err)
+	}
+
+	resp, err := c.readOneResponse(io.Discard)
+	if err != nil {
+		return fmt.Errorf("group response: %w", err)
+	}
+
+	// 211 = group selected successfully
+	if resp.StatusCode != 211 {
+		return fmt.Errorf("group failed: %d %s", resp.StatusCode, resp.Message)
+	}
+
+	return nil
+}
+
 type writerRef struct {
 	w io.Writer
 }
@@ -224,6 +275,10 @@ func (c *NNTPConnection) Run() {
 		_ = c.conn.Close()
 		c.failOutstanding()
 		c.closeDone()
+		// Notify the Client that this connection has closed
+		if c.onClose != nil {
+			c.onClose(c)
+		}
 	}()
 
 	go func() {
@@ -371,6 +426,9 @@ func (c *NNTPConnection) readerLoop() {
 
 		// release inflight slot
 		<-c.inflightSem
+
+		// Update last activity timestamp for idle tracking
+		c.updateActivity()
 
 		// If we hit a timeout or cancellation-related network error, close the connection.
 		if resp.Err != nil {

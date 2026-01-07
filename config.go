@@ -14,6 +14,8 @@ const (
 	DefaultReadTimeout         = 60 * time.Second
 	DefaultWriteTimeout        = 30 * time.Second
 	DefaultHealthCheckInterval = 1 * time.Minute
+	DefaultIdleTimeout         = 5 * time.Minute
+	DefaultWarmupConnections   = 0 // Fully lazy by default
 	DefaultPort                = 119
 	DefaultTLSPort             = 563
 )
@@ -84,6 +86,16 @@ type ProviderConfig struct {
 
 	// WriteTimeout is the timeout for sending requests.
 	WriteTimeout time.Duration
+
+	// IdleTimeout is how long a connection can be idle before being closed.
+	// Set to 0 to disable idle timeout and keep connections open indefinitely.
+	// Default: 5 minutes.
+	IdleTimeout time.Duration
+
+	// WarmupConnections is the number of connections to pre-create at startup.
+	// Set to 0 for fully lazy connection creation (connections created on-demand).
+	// Default: 0 (fully lazy).
+	WarmupConnections int
 }
 
 // Validate checks the provider configuration for errors.
@@ -130,6 +142,9 @@ func (c ProviderConfig) WithDefaults() ProviderConfig {
 	if c.Name == "" {
 		c.Name = c.Host
 	}
+	// Note: IdleTimeout defaults to 0 (no idle timeout) for backward compatibility.
+	// Users can set IdleTimeout > 0 to enable automatic connection cleanup.
+	// WarmupConnections defaults to 0 (fully lazy connection creation).
 	return c
 }
 

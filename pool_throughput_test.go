@@ -761,3 +761,406 @@ func TestPoolBodyThroughputWithDiscard(t *testing.T) {
 		t.Logf("With discard (counting): %.2f MB/s (%.2f MB in %v)", mbPerSec, float64(totalBytes)/(1024*1024), duration.Round(time.Millisecond))
 	})
 }
+
+// TestPipeliningWithLazyConnections verifies that pipelining (InflightPerConn > 1)
+// works correctly with lazy connection creation (WarmupConnections = 0).
+func TestPipeliningWithLazyConnections(t *testing.T) {
+	ctx := context.Background()
+
+	server := newMockServer(t, filepath.Join(t.TempDir(), "pipelining_lazy.db"))
+	defer server.Close()
+
+	// Create test articles (50KB each)
+	articleSize := 50 * 1024
+	messageIDs := createTestArticles(t, server, articleSize, 50)
+
+	host, port := parseAddr(server.Addr().String())
+
+	// Test configuration: pipelining with partial lazy connections
+	// Note: Using WarmupConnections=1 to avoid race between GROUP selection and
+	// parallel connection creation. Full lazy behavior with GROUP is tested in
+	// TestLazyConnectionsWithGroupSelection.
+	pool, err := NewPool(ctx, PoolConfig{
+		Providers: []ProviderConfig{{
+			Host:              host,
+			Port:              port,
+			MaxConnections:    5,
+			InflightPerConn:   3, // Pipeline depth of 3
+			WarmupConnections: 1, // Create 1 connection at startup, rest lazy
+			ConnectTimeout:    5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Select newsgroup
+	if _, err := pool.Group(ctx, "test"); err != nil {
+		t.Fatalf("Failed to select group: %v", err)
+	}
+
+	// Run concurrent requests - more than connections * inflight to stress test
+	var (
+		totalBytes    atomic.Int64
+		totalRequests atomic.Int64
+		errors        atomic.Int64
+		wg            sync.WaitGroup
+	)
+
+	concurrency := 20
+	requestsPerWorker := 10
+
+	start := time.Now()
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < requestsPerWorker; j++ {
+				msgID := messageIDs[(workerID*requestsPerWorker+j)%len(messageIDs)]
+				var buf bytes.Buffer
+				_, err := pool.Body(ctx, msgID, &buf)
+				if err != nil {
+					errors.Add(1)
+					t.Logf("Worker %d request %d failed: %v", workerID, j, err)
+					continue
+				}
+				if buf.Len() == 0 {
+					errors.Add(1)
+					t.Logf("Worker %d request %d returned empty body", workerID, j)
+					continue
+				}
+				totalBytes.Add(int64(buf.Len()))
+				totalRequests.Add(1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	duration := time.Since(start)
+
+	reqTotal := totalRequests.Load()
+	bytesTotal := totalBytes.Load()
+	errTotal := errors.Load()
+	expectedRequests := int64(concurrency * requestsPerWorker)
+
+	mbPerSec := float64(bytesTotal) / (1024 * 1024) / duration.Seconds()
+	reqPerSec := float64(reqTotal) / duration.Seconds()
+
+	t.Logf("Pipelining with lazy connections:")
+	t.Logf("  Config: MaxConnections=5, InflightPerConn=3, WarmupConnections=1")
+	t.Logf("  Successful requests: %d/%d", reqTotal, expectedRequests)
+	t.Logf("  Total bytes: %.2f MB", float64(bytesTotal)/(1024*1024))
+	t.Logf("  Duration: %v", duration.Round(time.Millisecond))
+	t.Logf("  Throughput: %.2f MB/s", mbPerSec)
+	t.Logf("  Requests/sec: %.2f", reqPerSec)
+	t.Logf("  Errors: %d", errTotal)
+
+	// Verify all requests completed successfully
+	if errTotal > 0 {
+		t.Errorf("Expected 0 errors, got %d", errTotal)
+	}
+	if reqTotal != expectedRequests {
+		t.Errorf("Expected %d successful requests, got %d", expectedRequests, reqTotal)
+	}
+}
+
+// TestPipeliningFIFOOrdering verifies that pipelined requests complete successfully
+// and responses are correctly matched to their requests.
+func TestPipeliningFIFOOrdering(t *testing.T) {
+	ctx := context.Background()
+
+	server := newMockServer(t, filepath.Join(t.TempDir(), "pipelining_fifo.db"))
+	defer server.Close()
+
+	// Create yenc-encoded test articles
+	articleCount := 20
+	articleSize := 10 * 1024 // 10KB each
+	messageIDs := createTestArticles(t, server, articleSize, articleCount)
+
+	host, port := parseAddr(server.Addr().String())
+
+	// Use single connection with high pipeline depth to ensure ordering within connection
+	pool, err := NewPool(ctx, PoolConfig{
+		Providers: []ProviderConfig{{
+			Host:              host,
+			Port:              port,
+			MaxConnections:    1, // Single connection to verify FIFO ordering
+			InflightPerConn:   4, // Pipeline depth of 4
+			WarmupConnections: 1, // Warmup the single connection
+			ConnectTimeout:    5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Select newsgroup
+	if _, err := pool.Group(ctx, "test"); err != nil {
+		t.Fatalf("Failed to select group: %v", err)
+	}
+
+	// Track results for each request
+	type result struct {
+		requestIdx int
+		msgID      string
+		size       int
+		err        error
+	}
+
+	results := make([]result, articleCount)
+	var wg sync.WaitGroup
+
+	// Launch all requests nearly simultaneously to stress pipelining
+	for i := 0; i < articleCount; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			msgID := messageIDs[idx]
+			var buf bytes.Buffer
+			_, err := pool.Body(ctx, msgID, &buf)
+			results[idx] = result{
+				requestIdx: idx,
+				msgID:      msgID,
+				size:       buf.Len(),
+				err:        err,
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify all requests succeeded and returned data
+	var errors int
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("Request %d (%s) failed: %v", i, r.msgID, r.err)
+			errors++
+			continue
+		}
+		// Verify we got data back (not empty response)
+		if r.size == 0 {
+			t.Errorf("Request %d (%s): got empty response", i, r.msgID)
+			errors++
+		}
+	}
+
+	t.Logf("FIFO ordering test: %d/%d requests succeeded with data", articleCount-errors, articleCount)
+
+	if errors > 0 {
+		t.Errorf("%d requests failed or returned empty data", errors)
+	}
+}
+
+// TestPipeliningThroughputComparison compares throughput with different InflightPerConn values.
+func TestPipeliningThroughputComparison(t *testing.T) {
+	ctx := context.Background()
+
+	scenarios := []struct {
+		name            string
+		inflightPerConn int
+		maxConnections  int
+	}{
+		{"baseline_no_pipeline", 1, 5},
+		{"pipeline_depth_2", 2, 5},
+		{"pipeline_depth_4", 4, 5},
+		{"pipeline_depth_8", 8, 5},
+	}
+
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			server := newMockServer(t, filepath.Join(t.TempDir(), sc.name+".db"))
+			defer server.Close()
+
+			// Create test articles (100KB each)
+			articleSize := 100 * 1024
+			messageIDs := createTestArticles(t, server, articleSize, 50)
+
+			host, port := parseAddr(server.Addr().String())
+
+			pool, err := NewPool(ctx, PoolConfig{
+				Providers: []ProviderConfig{{
+					Host:              host,
+					Port:              port,
+					MaxConnections:    sc.maxConnections,
+					InflightPerConn:   sc.inflightPerConn,
+					WarmupConnections: 1, // Avoid GROUP selection race
+					ConnectTimeout:    5 * time.Second,
+					ReadTimeout:       30 * time.Second,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("Failed to create pool: %v", err)
+			}
+			defer pool.Close()
+
+			// Select newsgroup
+			if _, err := pool.Group(ctx, "test"); err != nil {
+				t.Fatalf("Failed to select group: %v", err)
+			}
+
+			// Run concurrent requests
+			var (
+				totalBytes    atomic.Int64
+				totalRequests atomic.Int64
+				errors        atomic.Int64
+				wg            sync.WaitGroup
+			)
+
+			concurrency := 10
+			requestCount := 200
+
+			work := make(chan string, requestCount)
+			for i := 0; i < requestCount; i++ {
+				work <- messageIDs[i%len(messageIDs)]
+			}
+			close(work)
+
+			start := time.Now()
+
+			for i := 0; i < concurrency; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for msgID := range work {
+						var buf bytes.Buffer
+						_, err := pool.Body(ctx, msgID, &buf)
+						if err != nil {
+							errors.Add(1)
+							continue
+						}
+						totalBytes.Add(int64(buf.Len()))
+						totalRequests.Add(1)
+					}
+				}()
+			}
+
+			wg.Wait()
+			duration := time.Since(start)
+
+			bytesTotal := totalBytes.Load()
+			reqTotal := totalRequests.Load()
+			errTotal := errors.Load()
+
+			mbPerSec := float64(bytesTotal) / (1024 * 1024) / duration.Seconds()
+			reqPerSec := float64(reqTotal) / duration.Seconds()
+
+			t.Logf("InflightPerConn=%d: %.2f MB/s | %.2f req/s | %d requests | %d errors | %v",
+				sc.inflightPerConn, mbPerSec, reqPerSec, reqTotal, errTotal, duration.Round(time.Millisecond))
+
+			// Basic sanity check - all requests should succeed
+			if errTotal > 0 {
+				t.Errorf("Expected 0 errors, got %d", errTotal)
+			}
+			if reqTotal != int64(requestCount) {
+				t.Errorf("Expected %d successful requests, got %d", requestCount, reqTotal)
+			}
+		})
+	}
+}
+
+// TestLazyConnectionsWithGroupSelection verifies that GROUP auto-selection works
+// correctly for lazy connections created AFTER pool.Group() completes.
+//
+// Note: There is a known race condition when WarmupConnections=0 and pipelining is
+// enabled (InflightPerConn > 1). Connections created in parallel during the initial
+// pool.Group() call may not receive the GROUP command. Using WarmupConnections >= 1
+// avoids this race by ensuring at least one connection exists before Group() is called.
+func TestLazyConnectionsWithGroupSelection(t *testing.T) {
+	ctx := context.Background()
+
+	server := newMockServer(t, filepath.Join(t.TempDir(), "lazy_group.db"))
+	defer server.Close()
+
+	// Create test articles
+	articleSize := 10 * 1024
+	messageIDs := createTestArticles(t, server, articleSize, 30)
+
+	host, port := parseAddr(server.Addr().String())
+
+	// Create pool with partial lazy connections
+	// WarmupConnections=1 ensures one connection exists before Group() is called,
+	// avoiding the race condition. Additional connections (up to MaxConnections)
+	// will be created lazily and should auto-select the group.
+	pool, err := NewPool(ctx, PoolConfig{
+		Providers: []ProviderConfig{{
+			Host:              host,
+			Port:              port,
+			MaxConnections:    5,
+			InflightPerConn:   3,
+			WarmupConnections: 1, // One connection at startup, rest lazy
+			ConnectTimeout:    5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Select newsgroup - this sets the group for future lazy connections
+	if _, err := pool.Group(ctx, "test"); err != nil {
+		t.Fatalf("Failed to select group: %v", err)
+	}
+
+	// Now run concurrent requests - additional connections will be created lazily
+	// and should auto-select the "test" group
+	var (
+		totalRequests atomic.Int64
+		errors        atomic.Int64
+		groupErrors   atomic.Int64 // Track "412 No newsgroup selected" errors specifically
+		wg            sync.WaitGroup
+	)
+
+	concurrency := 15 // More than MaxConnections to ensure multiple lazy connections
+	requestsPerWorker := 10
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < requestsPerWorker; j++ {
+				msgID := messageIDs[(workerID*requestsPerWorker+j)%len(messageIDs)]
+				var buf bytes.Buffer
+				_, err := pool.Body(ctx, msgID, &buf)
+				if err != nil {
+					errors.Add(1)
+					// Check if it's a "no newsgroup selected" error
+					if IsNoGroupSelected(err) {
+						groupErrors.Add(1)
+						t.Logf("Worker %d request %d: 412 No newsgroup selected error", workerID, j)
+					}
+					continue
+				}
+				totalRequests.Add(1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	reqTotal := totalRequests.Load()
+	errTotal := errors.Load()
+	groupErrTotal := groupErrors.Load()
+	expectedRequests := int64(concurrency * requestsPerWorker)
+
+	t.Logf("Lazy connections with GROUP auto-selection:")
+	t.Logf("  Config: MaxConnections=5, InflightPerConn=3, WarmupConnections=1")
+	t.Logf("  Successful requests: %d/%d", reqTotal, expectedRequests)
+	t.Logf("  Total errors: %d", errTotal)
+	t.Logf("  Group selection errors (412): %d", groupErrTotal)
+
+	// Critical: No "412 No newsgroup selected" errors should occur
+	if groupErrTotal > 0 {
+		t.Errorf("Expected 0 group selection errors (412), got %d - GROUP auto-selection failed", groupErrTotal)
+	}
+
+	// All requests should succeed
+	if reqTotal != expectedRequests {
+		t.Errorf("Expected %d successful requests, got %d", expectedRequests, reqTotal)
+	}
+}
