@@ -20,6 +20,10 @@ const (
 type readBuffer struct {
 	buf        []byte
 	start, end int
+
+	// Deadline caching to avoid SetReadDeadline syscall on every read
+	lastDeadline    time.Time
+	lastHasDeadline bool
 }
 
 func (rb *readBuffer) init() {
@@ -89,11 +93,17 @@ func (rb *readBuffer) ensureWriteSpace() error {
 }
 
 // readMore reads more data from the connection into the buffer.
+// It caches the deadline to avoid syscalls when the deadline hasn't changed.
 func (rb *readBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bool) (int, error) {
-	if hasDeadline {
-		_ = conn.SetReadDeadline(deadline)
-	} else {
-		_ = conn.SetReadDeadline(time.Time{})
+	// Only set deadline if it changed - avoids syscall on every read
+	if hasDeadline != rb.lastHasDeadline || (hasDeadline && !deadline.Equal(rb.lastDeadline)) {
+		if hasDeadline {
+			_ = conn.SetReadDeadline(deadline)
+		} else {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+		rb.lastDeadline = deadline
+		rb.lastHasDeadline = hasDeadline
 	}
 	if err := rb.ensureWriteSpace(); err != nil {
 		return 0, err
@@ -112,15 +122,20 @@ type streamFeeder interface {
 
 // feedUntilDone reads from the connection and feeds data to the decoder
 // until the response is complete.
+// Optimized to reduce deadline callback frequency and avoid unnecessary network reads.
 func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.Writer, deadline func() (time.Time, bool)) error {
 	rb.init()
+
+	// Cache deadline to reduce callback overhead
+	dl, hasDeadline := deadline()
 
 	for {
 		// Ensure we have some bytes to feed.
 		if rb.start == rb.end {
 			rb.start, rb.end = 0, 0
-			dl, ok := deadline()
-			if _, err := rb.readMore(conn, dl, ok); err != nil {
+			// Refresh deadline before blocking network read
+			dl, hasDeadline = deadline()
+			if _, err := rb.readMore(conn, dl, hasDeadline); err != nil {
 				return err
 			}
 		}
@@ -136,15 +151,26 @@ func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.W
 			return nil
 		}
 
-		// Need more data.
-		// If decoder couldn't consume anything but we have buffered bytes,
-		// compact them to the start so the next read appends contiguously.
-		if consumed == 0 && (rb.end-rb.start) > 0 {
-			rb.compact()
+		// If we still have buffered data, try to process it before reading more
+		if rb.end > rb.start {
+			// If decoder couldn't consume anything, we need more data
+			// Compact to make room for the next read
+			if consumed == 0 {
+				rb.compact()
+				// Refresh deadline before blocking network read
+				dl, hasDeadline = deadline()
+				if _, err := rb.readMore(conn, dl, hasDeadline); err != nil {
+					return err
+				}
+			}
+			// Otherwise continue loop to process remaining buffered data
+			continue
 		}
 
-		dl, ok := deadline()
-		if _, err := rb.readMore(conn, dl, ok); err != nil {
+		// Buffer is empty, read more data
+		// Refresh deadline before blocking network read
+		dl, hasDeadline = deadline()
+		if _, err := rb.readMore(conn, dl, hasDeadline); err != nil {
 			return err
 		}
 	}
