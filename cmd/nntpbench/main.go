@@ -40,6 +40,7 @@ func main() {
 	poolOnly := flag.Bool("pool", false, "Only run pool test")
 	sequential := flag.Bool("sequential", false, "Run pool test sequentially (1 connection)")
 	detailed := flag.Bool("detailed", false, "Show detailed single-body breakdown")
+	download := flag.Bool("download", false, "Real download test with progress bar")
 
 	timeout := flag.Duration("timeout", 5*time.Minute, "Overall timeout")
 
@@ -105,6 +106,18 @@ func main() {
 
 	fmt.Printf("\nBenchmarking %s:%d\n", cfg.Host, cfg.Port)
 	fmt.Printf("TLS: %v, Connections: %d\n", cfg.TLS, cfg.Connections)
+
+	// Download mode with progress bar
+	if *download {
+		result, err := DownloadBench(ctx, cfg, segments)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Download error: %v\n", err)
+			os.Exit(1)
+		}
+		PrintDownloadResult(result)
+		fmt.Println("\nDownload benchmark complete.")
+		return
+	}
 
 	// Detailed single-body breakdown
 	if *detailed && len(segments) > 0 {

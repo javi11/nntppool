@@ -1,6 +1,7 @@
 package nntpcli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -54,6 +55,7 @@ type ConnFactory func(ctx context.Context) (net.Conn, error)
 // NNTPConnection manages a single NNTP connection with pipelining support.
 type NNTPConnection struct {
 	conn net.Conn
+	bw   *bufio.Writer // Buffered writer to reduce write syscalls
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -92,6 +94,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 
 	c := &NNTPConnection{
 		conn:    conn,
+		bw:      bufio.NewWriterSize(conn, 64*1024), // 64KB write buffer
 		ctx:     cctx,
 		cancel:  cancel,
 		reqCh:   reqCh,
@@ -317,7 +320,14 @@ func (c *NNTPConnection) Run() {
 
 		// pipeline write - must succeed BEFORE enqueuing to pending
 		// to prevent response misalignment on write failure
-		if _, err := c.conn.Write(req.Payload); err != nil {
+		if _, err := c.bw.Write(req.Payload); err != nil {
+			safeClose(req.RespCh)
+			_ = c.conn.Close()
+			c.failOutstanding()
+			return
+		}
+		// Flush buffered writes to ensure command is sent
+		if err := c.bw.Flush(); err != nil {
 			safeClose(req.RespCh)
 			_ = c.conn.Close()
 			c.failOutstanding()
