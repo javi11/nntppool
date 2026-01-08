@@ -9,7 +9,7 @@ import (
 // Default configuration values.
 const (
 	DefaultMaxConnections      = 10
-	DefaultInflightPerConn     = 1
+	DefaultInflightPerConn     = 8 // Enable pipelining for high throughput
 	DefaultConnectTimeout      = 30 * time.Second
 	DefaultReadTimeout         = 60 * time.Second
 	DefaultWriteTimeout        = 30 * time.Second
@@ -74,8 +74,9 @@ type ProviderConfig struct {
 	IsBackup bool
 
 	// InflightPerConn is the maximum number of pipelined requests per connection.
-	// Default is 1 (no pipelining). Increase for providers that support pipelining
-	// to improve throughput.
+	// Default is 8 (pipelining enabled). This allows multiple requests to be sent
+	// before waiting for responses, significantly improving throughput on high-latency
+	// connections. Set to 1 to disable pipelining.
 	InflightPerConn int
 
 	// ConnectTimeout is the timeout for establishing a connection.

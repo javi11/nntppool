@@ -59,9 +59,7 @@ type NNTPConnection struct {
 	cancel context.CancelFunc
 
 	reqCh   <-chan *Request
-	pending chan *Request
-
-	inflightSem chan struct{}
+	pending chan *Request // capacity = inflightLimit, provides back-pressure
 
 	rb readBuffer
 
@@ -93,14 +91,13 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	cctx, cancel := context.WithCancel(ctx)
 
 	c := &NNTPConnection{
-		conn:        conn,
-		ctx:         cctx,
-		cancel:      cancel,
-		reqCh:       reqCh,
-		pending:     make(chan *Request, inflightLimit),
-		inflightSem: make(chan struct{}, inflightLimit),
-		rb:          readBuffer{buf: make([]byte, defaultReadBufSize)},
-		done:        make(chan struct{}),
+		conn:    conn,
+		ctx:     cctx,
+		cancel:  cancel,
+		reqCh:   reqCh,
+		pending: make(chan *Request, inflightLimit),
+		rb:      readBuffer{buf: make([]byte, defaultReadBufSize)},
+		done:    make(chan struct{}),
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -201,11 +198,6 @@ func (c *NNTPConnection) failOutstanding() {
 					continue
 				}
 				safeClose(req.RespCh)
-				// Best-effort inflight release (not strictly needed once we're shutting down).
-				select {
-				case <-c.inflightSem:
-				default:
-				}
 			default:
 				return
 			}
@@ -293,30 +285,15 @@ func (c *NNTPConnection) Run() {
 	}()
 
 	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-
-		// wait until we have inflight capacity
-		select {
-		case c.inflightSem <- struct{}{}:
-		case <-c.ctx.Done():
-			return
-		}
-
-		// pull next request
+		// Pull next request - pending channel provides flow control
 		var req *Request
 		var ok bool
 		select {
 		case req, ok = <-c.reqCh:
 		case <-c.ctx.Done():
-			<-c.inflightSem
 			return
 		}
 		if !ok {
-			<-c.inflightSem
 			return
 		}
 		if req.Ctx == nil {
@@ -326,7 +303,6 @@ func (c *NNTPConnection) Run() {
 		// Cancel before sending (queued-but-not-sent case)
 		select {
 		case <-req.Ctx.Done():
-			<-c.inflightSem
 			close(req.RespCh)
 			continue
 		default:
@@ -342,7 +318,6 @@ func (c *NNTPConnection) Run() {
 		// pipeline write - must succeed BEFORE enqueuing to pending
 		// to prevent response misalignment on write failure
 		if _, err := c.conn.Write(req.Payload); err != nil {
-			<-c.inflightSem
 			safeClose(req.RespCh)
 			_ = c.conn.Close()
 			c.failOutstanding()
@@ -351,8 +326,13 @@ func (c *NNTPConnection) Run() {
 		_ = c.conn.SetWriteDeadline(time.Time{})
 
 		// track FIFO ordering - enqueue AFTER successful write
-		// to ensure readerLoop only expects responses for actually-sent requests
-		c.pending <- req
+		// pending channel capacity = inflightLimit, provides back-pressure
+		select {
+		case c.pending <- req:
+		case <-c.ctx.Done():
+			safeClose(req.RespCh)
+			return
+		}
 	}
 }
 
@@ -429,7 +409,6 @@ func (c *NNTPConnection) readerLoop() {
 					safeSend(req.RespCh, resp)
 				}
 				safeClose(req.RespCh)
-				<-c.inflightSem
 				c.updateActivity()
 				_ = c.conn.Close()
 				c.failOutstanding()
@@ -451,9 +430,6 @@ func (c *NNTPConnection) readerLoop() {
 			safeSend(req.RespCh, resp)
 		}
 		safeClose(req.RespCh)
-
-		// release inflight slot
-		<-c.inflightSem
 
 		// Update last activity timestamp for idle tracking
 		c.updateActivity()

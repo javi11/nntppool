@@ -105,7 +105,7 @@ func NewClientLazy(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("nntpcli: MaxConnections must be positive")
 	}
 	if cfg.InflightPerConn <= 0 {
-		cfg.InflightPerConn = 1
+		cfg.InflightPerConn = 8 // Enable pipelining by default for high throughput
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -120,7 +120,7 @@ func NewClientLazy(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	c := &Client{
 		ctx:               ctx,
 		cancel:            cancel,
-		reqCh:             make(chan *Request, cfg.MaxConnections),
+		reqCh:             make(chan *Request, cfg.MaxConnections*cfg.InflightPerConn),
 		conns:             make(map[*NNTPConnection]struct{}),
 		maxConns:          cfg.MaxConnections,
 		factory:           cfg.Factory,
