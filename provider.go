@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,8 +19,11 @@ type Provider struct {
 	config ProviderConfig
 	client *nntpcli.Client
 
+	// Health status - atomic for lock-free reads in hot path
+	healthy atomic.Bool
+
+	// Protected by mu - only for error tracking (not hot path)
 	mu        sync.RWMutex
-	healthy   bool
 	lastError error
 	lastCheck time.Time
 
@@ -75,11 +76,12 @@ func NewProvider(ctx context.Context, cfg ProviderConfig) (*Provider, error) {
 		return nil, fmt.Errorf("failed to create client for %s: %w", cfg.Name, err)
 	}
 
-	return &Provider{
-		config:  cfg,
-		client:  client,
-		healthy: true,
-	}, nil
+	p := &Provider{
+		config: cfg,
+		client: client,
+	}
+	p.healthy.Store(true)
+	return p, nil
 }
 
 // NewProviderWithConnFactory creates a new provider with a custom connection factory.
@@ -102,11 +104,12 @@ func NewProviderWithConnFactory(ctx context.Context, cfg ProviderConfig, factory
 		return nil, fmt.Errorf("failed to create client for %s: %w", cfg.Name, err)
 	}
 
-	return &Provider{
-		config:  cfg,
-		client:  client,
-		healthy: true,
-	}, nil
+	p := &Provider{
+		config: cfg,
+		client: client,
+	}
+	p.healthy.Store(true)
+	return p, nil
 }
 
 // Name returns the provider's name.
@@ -130,28 +133,27 @@ func (p *Provider) IsBackup() bool {
 }
 
 // IsHealthy returns whether the provider is currently healthy.
+// Uses atomic load for lock-free access in hot path.
 func (p *Provider) IsHealthy() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.healthy
+	return p.healthy.Load()
 }
 
 // MarkHealthy marks the provider as healthy.
 func (p *Provider) MarkHealthy() {
+	p.healthy.Store(true)
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.healthy = true
 	p.lastError = nil
 	p.lastCheck = time.Now()
+	p.mu.Unlock()
 }
 
 // MarkUnhealthy marks the provider as unhealthy with the given error.
 func (p *Provider) MarkUnhealthy(err error) {
+	p.healthy.Store(false)
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.healthy = false
 	p.lastError = err
 	p.lastCheck = time.Now()
+	p.mu.Unlock()
 	p.errorCount.Add(1)
 }
 
@@ -186,11 +188,6 @@ func (p *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 			Err:          err,
 			Temporary:    true,
 		}
-	}
-
-	// Debug: log received response
-	if os.Getenv("NNTPPOOL_DEBUG") != "" {
-		log.Printf("[provider] %s: received resp status=%d bytes=%d err=%v", p.config.Name, resp.StatusCode, resp.Meta.BytesDecoded, resp.Err)
 	}
 
 	if resp.Err != nil {
@@ -278,13 +275,15 @@ func (p *Provider) SetGroup(group string) {
 // Stats returns the provider's statistics.
 func (p *Provider) Stats() ProviderStats {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
+	lastError := p.lastError
+	lastCheck := p.lastCheck
+	p.mu.RUnlock()
 	return ProviderStats{
 		Name:          p.config.Name,
 		Host:          p.config.Host,
-		Healthy:       p.healthy,
-		LastError:     p.lastError,
-		LastCheck:     p.lastCheck,
+		Healthy:       p.healthy.Load(),
+		LastError:     lastError,
+		LastCheck:     lastCheck,
 		RequestCount:  p.requestCount.Load(),
 		ErrorCount:    p.errorCount.Load(),
 		NotFoundCount: p.notFoundCount.Load(),

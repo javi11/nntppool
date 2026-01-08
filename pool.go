@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -16,8 +14,24 @@ import (
 	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 )
 
-// debugEnabled controls debug logging. Set NNTPPOOL_DEBUG=1 to enable.
-var debugEnabled = os.Getenv("NNTPPOOL_DEBUG") != ""
+// Object pools for reducing allocations in hot paths
+var (
+	notFoundHostsPool = sync.Pool{
+		New: func() any {
+			return make(map[string]bool, 4)
+		},
+	}
+	triedProvidersPool = sync.Pool{
+		New: func() any {
+			return make(map[*Provider]bool, 8)
+		},
+	}
+	payloadBufferPool = sync.Pool{
+		New: func() any {
+			return bytes.NewBuffer(make([]byte, 0, 64))
+		},
+	}
+)
 
 // Pool manages multiple NNTP providers with automatic failover and load balancing.
 type Pool struct {
@@ -102,14 +116,28 @@ func NewPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 // Body retrieves the body of an article by message ID.
 // It writes the decoded body to the provided writer.
 func (p *Pool) Body(ctx context.Context, messageID string, w io.Writer) (int64, error) {
-	payload := []byte(fmt.Sprintf("BODY <%s>\r\n", messageID))
-	return p.executeWithFallback(ctx, payload, w)
+	buf := payloadBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	buf.WriteString("BODY <")
+	buf.WriteString(messageID)
+	buf.WriteString(">\r\n")
+	payload := buf.Bytes()
+	n, err := p.executeWithFallback(ctx, payload, w)
+	payloadBufferPool.Put(buf)
+	return n, err
 }
 
 // Article retrieves a complete article by message ID.
 func (p *Pool) Article(ctx context.Context, messageID string, w io.Writer) (int64, error) {
-	payload := []byte(fmt.Sprintf("ARTICLE <%s>\r\n", messageID))
-	return p.executeWithFallback(ctx, payload, w)
+	buf := payloadBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	buf.WriteString("ARTICLE <")
+	buf.WriteString(messageID)
+	buf.WriteString(">\r\n")
+	payload := buf.Bytes()
+	n, err := p.executeWithFallback(ctx, payload, w)
+	payloadBufferPool.Put(buf)
+	return n, err
 }
 
 // Head retrieves the headers of an article by message ID.
@@ -235,8 +263,16 @@ func (p *Pool) executeWithFallback(ctx context.Context, payload []byte, w io.Wri
 	p.mu.RUnlock()
 
 	// Track hosts that returned "not found" to skip same-backbone providers
-	notFoundHosts := make(map[string]bool)
-	triedProviders := make(map[*Provider]bool)
+	// Use pooled maps to reduce allocations
+	notFoundHosts := notFoundHostsPool.Get().(map[string]bool)
+	triedProviders := triedProvidersPool.Get().(map[*Provider]bool)
+	// Clear maps (they may have been used before)
+	clear(notFoundHosts)
+	clear(triedProviders)
+	defer func() {
+		notFoundHostsPool.Put(notFoundHosts)
+		triedProvidersPool.Put(triedProviders)
+	}()
 
 	// PHASE 1: Try primary providers
 	_, bytesWritten, err := p.tryProviders(ctx, p.primaryProviders, payload, w, notFoundHosts, triedProviders)
@@ -294,13 +330,7 @@ func (p *Pool) tryProviders(
 			if f, ok := w.(interface{ Flush() error }); ok {
 				_ = f.Flush()
 			}
-			if debugEnabled {
-				log.Printf("[pool] tryProviders success: status=%d bytes=%d", resp.StatusCode, resp.Meta.BytesDecoded)
-			}
 			return resp, int64(resp.Meta.BytesDecoded), nil
-		}
-		if debugEnabled {
-			log.Printf("[pool] tryProviders error: status=%d bytes=%d err=%v", resp.StatusCode, resp.Meta.BytesDecoded, err)
 		}
 
 		lastErr = err
