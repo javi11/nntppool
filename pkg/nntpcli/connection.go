@@ -2,17 +2,88 @@
 package nntpcli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
+
+// nntpConn wraps the custom reader/writer/pipeline for NNTP operations.
+// This replaces textproto.Conn to remove the dependency on net/textproto.
+type nntpConn struct {
+	reader   *nntpReader
+	writer   *nntpWriter
+	pipeline *pipeline
+	conn     net.Conn
+}
+
+// newNNTPConn creates a new nntpConn wrapping the given net.Conn.
+func newNNTPConn(conn net.Conn) *nntpConn {
+	return &nntpConn{
+		reader:   newNNTPReader(conn),
+		writer:   newNNTPWriter(conn),
+		pipeline: newPipeline(),
+		conn:     conn,
+	}
+}
+
+// Cmd sends a command and returns a pipeline ID for response tracking.
+func (c *nntpConn) Cmd(format string, args ...any) (uint, error) {
+	id := c.pipeline.Next()
+	c.pipeline.StartRequest(id)
+	err := c.writer.PrintfLine(format, args...)
+	if err != nil {
+		c.pipeline.EndRequest(id)
+		return 0, err
+	}
+	err = c.writer.Flush()
+	c.pipeline.EndRequest(id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// StartResponse blocks until it is time to read the response for the given ID.
+func (c *nntpConn) StartResponse(id uint) {
+	c.pipeline.StartResponse(id)
+}
+
+// EndResponse signals that the response for the given ID has been read.
+func (c *nntpConn) EndResponse(id uint) {
+	c.pipeline.EndResponse(id)
+}
+
+// ReadCodeLine reads a response line and parses the status code.
+func (c *nntpConn) ReadCodeLine(expectCode int) (int, string, error) {
+	return c.reader.ReadCodeLine(expectCode)
+}
+
+// ReadLine reads a single line from the connection.
+func (c *nntpConn) ReadLine() (string, error) {
+	return c.reader.ReadLine()
+}
+
+// DotWriter returns an io.WriteCloser for dot-stuffed writing.
+func (c *nntpConn) DotWriter() io.WriteCloser {
+	return c.writer.DotWriter()
+}
+
+// Reader returns the underlying reader for use with rapidyenc.
+func (c *nntpConn) Reader() io.Reader {
+	return c.reader.Reader()
+}
+
+// Close closes the underlying connection.
+func (c *nntpConn) Close() error {
+	return c.conn.Close()
+}
 
 type Connection interface {
 	io.Closer
@@ -45,13 +116,14 @@ var _ Connection = (*connection)(nil)
 type connection struct {
 	maxAgeTime         time.Time
 	netconn            net.Conn
-	conn               *textproto.Conn
+	conn               *nntpConn
 	currentJoinedGroup string
 	operationTimeout   time.Duration
+	drainTimeout       time.Duration
 }
 
-func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time.Duration) (Connection, error) {
-	conn := textproto.NewConn(netconn)
+func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout, drainTimeout time.Duration) (Connection, error) {
+	conn := newNNTPConn(netconn)
 
 	_, _, err := conn.ReadCodeLine(StatusReady)
 	if err != nil {
@@ -63,6 +135,7 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time
 				netconn:          netconn,
 				maxAgeTime:       maxAgeTime,
 				operationTimeout: operationTimeout,
+				drainTimeout:     drainTimeout,
 			}, nil
 		}
 
@@ -76,6 +149,7 @@ func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time
 		netconn:          netconn,
 		maxAgeTime:       maxAgeTime,
 		operationTimeout: operationTimeout,
+		drainTimeout:     drainTimeout,
 	}, nil
 }
 
@@ -157,7 +231,7 @@ func (c *connection) Ping() (err error) {
 		}
 	}()
 
-	_, _, err = c.sendCmd(StatusReady, "DATE")
+	_, _, err = c.sendCmd(StatusDate, "DATE")
 	if err != nil {
 		return fmt.Errorf("DATE: %w", err)
 	}
@@ -234,7 +308,10 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		}
 	}()
 
+	debugLog("BodyDecoded: starting msgID=<%s> discard=%d", msgID, discard)
+
 	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
+		debugLog("BodyDecoded: set deadline error: %v", err)
 		return 0, fmt.Errorf("set deadline: %w", err)
 	}
 	defer func() {
@@ -245,6 +322,7 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 
 	id, err := c.conn.Cmd("BODY <%s>", msgID)
 	if err != nil {
+		debugLog("BodyDecoded: BODY command error: %v", err)
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
 	}
 
@@ -253,34 +331,48 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 
 	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
 	if err != nil {
+		debugLog("BodyDecoded: ReadCodeLine error: %v", err)
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, err)
 	}
 
-	dec := rapidyenc.AcquireDecoder(c.conn.R)
-	defer rapidyenc.ReleaseDecoder(dec)
+	debugLog("BodyDecoded: got 222 response, creating decoder")
+	dec := newIncrementalDecoder(c.conn.Reader())
 
-	// Discard the first n lines
+	// Discard the first n bytes if requested
 	if discard > 0 {
-		if _, err = io.CopyN(io.Discard, dec, discard); err != nil {
-			// Attempt to drain the decoder to avoid connection issues
-			if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-				return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w (drain also failed: %v)", msgID, discard, err, drainErr)
+		debugLog("BodyDecoded: starting discard of %d bytes", discard)
+		discarded, discardErr := io.CopyN(io.Discard, dec, discard)
+		debugLog("BodyDecoded: discard result: discarded=%d err=%v", discarded, discardErr)
+		if discardErr != nil {
+			// Set drain timeout before draining to prevent indefinite blocking
+			if c.drainTimeout > 0 {
+				_ = c.netconn.SetDeadline(time.Now().Add(c.drainTimeout))
 			}
-
-			return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", msgID, discard, err)
+			// Attempt to drain the decoder to avoid connection issues
+			debugLog("BodyDecoded: draining decoder after discard error")
+			drained, drainErr := io.Copy(io.Discard, dec)
+			debugLog("BodyDecoded: drain result: drained=%d err=%v", drained, drainErr)
+			return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", msgID, discard, discardErr)
 		}
+		debugLog("BodyDecoded: discard completed successfully")
 	}
 
+	debugLog("BodyDecoded: starting main copy")
 	n, err = io.Copy(w, dec)
+	debugLog("BodyDecoded: copy result: n=%d err=%v", n, err)
 	if err != nil {
-		// Attempt to drain the decoder to avoid connection issues
-		if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-			return n, fmt.Errorf("BODY <%s>: copy failed: %w (drain also failed: %v)", msgID, err, drainErr)
+		// Set drain timeout before draining to prevent indefinite blocking
+		if c.drainTimeout > 0 {
+			_ = c.netconn.SetDeadline(time.Now().Add(c.drainTimeout))
 		}
-
+		// Attempt to drain the decoder to avoid connection issues
+		debugLog("BodyDecoded: draining decoder after copy error")
+		drained, drainErr := io.Copy(io.Discard, dec)
+		debugLog("BodyDecoded: drain result: drained=%d err=%v", drained, drainErr)
 		return n, fmt.Errorf("BODY <%s>: copy failed: %w", msgID, err)
 	}
 
+	debugLog("BodyDecoded: completed successfully, total bytes=%d", n)
 	return n, nil
 }
 
@@ -318,13 +410,28 @@ func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err err
 		return nil, fmt.Errorf("clear deadline: %w", err)
 	}
 
-	dec := rapidyenc.AcquireDecoder(c.conn.R)
+	dec := rapidyenc.NewDecoder(c.conn.Reader())
+
+	// Initialize decoder with a read (new rapidyenc requires this)
+	initBuf := make([]byte, 4096)
+	initN, initErr := dec.Read(initBuf)
+	var buffer *bytes.Buffer
+	if initN > 0 {
+		buffer = bytes.NewBuffer(initBuf[:initN])
+	}
+	if initErr != nil && initErr != io.EOF {
+		_, _ = io.Copy(io.Discard, dec)
+		c.conn.EndResponse(id)
+		return nil, fmt.Errorf("BODY <%s>: decoder initialization failed: %w", msgID, initErr)
+	}
 
 	return &articleBodyReader{
-		decoder:    dec,
-		conn:       c,
-		responseID: id,
-		closed:     false,
+		decoder:      dec,
+		conn:         c,
+		responseID:   id,
+		buffer:       buffer,
+		closed:       false,
+		drainTimeout: c.drainTimeout,
 	}, nil
 }
 

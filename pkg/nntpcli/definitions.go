@@ -9,8 +9,11 @@ import (
 
 // NNTP response codes as defined in RFC 3977
 const (
+	// 1xx - Informational
+	StatusDate = 111 // Date response (DATE command)
+
 	// 2xx - Positive Completion
-	StatusReady                = 200 // Service available, posting allowed
+	StatusReady = 200 // Service available, posting allowed
 	StatusReadyNoPosting       = 201 // Service available, posting prohibited
 	StatusQuit                 = 205 // Connection closing
 	StatusGroupSelected        = 211 // Group selected

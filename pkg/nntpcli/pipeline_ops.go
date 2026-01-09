@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 	"time"
-
-	"github.com/mnightingale/rapidyenc"
 )
 
 // PipelineRequest represents a single body request in a pipeline.
@@ -34,7 +32,7 @@ type PipelineResult struct {
 // This method sends all BODY commands before reading any responses, which can significantly
 // improve throughput on high-latency connections.
 //
-// The method uses the textproto.Conn's native pipelining support via Cmd(), StartResponse(),
+// The method uses the nntpConn's pipelining support via Cmd(), StartResponse(),
 // and EndResponse() to properly sequence the requests and responses.
 //
 // If requests is empty, returns an empty slice.
@@ -125,15 +123,14 @@ func (c *connection) BodyPipelined(requests []PipelineRequest) (results []Pipeli
 			continue
 		}
 
-		// Decode body with rapidyenc
-		dec := rapidyenc.AcquireDecoder(c.conn.R)
+		// Decode body with incremental decoder
+		dec := newIncrementalDecoder(c.conn.Reader())
 
 		// Discard the first n bytes if requested
 		if req.Discard > 0 {
 			if _, discardErr := io.CopyN(io.Discard, dec, req.Discard); discardErr != nil {
 				// Attempt to drain the decoder to avoid connection issues
 				_, _ = io.Copy(io.Discard, dec)
-				rapidyenc.ReleaseDecoder(dec)
 				c.conn.EndResponse(ids[i])
 				results[i].Error = fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", req.MessageID, req.Discard, discardErr)
 				continue
@@ -145,14 +142,12 @@ func (c *connection) BodyPipelined(requests []PipelineRequest) (results []Pipeli
 		if copyErr != nil {
 			// Attempt to drain the decoder to avoid connection issues
 			_, _ = io.Copy(io.Discard, dec)
-			rapidyenc.ReleaseDecoder(dec)
 			c.conn.EndResponse(ids[i])
 			results[i].BytesWritten = n
 			results[i].Error = fmt.Errorf("BODY <%s>: copy failed: %w", req.MessageID, copyErr)
 			continue
 		}
 
-		rapidyenc.ReleaseDecoder(dec)
 		c.conn.EndResponse(ids[i])
 
 		results[i].BytesWritten = n
