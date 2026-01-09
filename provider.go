@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/puddle/v2"
+	"github.com/yudhasubki/netpool"
 )
 
 // ProviderState represents the lifecycle state of a provider during configuration changes
@@ -63,7 +63,7 @@ func (p ProviderInfo) ID() string {
 }
 
 type providerPool struct {
-	connectionPool        *puddle.Pool[*internalConnection]
+	connectionPool        netpool.Netpooler
 	provider              UsenetProviderConfig
 	state                 ProviderState
 	stateMu               sync.RWMutex // Protects state changes

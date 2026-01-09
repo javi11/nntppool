@@ -3,11 +3,15 @@ package nntppool
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
-	"github.com/jackc/puddle/v2"
+	"github.com/javi11/nntppool/v2/internal/netconn"
+	"github.com/yudhasubki/netpool"
 )
+
+var _ net.Conn = (*mockNetConn)(nil) // ensure mockNetConn implements net.Conn
 
 func TestProviderStateString(t *testing.T) {
 	tests := []struct {
@@ -186,38 +190,42 @@ func TestProviderIDFunction(t *testing.T) {
 	}
 }
 
+// Note: mockNetConn is defined in helpers_test.go
+
 func TestProviderPoolIntegration(t *testing.T) {
-	// Create a provider pool with actual puddle pool for integration testing
+	// Create a provider pool with actual netpool for integration testing
 	provider := UsenetProviderConfig{
 		Host:           "test.example.com",
 		Username:       "testuser",
 		MaxConnections: 2,
 	}
 
-	// Create puddle pool with mock constructor
-	puddlePool, err := puddle.NewPool(&puddle.Config[*internalConnection]{
-		Constructor: func(ctx context.Context) (*internalConnection, error) {
-			return &internalConnection{
-				provider: provider,
-			}, nil
+	// Create netpool with mock constructor
+	netpoolInstance, err := netpool.New(
+		func(ctx context.Context) (net.Conn, error) {
+			// Return a wrapped mock connection
+			return netconn.NewNNTPConnWrapper(&mockNetConn{}, nil), nil
 		},
-		Destructor: func(value *internalConnection) {
-			// Mock destructor
+		netpool.Config{
+			MaxPool:     int32(provider.MaxConnections),
+			MinPool:     0,
+			DialTimeout: 5 * time.Second,
+			MaxIdleTime: 30 * time.Second,
 		},
-		MaxSize: int32(provider.MaxConnections),
-	})
+	)
 
 	if err != nil {
-		t.Fatalf("failed to create puddle pool: %v", err)
+		t.Fatalf("failed to create netpool: %v", err)
 	}
+	defer netpoolInstance.Close()
 
 	pool := &providerPool{
-		connectionPool: puddlePool,
+		connectionPool: netpoolInstance,
 		provider:       provider,
 		state:          ProviderStateActive,
 	}
 
-	// Test that we can work with the actual puddle pool
+	// Test that we can work with the actual netpool
 	if !pool.IsAcceptingConnections() {
 		t.Error("new provider pool should accept connections")
 	}
@@ -226,9 +234,6 @@ func TestProviderPoolIntegration(t *testing.T) {
 	if pool.IsAcceptingConnections() {
 		t.Error("offline provider pool should not accept connections")
 	}
-
-	// Clean up
-	puddlePool.Close()
 }
 
 // Test new provider connection tracking methods

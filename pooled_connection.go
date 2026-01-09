@@ -5,16 +5,12 @@ package nntppool
 
 import (
 	"fmt"
-	"time"
+	"net"
 
-	"github.com/jackc/puddle/v2"
+	"github.com/javi11/nntppool/v2/internal/netconn"
 	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/yudhasubki/netpool"
 )
-
-type internalConnection struct {
-	nntp     nntpcli.Connection   // 8 bytes
-	provider UsenetProviderConfig // 128 bytes
-}
 
 var _ PooledConnection = (*pooledConnection)(nil)
 
@@ -25,53 +21,71 @@ type PooledConnection interface {
 	Close() error
 	Free() error
 	Provider() ConnectionProviderInfo
-	CreatedAt() time.Time
 }
 
 type pooledConnection struct {
-	resource *puddle.Resource[*internalConnection]
+	conn     net.Conn
+	nntpConn nntpcli.Connection
+	provider UsenetProviderConfig
+	pool     netpool.Netpooler
 	log      Logger
 	metrics  *PoolMetrics
 }
 
 // newPooledConnection creates a new pooled connection.
-// The connection wraps a puddle resource and provides automatic
+// The connection wraps a net.Conn managed by netpool and provides automatic
 // release/destroy functionality with metrics tracking.
-func newPooledConnection(resource *puddle.Resource[*internalConnection], log Logger, metrics *PoolMetrics) pooledConnection {
+func newPooledConnection(
+	conn net.Conn,
+	provider UsenetProviderConfig,
+	pool netpool.Netpooler,
+	log Logger,
+	metrics *PoolMetrics,
+) pooledConnection {
+	// Extract NNTP connection from wrapper
+	var nntpConn nntpcli.Connection
+	if wrapper, ok := conn.(*netconn.NNTPConnWrapper); ok {
+		nntpConn = wrapper.NNTPConnection()
+	}
+
 	return pooledConnection{
-		resource: resource,
+		conn:     conn,
+		nntpConn: nntpConn,
+		provider: provider,
+		pool:     pool,
 		log:      log,
 		metrics:  metrics,
 	}
 }
 
-// connectionID returns a unique identifier for this connection based on its resource pointer.
+// connectionID returns a unique identifier for this connection based on its pointer.
 // This provides a stable ID for metrics tracking without storing extra state.
 func (p pooledConnection) connectionID() string {
-	return fmt.Sprintf("%p", p.resource)
+	return fmt.Sprintf("%p", p.conn)
 }
 
 // Close destroys the connection and removes it from the pool.
 // This method should be used when the connection is known to be in a bad state
-// and should not be reused. puddle will handle double-destroy panics.
+// and should not be reused.
 func (p pooledConnection) Close() error {
 	if p.metrics != nil {
 		p.metrics.UnregisterActiveConnection(p.connectionID())
 		p.metrics.RecordConnectionDestroyed()
 	}
-	p.resource.Destroy()
+	// Use PutWithError to signal netpool to close the connection
+	p.pool.PutWithError(p.conn, fmt.Errorf("connection closed due to error"))
 	return nil
 }
 
 // Free returns the connection to the pool for reuse.
 // This method should be called when you're done using the connection but
-// it's still in a good state. puddle will handle double-release panics.
+// it's still in a good state.
 func (p pooledConnection) Free() error {
 	if p.metrics != nil {
 		p.metrics.UnregisterActiveConnection(p.connectionID())
 		p.metrics.RecordRelease()
 	}
-	p.resource.Release()
+	p.pool.Put(p.conn)
 	return nil
 }
 
@@ -80,32 +94,17 @@ func (p pooledConnection) Free() error {
 // NNTP operations. The returned connection should not be stored separately
 // from the PooledConnection.
 func (p pooledConnection) Connection() nntpcli.Connection {
-	return p.resource.Value().nntp
-}
-
-// Raw returns the underlying resource from the connection pool.
-// This method provides access to the underlying resource from the connection pool.
-func (p pooledConnection) Raw() *puddle.Resource[*internalConnection] {
-	return p.resource
-}
-
-// CreatedAt returns the time when the connection was created.
-// This method provides information about when the connection was created.
-func (p pooledConnection) CreatedAt() time.Time {
-	return p.resource.CreationTime()
+	return p.nntpConn
 }
 
 // Provider returns the provider information associated with the connection.
 // This method provides information about the provider that created the connection.
 func (p pooledConnection) Provider() ConnectionProviderInfo {
-	prov := p.resource.Value().provider
-
 	return ConnectionProviderInfo{
-		Host:           prov.Host,
-		Username:       prov.Username,
-		MaxConnections: prov.MaxConnections,
-		PipelineDepth:  prov.PipelineDepth,
+		Host:           p.provider.Host,
+		Username:       p.provider.Username,
+		MaxConnections: p.provider.MaxConnections,
+		PipelineDepth:  p.provider.PipelineDepth,
 		State:          ProviderStateActive, // Default state, actual state managed by pool
 	}
 }
-

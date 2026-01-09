@@ -38,6 +38,9 @@ type Connection interface {
 	MaxAgeTime() time.Time
 	Stat(msgID string) (int, error)
 	Capabilities() ([]string, error)
+	// NetConn returns the underlying network connection.
+	// This is needed for netpool integration to manage the connection lifecycle.
+	NetConn() net.Conn
 }
 
 var _ Connection = (*connection)(nil)
@@ -438,6 +441,11 @@ func (c *connection) MaxAgeTime() (maxAge time.Time) {
 	}()
 
 	return c.maxAgeTime
+}
+
+// NetConn returns the underlying network connection.
+func (c *connection) NetConn() net.Conn {
+	return c.netconn
 }
 
 // Capabilities returns a list of features this server performs.

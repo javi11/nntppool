@@ -5,10 +5,10 @@ go 1.25.1
 require (
 	github.com/avast/retry-go/v4 v4.6.1
 	github.com/hashicorp/go-multierror v1.1.1
-	github.com/jackc/puddle/v2 v2.2.2
 	github.com/javi11/nntp-server-mock v0.0.1
 	github.com/mnightingale/rapidyenc v0.0.0-20250628164132-aaf36ba945ef
 	github.com/stretchr/testify v1.10.0
+	github.com/yudhasubki/netpool v0.5.0
 	go.uber.org/mock v0.5.2
 	golang.org/x/net v0.48.0
 	golang.org/x/text v0.32.0

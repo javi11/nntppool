@@ -7,14 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/textproto"
+	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/avast/retry-go/v4"
-	"github.com/jackc/puddle/v2"
+	"github.com/javi11/nntppool/v2/internal/netconn"
 	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 )
 
@@ -83,18 +83,17 @@ type UsenetConnectionPool interface {
 }
 
 type connectionPool struct {
-	closeChan               chan struct{}
-	connPoolsMu             sync.RWMutex // Protects connPools access
-	connPools               []*providerPool
-	log                     Logger
-	config                  Config
-	wg                      sync.WaitGroup
-	shutdownOnce            sync.Once    // Ensures single shutdown
-	isShutdown              int32        // Atomic flag for shutdown state
-	metrics                 *PoolMetrics // High-performance metrics collection
-	providerHealthCheckIdx  int          // Index for round-robin provider health checks
-	lastProviderHealthCheck time.Time    // Last time provider health check was performed
-	providerHealthCheckMu   sync.Mutex   // Protects provider health check state
+	closeChan    chan struct{}
+	connPoolsMu  sync.RWMutex // Protects connPools access
+	connPools    []*providerPool
+	log          Logger
+	config       Config
+	wg           sync.WaitGroup
+	shutdownOnce sync.Once    // Ensures single shutdown
+	isShutdown   int32        // Atomic flag for shutdown state
+	metrics      *PoolMetrics // High-performance metrics collection
+	// Note: providerHealthCheckIdx, lastProviderHealthCheck, providerHealthCheckMu were
+	// removed as netpool handles connection health automatically via HealthCheck callback
 }
 
 func NewConnectionPool(c ...Config) (UsenetConnectionPool, error) {
@@ -200,8 +199,8 @@ func (p *connectionPool) Quit() {
 				hasActiveConnections := false
 				for _, pool := range pools {
 					if pool != nil && pool.connectionPool != nil {
-						stats := pool.connectionPool.Stat()
-						if stats.AcquiredResources() > 0 {
+						stats := pool.connectionPool.Stats()
+						if stats.InUse > 0 {
 							hasActiveConnections = true
 							break
 						}
@@ -331,7 +330,7 @@ func (p *connectionPool) GetConnection(
 	start := time.Now()
 	p.metrics.RecordAcquire()
 
-	conn, err := p.getConnection(ctx, cp, 0)
+	conn, pool, err := p.getConnection(ctx, cp, 0)
 	if err != nil {
 		p.metrics.RecordError("")
 		return nil, err
@@ -340,12 +339,12 @@ func (p *connectionPool) GetConnection(
 	// Record successful acquire timing
 	p.metrics.RecordAcquireWaitTime(time.Since(start))
 
-	// Create pooled connection with unique ID
-	pooledConn := newPooledConnection(conn, p.log, p.metrics)
+	// Create pooled connection with provider info and pool reference
+	pooledConn := newPooledConnection(conn, pool.provider, pool.connectionPool, p.log, p.metrics)
 
 	// Register the connection as active for metrics tracking
-	if conn.Value().nntp != nil {
-		p.metrics.RegisterActiveConnection(pooledConn.connectionID(), conn.Value().nntp)
+	if wrapper, ok := conn.(*netconn.NNTPConnWrapper); ok {
+		p.metrics.RegisterActiveConnection(pooledConn.connectionID(), wrapper.NNTPConnection())
 	}
 
 	return pooledConn, nil
@@ -364,7 +363,7 @@ func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
 			Host:                  pool.provider.Host,
 			Username:              pool.provider.Username,
 			MaxConnections:        pool.provider.MaxConnections,
-			UsedConnections:       int(pool.connectionPool.Stat().TotalResources()),
+			UsedConnections:       pool.connectionPool.Stats().Active,
 			State:                 pool.GetState(),
 			LastConnectionAttempt: lastAttempt,
 			LastSuccessfulConnect: lastSuccess,
@@ -398,7 +397,7 @@ func (p *connectionPool) GetProviderStatus(providerID string) (*ProviderInfo, bo
 				Host:                  pool.provider.Host,
 				Username:              pool.provider.Username,
 				MaxConnections:        pool.provider.MaxConnections,
-				UsedConnections:       int(pool.connectionPool.Stat().TotalResources()),
+				UsedConnections:       pool.connectionPool.Stats().Active,
 				State:                 pool.GetState(),
 				LastConnectionAttempt: lastAttempt,
 				LastSuccessfulConnect: lastSuccess,
@@ -846,15 +845,18 @@ func (p *connectionPool) TestProviderPipelineSupport(
 	}
 
 	// Acquire a connection from this specific provider
-	resource, err := targetPool.connectionPool.Acquire(ctx)
+	conn, err := targetPool.connectionPool.GetWithContext(ctx)
 	if err != nil {
 		return false, 0, fmt.Errorf("failed to acquire connection from %s: %w", providerHost, err)
 	}
-	defer resource.Release()
+	defer targetPool.connectionPool.Put(conn)
 
-	// Get the connection and test pipelining
-	nntpConn := resource.Value().nntp
-	return nntpConn.TestPipelineSupport(testMsgID)
+	// Get the NNTP connection from wrapper and test pipelining
+	wrapper, ok := conn.(*netconn.NNTPConnWrapper)
+	if !ok {
+		return false, 0, fmt.Errorf("invalid connection type for provider %s", providerHost)
+	}
+	return wrapper.NNTPConnection().TestPipelineSupport(testMsgID)
 }
 
 // BodyReader retrieves the body reader of a message with the given message ID from the NNTP server.
@@ -1097,7 +1099,6 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 						"error", err,
 						"retry", n,
 						"error_connection_host", provider.Host,
-						"error_connection_created_at", conn.CreatedAt(),
 					)
 
 					_ = conn.Close()
@@ -1245,7 +1246,6 @@ func (p *connectionPool) Stat(
 						"error", err,
 						"retry", n,
 						"error_connection_host", provider.Host,
-						"error_connection_created_at", conn.CreatedAt(),
 					)
 
 					_ = conn.Close()
@@ -1314,30 +1314,27 @@ func (p *connectionPool) getConnection(
 	ctx context.Context,
 	cPool []*providerPool,
 	poolNumber int,
-) (*puddle.Resource[*internalConnection], error) {
+) (net.Conn, *providerPool, error) {
 	if poolNumber > len(cPool)-1 {
 		poolNumber = 0
-		pool := cPool[poolNumber]
-
-		conn, err := pool.connectionPool.Acquire(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		return conn, nil
 	}
 
 	pool := cPool[poolNumber]
-	if pool.connectionPool.Stat().AcquiredResources() == int32(pool.provider.MaxConnections) {
-		return p.getConnection(ctx, cPool, poolNumber+1)
+
+	// Check if pool is at capacity using Stats()
+	stats := pool.connectionPool.Stats()
+	if stats.InUse >= int(pool.provider.MaxConnections) {
+		if poolNumber < len(cPool)-1 {
+			return p.getConnection(ctx, cPool, poolNumber+1)
+		}
 	}
 
-	conn, err := pool.connectionPool.Acquire(ctx)
+	conn, err := pool.connectionPool.GetWithContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return conn, nil
+	return conn, pool, nil
 }
 
 func (p *connectionPool) connectionHealCheck(healthCheckInterval time.Duration) {
@@ -1364,80 +1361,17 @@ func (p *connectionPool) connectionHealCheck(healthCheckInterval time.Duration) 
 }
 
 func (p *connectionPool) checkHealth(ctx context.Context) {
-	// First, perform proactive provider health checks if enabled
-	providersToCheck := p.getProvidersToHealthCheck()
-	if len(providersToCheck) > 0 {
-		p.checkProviderHealth(ctx, providersToCheck)
-	}
+	// Note: Provider and connection health checks are now handled by netpool's
+	// built-in HealthCheck callback and MaxIdleTime configuration.
+	// This routine now only maintains minimum connections.
 
-	// Get current time once for the entire check cycle to avoid repeated time.Now() calls
-	now := time.Now()
-
-	// Then perform the existing connection pool health checks
-	// Limit iterations to prevent excessive CPU usage during high churn
-	const maxIterations = 3
-	for i := 0; i < maxIterations; i++ {
-		// If checkMinConns failed we don't destroy any connections since we couldn't
-		// even get to minConns
-		if err := p.checkMinConns(ctx); err != nil {
-			p.log.Debug("Failed to maintain minimum connections", "error", err)
-			break
-		}
-
-		if !p.checkConnsHealthWithTime(now) {
-			// Since we didn't destroy any connections we can stop looping
-			break
-		}
-
-		// Technically Destroy is asynchronous but 500ms should be enough for it to
-		// remove it from the underlying pool
-		select {
-		case <-ctx.Done():
-			return
-		case <-p.closeChan:
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
-
-		// Update time for next iteration
-		now = time.Now()
+	if err := p.checkMinConns(ctx); err != nil {
+		p.log.Debug("Failed to maintain minimum connections", "error", err)
 	}
 }
 
-func (p *connectionPool) checkConnsHealth() bool {
-	return p.checkConnsHealthWithTime(time.Now())
-}
-
-// checkConnsHealthWithTime checks connection health using a pre-computed timestamp
-// to avoid repeated time.Now() calls when checking multiple connections.
-func (p *connectionPool) checkConnsHealthWithTime(now time.Time) bool {
-	var destroyed bool
-
-	p.connPoolsMu.RLock()
-	pools := p.connPools
-	p.connPoolsMu.RUnlock()
-
-	// Pre-allocate with estimated capacity to reduce allocations
-	idle := make([]*puddle.Resource[*internalConnection], 0, len(pools)*4)
-
-	for _, pool := range pools {
-		idle = append(idle, pool.connectionPool.AcquireAllIdle()...)
-	}
-
-	for _, res := range idle {
-		providerTimeout := time.Duration(res.Value().provider.MaxConnectionIdleTimeInSeconds) * time.Second
-
-		if p.isExpiredAt(res, now) || res.IdleDuration() > providerTimeout {
-			res.Destroy()
-
-			destroyed = true
-		} else {
-			res.ReleaseUnused()
-		}
-	}
-
-	return destroyed
-}
+// Note: checkConnsHealth and checkConnsHealthWithTime were removed as netpool handles
+// connection health automatically via HealthCheck callback and MaxIdleTime configuration.
 
 func (p *connectionPool) createIdleResources(ctx context.Context, toCreate int) error {
 	for i := 0; i < toCreate; i++ {
@@ -1460,7 +1394,7 @@ func (p *connectionPool) checkMinConns(ctx context.Context) error {
 	// off this check
 	totalConns := 0
 	for _, pool := range p.connPools {
-		totalConns += int(pool.connectionPool.Stat().TotalResources())
+		totalConns += int(pool.connectionPool.Stats().Active)
 	}
 
 	toCreate := p.config.MinConnections - totalConns
@@ -1471,15 +1405,7 @@ func (p *connectionPool) checkMinConns(ctx context.Context) error {
 	return nil
 }
 
-func (p *connectionPool) isExpired(res *puddle.Resource[*internalConnection]) bool {
-	return p.isExpiredAt(res, time.Now())
-}
-
-// isExpiredAt checks if a connection is expired at a given time.
-// Use this in batch operations to avoid repeated time.Now() calls.
-func (p *connectionPool) isExpiredAt(res *puddle.Resource[*internalConnection], now time.Time) bool {
-	return now.After(res.Value().nntp.MaxAgeTime())
-}
+// Note: isExpired and isExpiredAt were removed as netpool handles TTL via MaxIdleTime configuration.
 
 // isConnectionExpiredError checks if the error is likely due to an expired/stale connection
 func isConnectionExpiredError(err error) bool {
@@ -1574,20 +1500,25 @@ func (p *connectionPool) attemptProviderReconnection(ctx context.Context, pool *
 	defer cancel()
 
 	// Try to acquire a connection to test connectivity
-	c, err := pool.connectionPool.Acquire(reconCtx)
+	c, err := pool.connectionPool.GetWithContext(reconCtx)
 	if err != nil {
 		p.handleReconnectionFailure(pool, err)
 		return
 	}
 
-	defer c.Release()
+	defer pool.connectionPool.Put(c)
 
-	// Test the connection by getting capabilities
-	conn := c.Value()
+	// Extract the NNTP connection from the wrapper
+	wrapper, ok := c.(*netconn.NNTPConnWrapper)
+	if !ok {
+		p.handleReconnectionFailure(pool, fmt.Errorf("invalid connection type for provider %s", pool.provider.Host))
+		return
+	}
+	nntpConn := wrapper.NNTPConnection()
 
 	// Verify capabilities if needed
 	if len(pool.provider.VerifyCapabilities) > 0 {
-		caps, err := conn.nntp.Capabilities()
+		caps, err := nntpConn.Capabilities()
 		if err != nil {
 			p.handleReconnectionFailure(pool, err)
 			return
@@ -1643,36 +1574,25 @@ func (p *connectionPool) handleReconnectionFailure(pool *providerPool, err error
 		pool.provider.Host, retryCount, err, nextDelay))
 }
 
-// dropAllProviderConnections drops all connections (both idle and active) from a provider pool
+// dropAllProviderConnections logs the drop action for an offline provider
+// Note: netpool handles connection cleanup automatically via HealthCheck and MaxIdleTime.
+// Active connections will fail health checks and be closed when returned to the pool.
 func (p *connectionPool) dropAllProviderConnections(pool *providerPool) {
 	if pool == nil || pool.connectionPool == nil {
 		return
 	}
 
+	// Get current stats
+	stats := pool.connectionPool.Stats()
+	initialTotal := int(stats.Active)
+	initialInUse := int(stats.InUse)
+	initialIdle := initialTotal - initialInUse
+
 	// Log the drop action
-	p.log.Info(fmt.Sprintf("dropping all connections for offline provider %s", pool.provider.Host))
-
-	// Get current stats before dropping connections
-	initialTotal := int(pool.connectionPool.Stat().TotalResources())
-	initialAcquired := int(pool.connectionPool.Stat().AcquiredResources())
-
-	// Acquire all idle connections and destroy them safely
-	idle := pool.connectionPool.AcquireAllIdle()
-	destroyedIdle := 0
-	for _, res := range idle {
-		// Only destroy if the resource is still valid
-		if res != nil && res.Value() != nil {
-			res.Destroy()
-			destroyedIdle++
-		}
-	}
-
-	// For active connections, we can't forcibly destroy them as they're in use,
-	// but they will be closed when returned to the pool since provider is offline
-	activeConnections := initialAcquired
-
-	p.log.Info(fmt.Sprintf("dropped connections for offline provider %s: %d idle destroyed, %d active (total was %d)",
-		pool.provider.Host, destroyedIdle, activeConnections, initialTotal))
+	// Netpool's HealthCheck will handle closing stale/failed connections
+	// when they are returned to the pool or during idle time checks
+	p.log.Info(fmt.Sprintf("provider %s marked offline: %d total connections (%d idle, %d in-use) will be recycled via health checks",
+		pool.provider.Host, initialTotal, initialIdle, initialInUse))
 }
 
 // calculateBackoffDelay calculates exponential backoff delay with a maximum cap
@@ -1693,258 +1613,8 @@ func (p *connectionPool) calculateBackoffDelay(retryCount int) time.Duration {
 	return delay
 }
 
-// performLightweightProviderCheck performs a connectivity test to a provider using the connection pool
-// to respect connection limits and prevent exceeding provider quotas
-func (p *connectionPool) performLightweightProviderCheck(ctx context.Context, pool *providerPool) error {
-	const maxRealErrors = 2 // Allow 3 total real error attempts (0, 1, 2)
-
-	safetyLimit := pool.provider.MaxConnections * 2
-
-	realErrorAttempts := 0
-	expiredConnectionsDestroyed := 0
-
-	// Loop until we succeed, hit real error limit, or exceed safety limit for expired connections
-	for expiredConnectionsDestroyed < safetyLimit {
-		// Create a timeout context for this specific check
-		checkCtx, cancel := context.WithTimeout(ctx, p.config.ProviderHealthCheckTimeout)
-
-		// Try to acquire a connection from the pool to respect connection limits
-		c, err := pool.connectionPool.Acquire(checkCtx)
-		if err != nil {
-			cancel()
-			// If we can't acquire a connection, it could mean:
-			// 1. Provider is offline/unreachable
-			// 2. Provider is at max connections (busy but healthy)
-			// 3. Pool creation failed
-
-			// Check if this is a timeout/context error (likely busy)
-			if checkCtx.Err() == context.DeadlineExceeded {
-				// Provider is likely busy but healthy - treat as success
-				p.log.Debug(fmt.Sprintf("provider %s health check timeout - treating as busy but healthy", pool.provider.Host))
-				return nil
-			}
-
-			// This is a real acquisition error
-			realErrorAttempts++
-			if realErrorAttempts > maxRealErrors {
-				return fmt.Errorf("failed to acquire connection for provider %s after %d attempts: %w", pool.provider.Host, realErrorAttempts, err)
-			}
-			// Try again - don't increment expired counter, this is a real error
-			continue
-		}
-
-		// Get the underlying connection
-		conn := c.Value()
-		if conn == nil || conn.nntp == nil {
-			c.ReleaseUnused()
-			cancel()
-
-			// This is a real error - invalid connection
-			realErrorAttempts++
-			if realErrorAttempts > maxRealErrors {
-				return fmt.Errorf("provider %s has invalid connection after %d attempts", pool.provider.Host, realErrorAttempts)
-			}
-			continue
-		}
-
-		// Check if connection is expired before using it
-		// Expired connections are normal lifecycle events, not health failures
-		if p.isExpired(c) {
-			expiredConnectionsDestroyed++
-			c.Destroy() // Destroy expired connection instead of releasing
-			cancel()
-			// Don't count expired connections as failures - they're normal lifecycle
-			// Continue immediately to try again without incrementing realErrorAttempts
-			continue
-		}
-
-		// Test basic NNTP command to ensure the server is responsive
-		err = conn.nntp.Ping()
-		if err != nil {
-			// If is not a textproto.Error, it could be a connection issue
-			var nntpErr *textproto.Error
-			if ok := errors.As(err, &nntpErr); !ok {
-				// Check if this error is likely due to connection expiry/staleness
-				if isConnectionExpiredError(err) {
-					expiredConnectionsDestroyed++
-					p.log.Debug(fmt.Sprintf("provider %s health check failed with retryable error (destroyed %d expired): %v, destroying connection and retrying",
-						pool.provider.Host, expiredConnectionsDestroyed, err))
-					c.Destroy() // Destroy the bad connection
-					cancel()
-					// Don't count expired connection errors as failures
-					// Continue immediately to try again without incrementing realErrorAttempts
-					continue
-				}
-
-				// This is a real connectivity error
-				c.ReleaseUnused()
-				cancel()
-
-				realErrorAttempts++
-				if realErrorAttempts > maxRealErrors {
-					return fmt.Errorf("ping failed for provider %s after %d attempts: %w", pool.provider.Host, realErrorAttempts, err)
-				}
-				continue
-			}
-		}
-
-		// Success! Clean up and return
-		c.ReleaseUnused()
-		cancel()
-
-		return nil
-	}
-
-	// If we get here, we exceeded the safety limit for expired connections
-	// This is a pathological case that shouldn't happen in normal operation
-	return fmt.Errorf("provider %s health check exceeded safety limit after destroying %d expired connections (real errors: %d)",
-		pool.provider.Host, expiredConnectionsDestroyed, realErrorAttempts)
-}
-
-// getProvidersToHealthCheck returns a list of providers that should be checked in this cycle
-// using round-robin staggered checking to distribute load
-func (p *connectionPool) getProvidersToHealthCheck() []*providerPool {
-	p.providerHealthCheckMu.Lock()
-	defer p.providerHealthCheckMu.Unlock()
-
-	p.connPoolsMu.RLock()
-	pools := p.connPools
-	p.connPoolsMu.RUnlock()
-
-	if len(pools) == 0 {
-		return nil
-	}
-
-	now := time.Now()
-
-	// Check if enough time has passed since last provider health check
-	if now.Sub(p.lastProviderHealthCheck) < p.config.ProviderHealthCheckStagger {
-		return nil
-	}
-
-	p.lastProviderHealthCheck = now
-
-	// Calculate how many providers to check per cycle to stagger over the health check interval
-	totalProviders := len(pools)
-	if totalProviders == 0 {
-		return nil
-	}
-
-	// Determine how many providers to check this cycle
-	// We want to check all providers over multiple cycles within the health check interval
-	checkInterval := p.config.HealthCheckInterval
-	staggerInterval := p.config.ProviderHealthCheckStagger
-	cyclesPerHealthCheck := checkInterval / staggerInterval
-
-	providersPerCycle := 1
-	if cyclesPerHealthCheck > 0 {
-		providersPerCycle = int(cyclesPerHealthCheck)
-		if totalProviders < providersPerCycle {
-			providersPerCycle = totalProviders
-		}
-	}
-
-	// Select providers using round-robin
-	var providersToCheck []*providerPool
-	for i := 0; i < providersPerCycle && len(providersToCheck) < totalProviders; i++ {
-		idx := (p.providerHealthCheckIdx + i) % totalProviders
-		pool := pools[idx]
-
-		// Only check active providers (offline/reconnecting providers are handled by reconnection worker)
-		state := pool.GetState()
-		if state == ProviderStateActive {
-			providersToCheck = append(providersToCheck, pool)
-		}
-	}
-
-	// Advance the index for next cycle
-	p.providerHealthCheckIdx = (p.providerHealthCheckIdx + providersPerCycle) % totalProviders
-
-	return providersToCheck
-}
-
-// checkProviderHealth performs proactive health checking on selected providers
-func (p *connectionPool) checkProviderHealth(ctx context.Context, providersToCheck []*providerPool) {
-	if len(providersToCheck) == 0 {
-		return
-	}
-
-	for _, pool := range providersToCheck {
-		select {
-		case <-ctx.Done():
-			return
-		case <-p.closeChan:
-			return
-		default:
-		}
-
-		// Skip authentication failed providers
-		state := pool.GetState()
-		if state == ProviderStateAuthenticationFailed {
-			continue
-		}
-
-		p.performProviderHealthCheck(ctx, pool)
-	}
-}
-
-// performProviderHealthCheck checks a single provider's health and updates its state
-func (p *connectionPool) performProviderHealthCheck(ctx context.Context, pool *providerPool) {
-	currentState := pool.GetState()
-
-	err := p.performLightweightProviderCheck(ctx, pool)
-	if err != nil {
-		// Health check failed
-		p.handleProviderHealthCheckFailure(pool, err, currentState)
-	} else {
-		// Health check succeeded
-		p.handleProviderHealthCheckSuccess(pool, currentState)
-	}
-}
-
-// handleProviderHealthCheckFailure handles a failed provider health check
-func (p *connectionPool) handleProviderHealthCheckFailure(pool *providerPool, err error, currentState ProviderState) {
-	// Check if this is an authentication error
-	if isAuthenticationError(err) {
-		if currentState != ProviderStateAuthenticationFailed {
-			pool.SetState(ProviderStateAuthenticationFailed)
-			pool.SetConnectionAttempt(err)
-			p.log.Error(fmt.Sprintf("provider %s authentication failed during health check", pool.provider.Host))
-		}
-		return
-	}
-
-	// Mark as offline if it's currently active
-	if currentState == ProviderStateActive {
-		pool.SetState(ProviderStateOffline)
-		pool.SetConnectionAttempt(err)
-
-		// Drop all connections from the offline provider
-		p.dropAllProviderConnections(pool)
-
-		// Calculate backoff for reconnection system
-		_, _, _, _, retryCount := pool.GetConnectionStatus()
-		nextDelay := p.calculateBackoffDelay(retryCount)
-		pool.SetNextRetryAt(time.Now().Add(nextDelay))
-
-		p.log.Warn(fmt.Sprintf("provider %s marked as offline due to health check failure: %v", pool.provider.Host, err))
-	} else {
-		// Update failure tracking for offline providers
-		pool.SetConnectionAttempt(err)
-	}
-}
-
-// handleProviderHealthCheckSuccess handles a successful provider health check
-func (p *connectionPool) handleProviderHealthCheckSuccess(pool *providerPool, currentState ProviderState) {
-	// If provider was offline, mark it as active
-	switch currentState {
-	case ProviderStateOffline, ProviderStateReconnecting:
-		pool.SetState(ProviderStateActive)
-		pool.SetConnectionAttempt(nil) // Clear failure reason
-
-		p.log.Info(fmt.Sprintf("provider %s marked as active after successful health check", pool.provider.Host))
-	case ProviderStateActive:
-		// Update successful connection time for active providers
-		pool.SetConnectionAttempt(nil)
-	}
-}
+// Note: Provider health check functions (performLightweightProviderCheck, getProvidersToHealthCheck,
+// checkProviderHealth, performProviderHealthCheck, handleProviderHealthCheckFailure,
+// handleProviderHealthCheckSuccess) were removed as netpool handles connection health
+// automatically via the HealthCheck callback configured in getPools().
+// Provider state management is still handled by the reconnection system.

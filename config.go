@@ -50,9 +50,9 @@ type Config struct {
 	DefaultConnectionLease              time.Duration
 	ProviderReconnectInterval           time.Duration
 	ProviderMaxReconnectInterval        time.Duration
-	ProviderHealthCheckStagger          time.Duration
-	ProviderHealthCheckTimeout          time.Duration
 	NntpOperationTimeout                time.Duration
+	// Note: ProviderHealthCheckStagger and ProviderHealthCheckTimeout were removed
+	// as netpool handles connection health automatically via HealthCheck callback
 }
 
 // Adapter methods for internal package interfaces
@@ -141,8 +141,6 @@ var (
 		DefaultConnectionLease:       10 * time.Minute,
 		ProviderReconnectInterval:    30 * time.Second,
 		ProviderMaxReconnectInterval: 5 * time.Minute,
-		ProviderHealthCheckStagger:   10 * time.Second,
-		ProviderHealthCheckTimeout:   5 * time.Second,
 		NntpOperationTimeout:         30 * time.Second,
 	}
 	providerConfigDefault = UsenetProviderConfig{
@@ -203,15 +201,6 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.ProviderMaxReconnectInterval == 0 {
 		cfg.ProviderMaxReconnectInterval = configDefault.ProviderMaxReconnectInterval
-	}
-
-	// Provider health check options (use defaults if not set explicitly)
-	if cfg.ProviderHealthCheckStagger == 0 {
-		cfg.ProviderHealthCheckStagger = configDefault.ProviderHealthCheckStagger
-	}
-
-	if cfg.ProviderHealthCheckTimeout == 0 {
-		cfg.ProviderHealthCheckTimeout = configDefault.ProviderHealthCheckTimeout
 	}
 
 	if cfg.NntpOperationTimeout == 0 {

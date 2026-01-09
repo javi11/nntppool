@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
-	"github.com/jackc/puddle/v2"
+	"github.com/javi11/nntppool/v2/internal/netconn"
 	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/yudhasubki/netpool"
 	"golang.org/x/net/proxy"
 )
 
@@ -38,38 +39,39 @@ func getPools(
 	pSlice := make([]*providerPool, 0)
 
 	for _, provider := range p {
-		pools, err := puddle.NewPool(
-			&puddle.Config[*internalConnection]{
-				Constructor: func(ctx context.Context) (*internalConnection, error) {
-					nntpCon, err := dialNNTP(
-						ctx,
-						nttpCli,
-						provider,
-						log,
-					)
-					if err != nil {
-						return nil, err
-					}
+		providerCopy := provider // Capture for closure
 
-					// Record connection creation
-					if metrics != nil {
-						metrics.RecordConnectionCreated()
-					}
+		// Calculate idle timeout from config
+		maxIdleTime := time.Duration(providerCopy.MaxConnectionIdleTimeInSeconds) * time.Second
+		if maxIdleTime == 0 {
+			maxIdleTime = 40 * time.Minute // Default idle timeout
+		}
 
-					return &internalConnection{
-						nntp:     nntpCon,
-						provider: provider,
-					}, nil
-				},
-				Destructor: func(value *internalConnection) {
-					_ = value.nntp.Close()
+		pool, err := netpool.New(
+			func(ctx context.Context) (net.Conn, error) {
+				nntpCon, err := dialNNTP(ctx, nttpCli, providerCopy, log)
+				if err != nil {
+					return nil, err
+				}
 
-					// Record connection destruction
-					if metrics != nil {
-						metrics.RecordConnectionDestroyed()
-					}
-				},
-				MaxSize: int32(provider.MaxConnections),
+				// Record connection creation
+				if metrics != nil {
+					metrics.RecordConnectionCreated()
+				}
+
+				// Wrap the connection for netpool management
+				return netconn.NewNNTPConnWrapper(nntpCon.NetConn(), nntpCon), nil
+			},
+			netpool.Config{
+				MaxPool:     int32(providerCopy.MaxConnections),
+				MinPool:     0,
+				DialTimeout: 30 * time.Second,
+				MaxIdleTime: maxIdleTime,
+				// Note: HealthCheck is intentionally nil for performance.
+				// Running Ping() on every Get() adds significant latency.
+				// Bad connections are detected during NNTP operations and
+				// handled by the retry logic. Stale connections are handled
+				// by MaxIdleTime.
 			},
 		)
 		if err != nil {
@@ -77,8 +79,8 @@ func getPools(
 		}
 
 		pSlice = append(pSlice, &providerPool{
-			connectionPool: pools,
-			provider:       provider,
+			connectionPool: pool,
+			provider:       providerCopy,
 			state:          ProviderStateActive,
 		})
 	}
@@ -96,7 +98,7 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 	for _, pool := range pools {
 		poolCopy := pool // Capture the loop variable
 		wg.Go(func() error {
-			c, err := poolCopy.connectionPool.Acquire(ctx)
+			c, err := poolCopy.connectionPool.GetWithContext(ctx)
 			if err != nil {
 				log.Warn(fmt.Sprintf("failed to verify provider %s, marking as offline: %v", poolCopy.provider.Host, err))
 
@@ -114,11 +116,22 @@ func verifyProviders(pools []*providerPool, log Logger) error {
 				return nil
 			}
 
-			defer c.Release()
+			defer poolCopy.connectionPool.Put(c)
+
+			// Extract the NNTP connection from the wrapper
+			wrapper, ok := c.(*netconn.NNTPConnWrapper)
+			if !ok {
+				err := fmt.Errorf("invalid connection type for provider %s", poolCopy.provider.Host)
+				poolCopy.SetState(ProviderStateOffline)
+				poolCopy.SetConnectionAttempt(err)
+				offlineProviders = append(offlineProviders, poolCopy.provider.Host)
+				return nil
+			}
+
+			nntpConn := wrapper.NNTPConnection()
 
 			if len(poolCopy.provider.VerifyCapabilities) > 0 {
-				conn := c.Value()
-				caps, _ := conn.nntp.Capabilities()
+				caps, _ := nntpConn.Capabilities()
 
 				log.Info(fmt.Sprintf("capabilities for provider %s: %v", poolCopy.provider.Host, caps))
 

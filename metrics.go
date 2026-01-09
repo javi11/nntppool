@@ -195,7 +195,7 @@ func (m *PoolMetrics) GetSnapshot(pools []*providerPool) PoolMetricsSnapshot {
 		state := pool.GetState()
 		var activeConnections int
 		if pool.connectionPool != nil {
-			activeConnections = int(pool.connectionPool.Stat().AcquiredResources())
+			activeConnections = int(pool.connectionPool.Stats().InUse)
 		}
 
 		snapshot.ProviderMetrics[host] = ProviderMetricsSnapshot{
