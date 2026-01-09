@@ -1,161 +1,303 @@
 package nntppool
 
 import (
+	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/jackc/puddle/v2"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 )
 
-// ProviderState represents the lifecycle state of a provider during configuration changes
-type ProviderState int
-
-const (
-	ProviderStateActive               ProviderState = iota // Normal operation
-	ProviderStateOffline                                   // Provider is offline/unreachable
-	ProviderStateReconnecting                              // Currently attempting to reconnect
-	ProviderStateAuthenticationFailed                      // Authentication failed, won't retry
-)
-
-func (ps ProviderState) String() string {
-	switch ps {
-	case ProviderStateActive:
-		return "active"
-	case ProviderStateOffline:
-		return "offline"
-	case ProviderStateReconnecting:
-		return "reconnecting"
-	case ProviderStateAuthenticationFailed:
-		return "authentication_failed"
-	default:
-		return "unknown"
-	}
-}
-
-type ConnectionProviderInfo struct {
-	Host           string        `json:"host"`
-	Username       string        `json:"username"`
-	MaxConnections int           `json:"maxConnections"`
-	PipelineDepth  int           `json:"pipelineDepth"`
-	State          ProviderState `json:"state"`
-}
-
-func (p ConnectionProviderInfo) ID() string {
-	return providerID(p.Host, p.Username)
-}
-
-type ProviderInfo struct {
-	Host                  string        `json:"host"`
-	Username              string        `json:"username"`
-	UsedConnections       int           `json:"usedConnections"`
-	MaxConnections        int           `json:"maxConnections"`
-	State                 ProviderState `json:"state"`
-	LastConnectionAttempt time.Time     `json:"lastConnectionAttempt"`
-	LastSuccessfulConnect time.Time     `json:"lastSuccessfulConnect"`
-	FailureReason         string        `json:"failureReason"`
-	RetryCount            int           `json:"retryCount"`
-	NextRetryAt           time.Time     `json:"nextRetryAt"`
-}
-
-func (p ProviderInfo) ID() string {
-	return providerID(p.Host, p.Username)
-}
-
-type providerPool struct {
-	connectionPool        *puddle.Pool[*internalConnection]
-	provider              UsenetProviderConfig
-	state                 ProviderState
-	stateMu               sync.RWMutex // Protects state changes
-	lastConnectionAttempt time.Time    // Last time connection was attempted
-	lastSuccessfulConnect time.Time    // Last successful connection
-	failureReason         string       // Reason for last failure
-	retryCount            int          // Number of retry attempts
-	nextRetryAt           time.Time    // When next retry should happen
-}
-
-func providerID(host, username string) string {
-	return fmt.Sprintf("%s_%s", host, username)
-}
-
+// Provider wraps an nntpcli.Client with health tracking and metrics.
 type Provider struct {
-	Host                           string
-	Username                       string
-	Password                       string
-	Port                           int
-	MaxConnections                 int
-	MaxConnectionIdleTimeInSeconds int
-	IsBackupProvider               bool
+	config ProviderConfig
+	client *nntpcli.Client
+
+	// Health status - atomic for lock-free reads in hot path
+	healthy atomic.Bool
+
+	// Protected by mu - only for error tracking (not hot path)
+	mu        sync.RWMutex
+	lastError error
+	lastCheck time.Time
+
+	// Metrics
+	requestCount  atomic.Int64
+	errorCount    atomic.Int64
+	notFoundCount atomic.Int64
 }
 
-func (p *Provider) ID() string {
-	return p.Host
-}
+// NewProvider creates a new provider from the given configuration.
+func NewProvider(ctx context.Context, cfg ProviderConfig) (*Provider, error) {
+	cfg = cfg.WithDefaults()
 
-// Provider pool state management methods
-func (pp *providerPool) GetState() ProviderState {
-	pp.stateMu.RLock()
-	defer pp.stateMu.RUnlock()
-	return pp.state
-}
-
-func (pp *providerPool) SetState(state ProviderState) {
-	pp.stateMu.Lock()
-	defer pp.stateMu.Unlock()
-
-	oldState := pp.state
-	pp.state = state
-
-	// Reset retry scheduling when state changes
-	if oldState != state {
-		pp.nextRetryAt = time.Time{}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
-}
 
-func (pp *providerPool) IsAcceptingConnections() bool {
-	state := pp.GetState()
-	return state == ProviderStateActive
-}
+	// Create TLS config if needed
+	var tlsConfig *tls.Config
+	if cfg.TLS {
+		if cfg.TLSConfig != nil {
+			tlsConfig = cfg.TLSConfig.Clone()
+		} else {
+			tlsConfig = &tls.Config{
+				ServerName: cfg.Host,
+				MinVersion: tls.VersionTLS12,
+			}
+		}
+	}
 
-// SetConnectionAttempt records a connection attempt
-func (pp *providerPool) SetConnectionAttempt(err error) {
-	pp.stateMu.Lock()
-	defer pp.stateMu.Unlock()
+	// Create connection factory
+	addr := cfg.Address()
+	factory := func(_ context.Context) (net.Conn, error) {
+		if tlsConfig != nil {
+			return tls.Dial("tcp", addr, tlsConfig)
+		}
+		return net.Dial("tcp", addr)
+	}
 
-	pp.lastConnectionAttempt = time.Now()
+	// Create the underlying client with lazy connection support
+	client, err := nntpcli.NewClientLazy(ctx, nntpcli.ClientConfig{
+		MaxConnections:    cfg.MaxConnections,
+		InflightPerConn:   cfg.InflightPerConn,
+		Auth:              nntpcli.Auth{Username: cfg.Username, Password: cfg.Password},
+		Factory:           factory,
+		IdleTimeout:       cfg.IdleTimeout,
+		WarmupConnections: cfg.WarmupConnections,
+	})
 	if err != nil {
-		pp.failureReason = err.Error()
-		pp.retryCount++
-	} else {
-		pp.lastSuccessfulConnect = time.Now()
-		pp.failureReason = ""
-		pp.retryCount = 0
+		return nil, fmt.Errorf("failed to create client for %s: %w", cfg.Name, err)
+	}
+
+	p := &Provider{
+		config: cfg,
+		client: client,
+	}
+	p.healthy.Store(true)
+	return p, nil
+}
+
+// NewProviderWithConnFactory creates a new provider with a custom connection factory.
+func NewProviderWithConnFactory(ctx context.Context, cfg ProviderConfig, factory nntpcli.ConnFactory) (*Provider, error) {
+	cfg = cfg.WithDefaults()
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	client, err := nntpcli.NewClientLazy(ctx, nntpcli.ClientConfig{
+		MaxConnections:    cfg.MaxConnections,
+		InflightPerConn:   cfg.InflightPerConn,
+		Auth:              nntpcli.Auth{Username: cfg.Username, Password: cfg.Password},
+		Factory:           factory,
+		IdleTimeout:       cfg.IdleTimeout,
+		WarmupConnections: cfg.WarmupConnections,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client for %s: %w", cfg.Name, err)
+	}
+
+	p := &Provider{
+		config: cfg,
+		client: client,
+	}
+	p.healthy.Store(true)
+	return p, nil
+}
+
+// Name returns the provider's name.
+func (p *Provider) Name() string {
+	return p.config.Name
+}
+
+// Host returns the provider's host.
+func (p *Provider) Host() string {
+	return p.config.Host
+}
+
+// Priority returns the provider's priority.
+func (p *Provider) Priority() int {
+	return p.config.Priority
+}
+
+// IsBackup returns whether this is a backup provider.
+func (p *Provider) IsBackup() bool {
+	return p.config.IsBackup
+}
+
+// IsHealthy returns whether the provider is currently healthy.
+// Uses atomic load for lock-free access in hot path.
+func (p *Provider) IsHealthy() bool {
+	return p.healthy.Load()
+}
+
+// MarkHealthy marks the provider as healthy.
+func (p *Provider) MarkHealthy() {
+	p.healthy.Store(true)
+	p.mu.Lock()
+	p.lastError = nil
+	p.lastCheck = time.Now()
+	p.mu.Unlock()
+}
+
+// MarkUnhealthy marks the provider as unhealthy with the given error.
+func (p *Provider) MarkUnhealthy(err error) {
+	p.healthy.Store(false)
+	p.mu.Lock()
+	p.lastError = err
+	p.lastCheck = time.Now()
+	p.mu.Unlock()
+	p.errorCount.Add(1)
+}
+
+// LastError returns the last error that caused the provider to be marked unhealthy.
+func (p *Provider) LastError() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.lastError
+}
+
+// Send sends a request to the provider and returns the response.
+func (p *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Writer) (nntpcli.Response, error) {
+	p.requestCount.Add(1)
+
+	// Apply timeout if configured
+	if p.config.ReadTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.config.ReadTimeout)
+		defer cancel()
+	}
+
+	respCh := p.client.Send(ctx, payload, bodyWriter)
+	resp, ok := <-respCh
+	if !ok {
+		err := ctx.Err()
+		if err == nil {
+			err = fmt.Errorf("response channel closed")
+		}
+		return nntpcli.Response{}, &ProviderError{
+			ProviderName: p.config.Name,
+			Host:         p.config.Host,
+			Err:          err,
+			Temporary:    true,
+		}
+	}
+
+	if resp.Err != nil {
+		// Check if it's a network error (temporary)
+		var netErr net.Error
+		temporary := errors.As(resp.Err, &netErr) && netErr.Timeout()
+
+		return resp, &ProviderError{
+			ProviderName: p.config.Name,
+			Host:         p.config.Host,
+			Err:          resp.Err,
+			Temporary:    temporary,
+		}
+	}
+
+	// Verify we got a valid success response (2xx status codes)
+	// For BODY/ARTICLE/HEAD commands, we expect 220/221/222
+	isSuccess := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	if !isSuccess {
+		// Track article not found separately for metrics
+		if resp.StatusCode == StatusArticleNotFound {
+			p.notFoundCount.Add(1)
+		}
+
+		// Determine error message
+		message := resp.Status
+		if message == "" {
+			message = fmt.Sprintf("unexpected status code: %d", resp.StatusCode)
+		}
+
+		return resp, &ProviderError{
+			ProviderName: p.config.Name,
+			Host:         p.config.Host,
+			StatusCode:   resp.StatusCode,
+			Message:      message,
+			Temporary:    false,
+		}
+	}
+
+	return resp, nil
+}
+
+// HealthCheck performs a health check on the provider using the DATE command.
+func (p *Provider) HealthCheck(ctx context.Context) error {
+	// Apply timeout
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	respCh := p.client.Send(ctx, []byte("DATE\r\n"), nil)
+	resp, ok := <-respCh
+	if !ok {
+		err := fmt.Errorf("health check failed: channel closed")
+		p.MarkUnhealthy(err)
+		return err
+	}
+
+	if resp.Err != nil {
+		p.MarkUnhealthy(resp.Err)
+		return resp.Err
+	}
+
+	// DATE should return 111
+	if resp.StatusCode != 111 {
+		err := fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+		p.MarkUnhealthy(err)
+		return err
+	}
+
+	p.MarkHealthy()
+	return nil
+}
+
+// Close closes the provider's client.
+func (p *Provider) Close() error {
+	return p.client.Close()
+}
+
+// SetGroup sets the current newsgroup for this provider.
+// New connections will automatically select this group.
+func (p *Provider) SetGroup(group string) {
+	p.client.SetGroup(group)
+}
+
+// Stats returns the provider's statistics.
+func (p *Provider) Stats() ProviderStats {
+	p.mu.RLock()
+	lastError := p.lastError
+	lastCheck := p.lastCheck
+	p.mu.RUnlock()
+	return ProviderStats{
+		Name:          p.config.Name,
+		Host:          p.config.Host,
+		Healthy:       p.healthy.Load(),
+		LastError:     lastError,
+		LastCheck:     lastCheck,
+		RequestCount:  p.requestCount.Load(),
+		ErrorCount:    p.errorCount.Load(),
+		NotFoundCount: p.notFoundCount.Load(),
 	}
 }
 
-// SetNextRetryAt sets when the next retry should happen
-func (pp *providerPool) SetNextRetryAt(retryAt time.Time) {
-	pp.stateMu.Lock()
-	defer pp.stateMu.Unlock()
-	pp.nextRetryAt = retryAt
-}
-
-// GetConnectionStatus returns connectivity status information
-func (pp *providerPool) GetConnectionStatus() (lastAttempt, lastSuccess, nextRetry time.Time, reason string, retries int) {
-	pp.stateMu.RLock()
-	defer pp.stateMu.RUnlock()
-	return pp.lastConnectionAttempt, pp.lastSuccessfulConnect, pp.nextRetryAt, pp.failureReason, pp.retryCount
-}
-
-// CanRetry returns true if the provider can be retried (not authentication failed)
-func (pp *providerPool) CanRetry() bool {
-	state := pp.GetState()
-	return state != ProviderStateAuthenticationFailed
-}
-
-// ShouldRetryNow returns true if enough time has passed for a retry
-func (pp *providerPool) ShouldRetryNow() bool {
-	pp.stateMu.RLock()
-	defer pp.stateMu.RUnlock()
-	return time.Now().After(pp.nextRetryAt)
+// ProviderStats contains statistics for a provider.
+type ProviderStats struct {
+	Name          string
+	Host          string
+	Healthy       bool
+	LastError     error
+	LastCheck     time.Time
+	RequestCount  int64
+	ErrorCount    int64
+	NotFoundCount int64
 }

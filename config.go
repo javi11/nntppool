@@ -1,249 +1,207 @@
 package nntppool
 
 import (
-	"context"
+	"crypto/tls"
 	"fmt"
-	"log/slog"
 	"time"
-
-	"github.com/avast/retry-go/v4"
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
-
-	"github.com/javi11/nntppool/v2/internal/config"
 )
 
-// Logger interface compatible with slog.Logger
-type Logger interface {
-	Debug(msg string, args ...any)
-	Info(msg string, args ...any)
-	Warn(msg string, args ...any)
-	Error(msg string, args ...any)
-	DebugContext(ctx context.Context, msg string, args ...any)
-	InfoContext(ctx context.Context, msg string, args ...any)
-	WarnContext(ctx context.Context, msg string, args ...any)
-	ErrorContext(ctx context.Context, msg string, args ...any)
-}
-
-type DelayType int
-
+// Default configuration values.
 const (
-	DelayTypeFixed DelayType = iota
-	DelayTypeRandom
-	DelayTypeExponential
+	DefaultMaxConnections      = 10
+	DefaultInflightPerConn     = 8 // Enable pipelining for high throughput
+	DefaultConnectTimeout      = 30 * time.Second
+	DefaultReadTimeout         = 60 * time.Second
+	DefaultWriteTimeout        = 30 * time.Second
+	DefaultHealthCheckInterval = 1 * time.Minute
+	DefaultIdleTimeout         = 5 * time.Minute
+	DefaultWarmupConnections   = 0 // Fully lazy by default
+	DefaultPort                = 119
+	DefaultTLSPort             = 563
 )
 
-type Config struct {
-	delayTypeFn         retry.DelayTypeFunc
-	Logger              Logger
-	NntpCli             nntpcli.Client
-	Providers           []UsenetProviderConfig
+// ProviderConfig defines the configuration for a single NNTP provider.
+//
+// # Performance Tuning
+//
+// For optimal throughput, configure MaxConnections based on your concurrency needs:
+//
+//	Total concurrent requests = MaxConnections × InflightPerConn
+//
+// If using N goroutines to download articles concurrently, ensure:
+//
+//	MaxConnections × InflightPerConn >= N
+//
+// When using io.Writer implementations with buffering (like bufio.Writer wrapping
+// an io.Pipe), use larger buffer sizes (e.g., 256KB) and ensure Flush() is called
+// after each article download completes. The pool automatically flushes writers
+// that implement the Flush() method.
+type ProviderConfig struct {
+	// Name is a human-readable identifier for the provider.
+	Name string
+
+	// Host is the NNTP server hostname.
+	Host string
+
+	// Port is the NNTP server port. Defaults to 119 (or 563 for TLS).
+	Port int
+
+	// TLS enables TLS encryption for the connection.
+	TLS bool
+
+	// TLSConfig is optional custom TLS configuration.
+	// If nil, a default config will be used when TLS is enabled.
+	TLSConfig *tls.Config
+
+	// Username for NNTP authentication.
+	Username string
+
+	// Password for NNTP authentication.
+	Password string
+
+	// MaxConnections is the maximum number of concurrent connections to this provider.
+	// For best throughput, set this to at least the number of concurrent goroutines
+	// that will be calling Body() or BodyReader().
+	MaxConnections int
+
+	// Priority determines the order in which providers are tried.
+	// Lower values = higher priority. Providers with the same priority
+	// are selected using round-robin.
+	Priority int
+
+	// IsBackup indicates this is a backup provider.
+	// Backup providers are only used after the initial request fails on primary providers.
+	IsBackup bool
+
+	// InflightPerConn is the maximum number of pipelined requests per connection.
+	// Default is 8 (pipelining enabled). This allows multiple requests to be sent
+	// before waiting for responses, significantly improving throughput on high-latency
+	// connections. Set to 1 to disable pipelining.
+	InflightPerConn int
+
+	// ConnectTimeout is the timeout for establishing a connection.
+	ConnectTimeout time.Duration
+
+	// ReadTimeout is the timeout for reading responses.
+	ReadTimeout time.Duration
+
+	// WriteTimeout is the timeout for sending requests.
+	WriteTimeout time.Duration
+
+	// IdleTimeout is how long a connection can be idle before being closed.
+	// Set to 0 to disable idle timeout and keep connections open indefinitely.
+	// Default: 5 minutes.
+	IdleTimeout time.Duration
+
+	// WarmupConnections is the number of connections to pre-create at startup.
+	// Set to 0 for fully lazy connection creation (connections created on-demand).
+	// Default: 0 (fully lazy).
+	WarmupConnections int
+}
+
+// Validate checks the provider configuration for errors.
+func (c *ProviderConfig) Validate() error {
+	if c.Host == "" {
+		return fmt.Errorf("%w: host is required", ErrInvalidConfig)
+	}
+	if c.MaxConnections < 0 {
+		return fmt.Errorf("%w: max connections cannot be negative", ErrInvalidConfig)
+	}
+	if c.InflightPerConn < 0 {
+		return fmt.Errorf("%w: inflight per connection cannot be negative", ErrInvalidConfig)
+	}
+	if c.Priority < 0 {
+		return fmt.Errorf("%w: priority cannot be negative", ErrInvalidConfig)
+	}
+	return nil
+}
+
+// WithDefaults returns a copy of the config with default values applied.
+func (c ProviderConfig) WithDefaults() ProviderConfig {
+	if c.Port == 0 {
+		if c.TLS {
+			c.Port = DefaultTLSPort
+		} else {
+			c.Port = DefaultPort
+		}
+	}
+	if c.MaxConnections == 0 {
+		c.MaxConnections = DefaultMaxConnections
+	}
+	if c.InflightPerConn == 0 {
+		c.InflightPerConn = DefaultInflightPerConn
+	}
+	if c.ConnectTimeout == 0 {
+		c.ConnectTimeout = DefaultConnectTimeout
+	}
+	if c.ReadTimeout == 0 {
+		c.ReadTimeout = DefaultReadTimeout
+	}
+	if c.WriteTimeout == 0 {
+		c.WriteTimeout = DefaultWriteTimeout
+	}
+	if c.Name == "" {
+		c.Name = c.Host
+	}
+	// Note: IdleTimeout defaults to 0 (no idle timeout) for backward compatibility.
+	// Users can set IdleTimeout > 0 to enable automatic connection cleanup.
+	// WarmupConnections defaults to 0 (fully lazy connection creation).
+	return c
+}
+
+// Address returns the host:port address for this provider.
+func (c *ProviderConfig) Address() string {
+	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+// PoolConfig defines the configuration for the connection pool.
+type PoolConfig struct {
+	// Providers is the list of NNTP providers.
+	Providers []ProviderConfig
+
+	// HealthCheckInterval is how often to check provider health.
+	// Set to 0 to disable health checks.
 	HealthCheckInterval time.Duration
-	MinConnections      int
-	MaxRetries          uint
-	DelayType           DelayType
-	// Deprecated: now is always false
-	SkipProvidersVerificationOnCreation bool
-	RetryDelay                          time.Duration
-	ShutdownTimeout                     time.Duration
-	DrainTimeout                        time.Duration
-	ForceCloseTimeout                   time.Duration
-	DefaultConnectionLease              time.Duration
-	ProviderReconnectInterval           time.Duration
-	ProviderMaxReconnectInterval        time.Duration
-	ProviderHealthCheckStagger          time.Duration
-	ProviderHealthCheckTimeout          time.Duration
-	NntpOperationTimeout                time.Duration
+
+	// MaxRetries is the maximum number of retry attempts within the same provider
+	// for transient errors. Set to 0 for no retries.
+	MaxRetries int
 }
 
-// Adapter methods for internal package interfaces
-func (c *Config) GetProviders() []config.ProviderConfig {
-	providers := make([]config.ProviderConfig, len(c.Providers))
+// Validate checks the pool configuration for errors.
+func (c *PoolConfig) Validate() error {
+	if len(c.Providers) == 0 {
+		return fmt.Errorf("%w: at least one provider is required", ErrInvalidConfig)
+	}
+
+	hasPrimary := false
 	for i, p := range c.Providers {
-		providers[i] = &p
-	}
-	return providers
-}
-
-// Helper interface for internal packages
-type ProviderConfig interface {
-	ID() string
-	GetHost() string
-	GetUsername() string
-	GetPassword() string
-	GetPort() int
-	GetMaxConnections() int
-	GetMaxConnectionIdleTimeInSeconds() int
-	GetMaxConnectionTTLInSeconds() int
-	GetPipelineDepth() int
-	GetTLS() bool
-	GetInsecureSSL() bool
-	GetIsBackupProvider() bool
-	GetVerifyCapabilities() []string
-	GetProxyURL() string
-}
-
-type UsenetProviderConfig struct {
-	Host                           string
-	Username                       string
-	Password                       string
-	VerifyCapabilities             []string
-	// ProxyURL is an optional SOCKS5 proxy URL for this provider.
-	// Format: socks5://[user:password@]host:port
-	// Example: socks5://proxy.example.com:1080
-	// Example with auth: socks5://user:pass@proxy.example.com:1080
-	ProxyURL                       string
-	Port                           int
-	MaxConnections                 int
-	MaxConnectionIdleTimeInSeconds int
-	MaxConnectionTTLInSeconds      int
-	// PipelineDepth is the number of BODY commands to send in a pipeline before
-	// waiting for responses. Set to 0 or 1 to disable pipelining (default).
-	// Recommended values: 2-4 for low latency (<50ms), 4-8 for high latency (100ms+).
-	// Higher values can improve throughput on high-latency connections.
-	PipelineDepth                  int
-	TLS                            bool
-	InsecureSSL                    bool
-	IsBackupProvider               bool
-}
-
-func (u *UsenetProviderConfig) ID() string {
-	return fmt.Sprintf("%s_%s", u.Host, u.Username)
-}
-
-// Adapter methods for internal package interfaces
-func (u *UsenetProviderConfig) GetHost() string        { return u.Host }
-func (u *UsenetProviderConfig) GetUsername() string    { return u.Username }
-func (u *UsenetProviderConfig) GetPassword() string    { return u.Password }
-func (u *UsenetProviderConfig) GetPort() int           { return u.Port }
-func (u *UsenetProviderConfig) GetMaxConnections() int { return u.MaxConnections }
-func (u *UsenetProviderConfig) GetMaxConnectionIdleTimeInSeconds() int {
-	return u.MaxConnectionIdleTimeInSeconds
-}
-func (u *UsenetProviderConfig) GetMaxConnectionTTLInSeconds() int { return u.MaxConnectionTTLInSeconds }
-func (u *UsenetProviderConfig) GetPipelineDepth() int             { return u.PipelineDepth }
-func (u *UsenetProviderConfig) GetTLS() bool                      { return u.TLS }
-func (u *UsenetProviderConfig) GetInsecureSSL() bool              { return u.InsecureSSL }
-func (u *UsenetProviderConfig) GetIsBackupProvider() bool         { return u.IsBackupProvider }
-func (u *UsenetProviderConfig) GetVerifyCapabilities() []string   { return u.VerifyCapabilities }
-func (u *UsenetProviderConfig) GetProxyURL() string               { return u.ProxyURL }
-
-type Option func(*Config)
-
-var (
-	configDefault = Config{
-		HealthCheckInterval:          1 * time.Minute,
-		MinConnections:               0,
-		MaxRetries:                   4,
-		RetryDelay:                   5 * time.Second,
-		ShutdownTimeout:              30 * time.Second,
-		DrainTimeout:                 10 * time.Second,
-		ForceCloseTimeout:            5 * time.Second,
-		DefaultConnectionLease:       10 * time.Minute,
-		ProviderReconnectInterval:    30 * time.Second,
-		ProviderMaxReconnectInterval: 5 * time.Minute,
-		ProviderHealthCheckStagger:   10 * time.Second,
-		ProviderHealthCheckTimeout:   5 * time.Second,
-		NntpOperationTimeout:         30 * time.Second,
-	}
-	providerConfigDefault = UsenetProviderConfig{
-		MaxConnections:                 10,
-		MaxConnectionIdleTimeInSeconds: 2400,
-		MaxConnectionTTLInSeconds:      2400,
-	}
-)
-
-func mergeWithDefault(config ...Config) Config {
-	if len(config) == 0 {
-		return configDefault
-	}
-
-	cfg := config[0]
-
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
-	}
-
-	if cfg.NntpCli == nil {
-		cfg.NntpCli = nntpcli.New(nntpcli.Config{
-			OperationTimeout: cfg.NntpOperationTimeout,
-		})
-	}
-
-	if cfg.HealthCheckInterval == 0 {
-		cfg.HealthCheckInterval = configDefault.HealthCheckInterval
-	}
-
-	if cfg.MaxRetries == 0 {
-		cfg.MaxRetries = configDefault.MaxRetries
-	}
-
-	if cfg.RetryDelay == 0 {
-		cfg.RetryDelay = configDefault.RetryDelay
-	}
-
-	if cfg.ShutdownTimeout == 0 {
-		cfg.ShutdownTimeout = configDefault.ShutdownTimeout
-	}
-
-	if cfg.DrainTimeout == 0 {
-		cfg.DrainTimeout = configDefault.DrainTimeout
-	}
-
-	if cfg.ForceCloseTimeout == 0 {
-		cfg.ForceCloseTimeout = configDefault.ForceCloseTimeout
-	}
-
-	if cfg.DefaultConnectionLease == 0 {
-		cfg.DefaultConnectionLease = configDefault.DefaultConnectionLease
-	}
-
-	if cfg.ProviderReconnectInterval == 0 {
-		cfg.ProviderReconnectInterval = configDefault.ProviderReconnectInterval
-	}
-
-	if cfg.ProviderMaxReconnectInterval == 0 {
-		cfg.ProviderMaxReconnectInterval = configDefault.ProviderMaxReconnectInterval
-	}
-
-	// Provider health check options (use defaults if not set explicitly)
-	if cfg.ProviderHealthCheckStagger == 0 {
-		cfg.ProviderHealthCheckStagger = configDefault.ProviderHealthCheckStagger
-	}
-
-	if cfg.ProviderHealthCheckTimeout == 0 {
-		cfg.ProviderHealthCheckTimeout = configDefault.ProviderHealthCheckTimeout
-	}
-
-	if cfg.NntpOperationTimeout == 0 {
-		cfg.NntpOperationTimeout = configDefault.NntpOperationTimeout
-	}
-
-	for i, p := range cfg.Providers {
-		if p.MaxConnections == 0 {
-			p.MaxConnections = providerConfigDefault.MaxConnections
+		if err := p.Validate(); err != nil {
+			return fmt.Errorf("%w: provider %d (%s): %v", ErrInvalidConfig, i, p.Name, err)
 		}
-
-		if p.MaxConnectionIdleTimeInSeconds == 0 {
-			p.MaxConnectionIdleTimeInSeconds = providerConfigDefault.MaxConnectionIdleTimeInSeconds
+		if !p.IsBackup {
+			hasPrimary = true
 		}
-
-		if p.MaxConnectionTTLInSeconds == 0 {
-			p.MaxConnectionTTLInSeconds = providerConfigDefault.MaxConnectionTTLInSeconds
-		}
-
-		cfg.Providers[i] = p
 	}
 
-	switch cfg.DelayType {
-	case DelayTypeFixed:
-		cfg.delayTypeFn = retry.FixedDelay
-	case DelayTypeRandom:
-		cfg.delayTypeFn = retry.RandomDelay
-	case DelayTypeExponential:
-		cfg.delayTypeFn = retry.BackOffDelay
-	default:
-		cfg.delayTypeFn = retry.FixedDelay
+	if !hasPrimary {
+		return fmt.Errorf("%w: at least one primary provider is required", ErrInvalidConfig)
 	}
 
-	return cfg
+	return nil
+}
+
+// WithDefaults returns a copy of the config with default values applied.
+func (c PoolConfig) WithDefaults() PoolConfig {
+	if c.HealthCheckInterval == 0 {
+		c.HealthCheckInterval = DefaultHealthCheckInterval
+	}
+
+	providers := make([]ProviderConfig, len(c.Providers))
+	for i, p := range c.Providers {
+		providers[i] = p.WithDefaults()
+	}
+	c.Providers = providers
+
+	return c
 }

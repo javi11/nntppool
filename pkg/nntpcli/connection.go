@@ -1,535 +1,467 @@
-//go:generate go tool mockgen -source=./connection.go -destination=./connection_mock.go -package=nntpcli Connection
 package nntpcli
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/textproto"
-	"strconv"
-	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/mnightingale/rapidyenc"
 )
 
-type Connection interface {
-	io.Closer
-	Authenticate(username, password string) (err error)
-	JoinGroup(name string) error
-	BodyDecoded(msgID string, w io.Writer, discard int64) (int64, error)
-	BodyReader(msgID string) (ArticleBodyReader, error)
-	// BodyPipelined sends multiple BODY commands in a pipeline and returns results in order.
-	// This method sends all BODY commands before reading any responses, which can significantly
-	// improve throughput on high-latency connections.
-	// If requests is empty, returns an empty slice.
-	// If requests has only one element, falls back to sequential BodyDecoded for simplicity.
-	BodyPipelined(requests []PipelineRequest) []PipelineResult
-	// TestPipelineSupport tests if the server supports pipelining by sending multiple
-	// STAT commands for the same message ID and verifying all responses are received correctly.
-	// Returns true if pipelining is supported, along with a suggested pipeline depth based on
-	// measured round-trip latency.
-	// Suggested depth ranges: 2-4 for <50ms latency, 4-6 for 50-100ms, 6-10 for >100ms.
-	TestPipelineSupport(testMsgID string) (supported bool, suggestedDepth int, err error)
-	Post(r io.Reader) (int64, error)
-	Ping() error
-	CurrentJoinedGroup() string
-	MaxAgeTime() time.Time
-	Stat(msgID string) (int, error)
-	Capabilities() ([]string, error)
+// Request represents an NNTP command to be sent to the server.
+type Request struct {
+	Ctx context.Context
+
+	Payload []byte
+	RespCh  chan Response
+
+	// Optional: decoded body bytes are streamed here. If nil, they are buffered into Response.Body.
+	BodyWriter io.Writer
 }
 
-var _ Connection = (*connection)(nil)
+// Response represents an NNTP server response.
+type Response struct {
+	StatusCode int
+	Status     string
 
-type connection struct {
-	maxAgeTime         time.Time
-	netconn            net.Conn
-	conn               *textproto.Conn
-	currentJoinedGroup string
-	operationTimeout   time.Duration
+	// For non-body multiline responses (CAPABILITIES, etc).
+	Lines []string
+
+	// Decoded payload bytes (only if Request.BodyWriter == nil).
+	Body bytes.Buffer
+
+	// Decoder metadata/status gathered while parsing.
+	Meta NNTPResponse
+
+	Err     error
+	Request *Request
 }
 
-func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time.Duration) (Connection, error) {
-	conn := textproto.NewConn(netconn)
-
-	_, _, err := conn.ReadCodeLine(StatusReady)
-	if err != nil {
-		// Download only server
-		_, _, err = conn.ReadCodeLine(StatusReadyNoPosting)
-		if err == nil {
-			return &connection{
-				conn:             conn,
-				netconn:          netconn,
-				maxAgeTime:       maxAgeTime,
-				operationTimeout: operationTimeout,
-			}, nil
-		}
-
-		_ = conn.Close()
-
-		return nil, err
-	}
-
-	return &connection{
-		conn:             conn,
-		netconn:          netconn,
-		maxAgeTime:       maxAgeTime,
-		operationTimeout: operationTimeout,
-	}, nil
+// Auth holds authentication credentials for NNTP connection.
+type Auth struct {
+	Username string
+	Password string
 }
 
-// Close this client.
-func (c *connection) Close() (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in Close: %v", r)
-		}
-	}()
+// ConnFactory is used by Client to create connections.
+type ConnFactory func(ctx context.Context) (net.Conn, error)
 
-	_, _, err = c.sendCmd(StatusQuit, "QUIT")
-	e := c.conn.Close()
+// NNTPConnection manages a single NNTP connection with pipelining support.
+type NNTPConnection struct {
+	conn net.Conn
+	bw   *bufio.Writer // Buffered writer to reduce write syscalls
 
-	if err != nil {
-		return err
-	}
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	return e
+	reqCh   <-chan *Request
+	pending chan *Request // capacity = inflightLimit, provides back-pressure
+
+	rb readBuffer
+
+	Greeting NNTPResponse
+
+	done   chan struct{}
+	doneMu sync.Once
+
+	failMu sync.Once
+
+	// Idle tracking
+	lastActivity atomic.Int64 // Unix nanoseconds of last completed request
+
+	// Callback invoked when connection closes (for pool management)
+	onClose func(*NNTPConnection)
 }
 
-// Authenticate against an NNTP server using authinfo user/pass
-func (c *connection) Authenticate(username, password string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in Authenticate: %v", r)
-		}
-	}()
-
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
+func newNetConn(addr string, tlsConfig *tls.Config) (net.Conn, error) {
+	if tlsConfig != nil {
+		return tls.Dial("tcp", addr, tlsConfig)
 	}
-	defer func() {
-		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
-			err = fmt.Errorf("clear deadline: %w", clearErr)
-		}
-	}()
-
-	code, _, err := c.sendCmd(StatusMoreAuthInfoRequired, "AUTHINFO USER %s", username)
-	if err != nil {
-		return fmt.Errorf("AUTHINFO USER %s: %w", username, err)
-	}
-
-	switch code {
-	case 481, 482, StatusPermissionDenied:
-		// failed, out of sequence or command not available
-		return fmt.Errorf("AUTHINFO USER %s: authentication failed with code %d", username, code)
-	case StatusAuthenticated:
-		// accepted without password
-		return nil
-	case StatusMoreAuthInfoRequired:
-		// need password
-		break
-	default:
-		return fmt.Errorf("AUTHINFO USER %s: unexpected response code %d", username, code)
-	}
-
-	_, _, err = c.sendCmd(StatusAuthenticated, "AUTHINFO PASS %s", password)
-	if err != nil {
-		return fmt.Errorf("AUTHINFO PASS (user %s): %w", username, err)
-	}
-
-	return nil
+	return net.Dial("tcp", addr)
 }
 
-func (c *connection) Ping() (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in Ping: %v", r)
-		}
-	}()
-
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
+func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth) (*NNTPConnection, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	defer func() {
-		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
-			err = fmt.Errorf("clear deadline: %w", clearErr)
-		}
-	}()
+	cctx, cancel := context.WithCancel(ctx)
 
-	_, _, err = c.sendCmd(StatusReady, "DATE")
+	c := &NNTPConnection{
+		conn:    conn,
+		bw:      bufio.NewWriterSize(conn, 64*1024), // 64KB write buffer
+		ctx:     cctx,
+		cancel:  cancel,
+		reqCh:   reqCh,
+		pending: make(chan *Request, inflightLimit),
+		rb:      readBuffer{buf: make([]byte, defaultReadBufSize)},
+		done:    make(chan struct{}),
+	}
+
+	// Server greeting is sent immediately upon connect.
+	greeting, err := c.readOneResponse(io.Discard)
 	if err != nil {
-		return fmt.Errorf("DATE: %w", err)
+		return nil, fmt.Errorf("nntp greeting: %w", err)
+	}
+	c.Greeting = greeting
+	if greeting.StatusCode != 200 && greeting.StatusCode != 201 {
+		return nil, fmt.Errorf("unexpected nntp greeting: %s", greeting.Message)
 	}
 
-	return nil
-}
-
-func (c *connection) JoinGroup(group string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in JoinGroup: %v", r)
-		}
-	}()
-
-	if group == c.currentJoinedGroup {
-		return nil
-	}
-
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
-	}
-	defer func() {
-		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
-			err = fmt.Errorf("clear deadline: %w", clearErr)
-		}
-	}()
-
-	_, _, err = c.sendCmd(StatusGroupSelected, "GROUP %s", group)
-	if err != nil {
-		return fmt.Errorf("GROUP %s: %w", group, err)
-	}
-
-	c.currentJoinedGroup = group
-
-	return nil
-}
-
-func (c *connection) CurrentJoinedGroup() (group string) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Cannot return error from this method, return empty string
-			group = ""
-		}
-	}()
-
-	return c.currentJoinedGroup
-}
-
-// BodyDecoded gets the decoded body of an article
-// If discard is provided the body will be discarded until the discard line,
-// this is useful if you don't want to start the writer from the beginning
-// Body retrieves the body of a message with the given message ID from the NNTP server,
-// writes it to the provided io.Writer, and optionally discards the first 'discard' lines.
-//
-// Parameters:
-//   - msgID: The message ID of the article to retrieve.
-//   - w: The io.Writer to which the message body will be written.
-//   - discard: The number of lines to discard from the beginning of the message body.
-//
-// Returns:
-//   - int64: The number of bytes written to the io.Writer.
-//   - error: Any error encountered during the operation.
-//
-// The function sends the "BODY" command to the NNTP server, starts the response,
-// and reads the response code. It uses a decoder to read the message body and
-// optionally discards the specified number of lines before writing the remaining
-// body to the provided io.Writer. If an error occurs during reading or writing,
-// the function ensures that the decoder is fully read to avoid connection issues.
-func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n int64, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in BodyDecoded: %v", r)
-			n = 0
-		}
-	}()
-
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return 0, fmt.Errorf("set deadline: %w", err)
-	}
-	defer func() {
-		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
-			err = fmt.Errorf("clear deadline: %w", clearErr)
-		}
-	}()
-
-	id, err := c.conn.Cmd("BODY <%s>", msgID)
-	if err != nil {
-		return 0, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
-	}
-
-	c.conn.StartResponse(id)
-	defer c.conn.EndResponse(id)
-
-	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
-	if err != nil {
-		return 0, fmt.Errorf("BODY <%s>: %w", msgID, err)
-	}
-
-	dec := rapidyenc.AcquireDecoder(c.conn.R)
-	defer rapidyenc.ReleaseDecoder(dec)
-
-	// Discard the first n lines
-	if discard > 0 {
-		if _, err = io.CopyN(io.Discard, dec, discard); err != nil {
-			// Attempt to drain the decoder to avoid connection issues
-			if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-				return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w (drain also failed: %v)", msgID, discard, err, drainErr)
-			}
-
-			return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", msgID, discard, err)
-		}
-	}
-
-	n, err = io.Copy(w, dec)
-	if err != nil {
-		// Attempt to drain the decoder to avoid connection issues
-		if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
-			return n, fmt.Errorf("BODY <%s>: copy failed: %w (drain also failed: %v)", msgID, err, drainErr)
+	// Optional AUTHINFO handshake.
+	if auth.Username != "" {
+		if auth.Password == "" {
+			return nil, fmt.Errorf("password required when username is set")
 		}
 
-		return n, fmt.Errorf("BODY <%s>: copy failed: %w", msgID, err)
-	}
-
-	return n, nil
-}
-
-func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in BodyReader: %v", r)
-			reader = nil
-		}
-	}()
-
-	// Set timeout for initial command and response
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return nil, fmt.Errorf("set deadline: %w", err)
-	}
-
-	id, err := c.conn.Cmd("BODY <%s>", msgID)
-	if err != nil {
-		_ = c.clearDeadline()
-		return nil, fmt.Errorf("BODY <%s>: %w", msgID, formatError(err))
-	}
-
-	c.conn.StartResponse(id)
-
-	_, _, err = c.conn.ReadCodeLine(StatusBodyFollows)
-	if err != nil {
-		c.conn.EndResponse(id)
-		_ = c.clearDeadline()
-		return nil, fmt.Errorf("BODY <%s>: %w", msgID, err)
-	}
-
-	// Clear deadline after successful response - caller controls read pace
-	if err := c.clearDeadline(); err != nil {
-		c.conn.EndResponse(id)
-		return nil, fmt.Errorf("clear deadline: %w", err)
-	}
-
-	dec := rapidyenc.AcquireDecoder(c.conn.R)
-
-	return &articleBodyReader{
-		decoder:    dec,
-		conn:       c,
-		responseID: id,
-		closed:     false,
-	}, nil
-}
-
-// Post a new article
-//
-// The reader should contain the entire article, headers and body in
-// RFC822ish format.
-//
-// Returns the number of bytes written and any error encountered.
-func (c *connection) Post(r io.Reader) (n int64, err error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("panic in Post: %v", rec)
-			n = 0
-		}
-	}()
-
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return 0, fmt.Errorf("set deadline: %w", err)
-	}
-	defer func() {
-		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
-			err = fmt.Errorf("clear deadline: %w", clearErr)
-		}
-	}()
-
-	_, _, err = c.sendCmd(StatusPasswordRequired, "POST")
-	if err != nil {
-		return 0, fmt.Errorf("POST: %w", err)
-	}
-
-	w := c.conn.DotWriter()
-
-	n, err = io.Copy(w, r)
-	if err != nil {
-		return 0, fmt.Errorf("POST: copy article content failed: %w", err)
-	}
-
-	if err = w.Close(); err != nil {
-		return 0, fmt.Errorf("POST: close writer failed: %w", err)
-	}
-
-	_, _, err = c.conn.ReadCodeLine(StatusArticlePosted)
-	if err == nil {
-		return n, nil
-	}
-
-	return 0, fmt.Errorf("POST: %w", err)
-}
-
-// Stat sends a STAT command to the NNTP server to check the status of a message
-// with the given message ID. It returns the message number if the message exists.
-//
-// Parameters:
-//
-//	msgID - The message ID to check.
-//
-// Returns:
-//
-//	int - The message number if the message exists.
-//	error - An error if the command fails or the response is invalid.
-func (c *connection) Stat(msgID string) (number int, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in Stat: %v", r)
-			number = 0
-		}
-	}()
-
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return 0, fmt.Errorf("set deadline: %w", err)
-	}
-	defer func() {
-		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
-			err = fmt.Errorf("clear deadline: %w", clearErr)
-		}
-	}()
-
-	id, err := c.conn.Cmd("STAT <%s>", msgID)
-	if err != nil {
-		return 0, fmt.Errorf("STAT <%s>: %w", msgID, err)
-	}
-
-	c.conn.StartResponse(id)
-	defer c.conn.EndResponse(id)
-
-	_, line, err := c.conn.ReadCodeLine(StatusStatSuccess)
-	if err != nil {
-		return 0, fmt.Errorf("STAT <%s>: %w", msgID, err)
-	}
-
-	ss := strings.SplitN(line, " ", NumberOfStatResParams) // optional comment ignored
-	if len(ss) < NumberOfStatResParams-1 {
-		return 0, fmt.Errorf("STAT <%s>: bad response format: %s", msgID, line)
-	}
-
-	number, err = strconv.Atoi(ss[0])
-	if err != nil {
-		return 0, fmt.Errorf("STAT <%s>: invalid article number in response: %w", msgID, err)
-	}
-
-	return number, nil
-}
-
-func (c *connection) MaxAgeTime() (maxAge time.Time) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Cannot return error from this method, return zero time
-			maxAge = time.Time{}
-		}
-	}()
-
-	return c.maxAgeTime
-}
-
-// Capabilities returns a list of features this server performs.
-// Not all servers support capabilities.
-func (c *connection) Capabilities() (caps []string, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic in Capabilities: %v", r)
-			caps = nil
-		}
-	}()
-
-	if err := c.setOperationDeadline(c.operationTimeout); err != nil {
-		return nil, fmt.Errorf("set deadline: %w", err)
-	}
-	defer func() {
-		if clearErr := c.clearDeadline(); clearErr != nil && err == nil {
-			err = fmt.Errorf("clear deadline: %w", clearErr)
-		}
-	}()
-
-	const StatusCapabilities = 101 // Capability list follows
-	_, _, err = c.sendCmd(StatusCapabilities, "CAPABILITIES")
-	if err != nil {
-		return nil, err
-	}
-
-	return c.readStrings()
-}
-
-// readStrings reads a list of strings from the NNTP connection,
-// stopping at a line containing only a . (Convenience method for
-// LIST, etc.)
-func (c *connection) readStrings() ([]string, error) {
-	var sv []string
-
-	for {
-		line, err := c.conn.ReadLine()
-		if err != nil {
+		if err := c.auth(auth); err != nil {
 			return nil, err
 		}
+	}
 
-		// Trim trailing newlines more efficiently
-		line = strings.TrimSuffix(line, "\r\n")
-		line = strings.TrimSuffix(line, "\n")
+	return c, nil
+}
 
-		if line == "." {
-			break
+// NewNNTPConnection creates a new NNTP connection to the specified address.
+func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth) (*NNTPConnection, error) {
+	conn, err := newNetConn(addr, tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, auth)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *NNTPConnection) auth(auth Auth) error {
+	// AUTHINFO USER
+	if _, err := c.conn.Write([]byte(fmt.Sprintf("AUTHINFO USER %s\r\n", auth.Username))); err != nil {
+		return fmt.Errorf("authinfo user: %w", err)
+	}
+	resp, err := c.readOneResponse(io.Discard)
+	if err != nil {
+		return fmt.Errorf("authinfo user response: %w", err)
+	}
+
+	switch resp.StatusCode {
+	case 281:
+		return nil // authenticated
+	case 381:
+		// need pass
+	default:
+		return fmt.Errorf("authinfo user unexpected response: %s", resp.Message)
+	}
+
+	// AUTHINFO PASS
+	if _, err := c.conn.Write([]byte(fmt.Sprintf("AUTHINFO PASS %s\r\n", auth.Password))); err != nil {
+		return fmt.Errorf("authinfo pass: %w", err)
+	}
+	resp, err = c.readOneResponse(io.Discard)
+	if err != nil {
+		return fmt.Errorf("authinfo pass response: %w", err)
+	}
+	if resp.StatusCode != 281 {
+		return fmt.Errorf("authinfo pass unexpected response: %s", resp.Message)
+	}
+	return nil
+}
+
+// Done returns a channel that is closed when the connection is done.
+func (c *NNTPConnection) Done() <-chan struct{} { return c.done }
+
+func (c *NNTPConnection) closeDone() {
+	c.doneMu.Do(func() { close(c.done) })
+}
+
+func safeClose[T any](ch chan T) {
+	defer func() { _ = recover() }()
+	close(ch)
+}
+
+func safeSend[T any](ch chan T, v T) {
+	defer func() { _ = recover() }()
+	ch <- v
+}
+
+func (c *NNTPConnection) failOutstanding() {
+	c.failMu.Do(func() {
+		for {
+			select {
+			case req := <-c.pending:
+				if req == nil {
+					continue
+				}
+				safeClose(req.RespCh)
+			default:
+				return
+			}
+		}
+	})
+}
+
+// Close closes the connection and waits for cleanup to complete.
+func (c *NNTPConnection) Close() error {
+	c.cancel()
+	_ = c.conn.Close()
+	<-c.done
+	return nil
+}
+
+// LastActivity returns the time of the last completed request.
+// Returns zero time if no requests have been completed yet.
+func (c *NNTPConnection) LastActivity() time.Time {
+	ns := c.lastActivity.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// updateActivity updates the last activity timestamp to now.
+func (c *NNTPConnection) updateActivity() {
+	c.lastActivity.Store(time.Now().UnixNano())
+}
+
+// SetOnClose sets the callback invoked when the connection closes.
+// This is used by the Client to remove the connection from its pool.
+func (c *NNTPConnection) SetOnClose(fn func(*NNTPConnection)) {
+	c.onClose = fn
+}
+
+// SendGroup sends a GROUP command and waits for the response.
+// This is used to set the initial group on a connection before it starts
+// processing requests from the shared channel.
+// Must be called before Run().
+func (c *NNTPConnection) SendGroup(ctx context.Context, group string) error {
+	cmd := fmt.Sprintf("GROUP %s\r\n", group)
+	if _, err := c.conn.Write([]byte(cmd)); err != nil {
+		return fmt.Errorf("group command: %w", err)
+	}
+
+	resp, err := c.readOneResponse(io.Discard)
+	if err != nil {
+		return fmt.Errorf("group response: %w", err)
+	}
+
+	// 211 = group selected successfully
+	if resp.StatusCode != 211 {
+		return fmt.Errorf("group failed: %d %s", resp.StatusCode, resp.Message)
+	}
+
+	return nil
+}
+
+type writerRef struct {
+	w io.Writer
+}
+
+func (wr *writerRef) Write(p []byte) (int, error) {
+	return wr.w.Write(p)
+}
+
+// Run starts the connection's writer loop. It should be called in a goroutine.
+func (c *NNTPConnection) Run() {
+	defer func() {
+		c.cancel()
+		_ = c.conn.Close()
+		c.failOutstanding()
+		c.closeDone()
+		// Notify the Client that this connection has closed
+		if c.onClose != nil {
+			c.onClose(c)
+		}
+	}()
+
+	go func() {
+		c.readerLoop()
+		// ensure writer exits too
+		c.cancel()
+	}()
+
+	for {
+		// Pull next request - pending channel provides flow control
+		var req *Request
+		var ok bool
+		select {
+		case req, ok = <-c.reqCh:
+		case <-c.ctx.Done():
+			return
+		}
+		if !ok {
+			return
+		}
+		if req.Ctx == nil {
+			req.Ctx = context.Background()
 		}
 
-		sv = append(sv, line)
-	}
+		// Cancel before sending (queued-but-not-sent case)
+		select {
+		case <-req.Ctx.Done():
+			close(req.RespCh)
+			continue
+		default:
+		}
 
-	return sv, nil
+		// per-request write deadline
+		if dl, ok := req.Ctx.Deadline(); ok {
+			_ = c.conn.SetWriteDeadline(dl)
+		} else {
+			_ = c.conn.SetWriteDeadline(time.Time{})
+		}
+
+		// pipeline write - must succeed BEFORE enqueuing to pending
+		// to prevent response misalignment on write failure
+		if _, err := c.bw.Write(req.Payload); err != nil {
+			safeClose(req.RespCh)
+			_ = c.conn.Close()
+			c.failOutstanding()
+			return
+		}
+		// Flush buffered writes to ensure command is sent
+		if err := c.bw.Flush(); err != nil {
+			safeClose(req.RespCh)
+			_ = c.conn.Close()
+			c.failOutstanding()
+			return
+		}
+		_ = c.conn.SetWriteDeadline(time.Time{})
+
+		// track FIFO ordering - enqueue AFTER successful write
+		// pending channel capacity = inflightLimit, provides back-pressure
+		select {
+		case c.pending <- req:
+		case <-c.ctx.Done():
+			safeClose(req.RespCh)
+			return
+		}
+	}
 }
 
-func (c *connection) sendCmd(expectCode int, cmd string, args ...any) (int, string, error) {
-	id, err := c.conn.Cmd(cmd, args...)
-	if err != nil {
-		return 0, "", err
+func (c *NNTPConnection) readerLoop() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			c.failOutstanding()
+			return
+		default:
+		}
+
+		// Match FIFO request
+		var req *Request
+		select {
+		case req = <-c.pending:
+		case <-c.ctx.Done():
+			return
+		}
+		if req.Ctx == nil {
+			req.Ctx = context.Background()
+		}
+
+		resp := Response{
+			Request: req,
+		}
+		decoder := NNTPResponse{}
+
+		// If the request is cancelled after send, we must still drain its response off the wire,
+		// but we don't deliver it.
+		deliver := true
+		select {
+		case <-req.Ctx.Done():
+			deliver = false
+		default:
+		}
+
+		out := req.BodyWriter
+		if !deliver {
+			out = io.Discard
+		} else if out == nil {
+			out = &resp.Body
+		}
+
+		// Allow us to switch output to io.Discard if the request is cancelled while
+		// we are still draining the response.
+		outRef := &writerRef{w: out}
+
+		err := c.rb.feedUntilDone(c.conn, &decoder, outRef, func() (time.Time, bool) {
+			if deliver {
+				select {
+				case <-req.Ctx.Done():
+					deliver = false
+					outRef.w = io.Discard
+				default:
+				}
+			}
+			return req.Ctx.Deadline()
+		})
+		_ = c.conn.SetReadDeadline(time.Time{})
+
+		// If feedUntilDone returned an error but response not complete,
+		// drain remaining data to io.Discard to preserve connection for reuse.
+		// This handles writer failures (broken pipe) where network is fine.
+		if err != nil && !decoder.Done() {
+			drainErr := c.rb.feedUntilDone(c.conn, &decoder, io.Discard, func() (time.Time, bool) {
+				// Use a reasonable timeout for draining (5 seconds)
+				return time.Now().Add(5 * time.Second), true
+			})
+			if drainErr != nil {
+				// Drain failed (network error) - close connection
+				resp.Err = err
+				if deliver {
+					safeSend(req.RespCh, resp)
+				}
+				safeClose(req.RespCh)
+				c.updateActivity()
+				_ = c.conn.Close()
+				c.failOutstanding()
+				return
+			}
+		}
+
+		if err != nil {
+			resp.Err = err
+		}
+
+		resp.StatusCode = decoder.StatusCode
+		resp.Status = decoder.Message
+		resp.Lines = decoder.Lines
+		resp.Meta = decoder
+
+		if deliver {
+			// Best effort: use safeSend to handle closed channel race with failOutstanding()
+			safeSend(req.RespCh, resp)
+		}
+		safeClose(req.RespCh)
+
+		// Update last activity timestamp for idle tracking
+		c.updateActivity()
+
+		// If we hit a timeout or cancellation-related network error, close the connection.
+		if resp.Err != nil {
+			var ne net.Error
+			if errors.As(resp.Err, &ne) && ne.Timeout() {
+				_ = c.conn.Close()
+				c.failOutstanding()
+				return
+			}
+		}
 	}
-
-	c.conn.StartResponse(id)
-
-	defer c.conn.EndResponse(id)
-
-	code, line, err := c.conn.ReadCodeLine(expectCode)
-	return code, line, err
 }
 
-func formatError(err error) error {
-	if IsArticleNotFoundError(err) {
-		return errors.Join(err, ErrArticleNotFound)
+// readOneResponse reads a complete NNTP response from the stream.
+// Any unread bytes remain buffered in c.rbuf[c.rstart:c.rend] for subsequent reads.
+func (c *NNTPConnection) readOneResponse(out io.Writer) (NNTPResponse, error) {
+	resp := NNTPResponse{}
+	if err := c.rb.feedUntilDone(c.conn, &resp, out, func() (time.Time, bool) { return time.Time{}, false }); err != nil {
+		return resp, err
 	}
-
-	return err
-}
-
-// setOperationDeadline sets a deadline for the current operation on the underlying network connection.
-// The deadline is calculated as the current time plus the specified timeout duration.
-// Returns an error if setting the deadline fails.
-func (c *connection) setOperationDeadline(timeout time.Duration) error {
-	if timeout <= 0 {
-		return nil
-	}
-	deadline := time.Now().Add(timeout)
-	return c.netconn.SetDeadline(deadline)
-}
-
-// clearDeadline removes any deadline from the underlying network connection.
-// This allows subsequent operations to proceed without timeout constraints.
-// Returns an error if clearing the deadline fails.
-func (c *connection) clearDeadline() error {
-	return c.netconn.SetDeadline(time.Time{})
+	return resp, nil
 }
