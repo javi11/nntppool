@@ -9,6 +9,28 @@ import (
 	"github.com/mnightingale/rapidyenc"
 )
 
+// peekBufferSize is optimized for typical yenc header sizes (~50-150 bytes).
+// 512 bytes covers edge cases while reducing memory usage 8x vs the previous 4KB.
+const peekBufferSize = 512
+
+// peekBufferPool provides reusable buffers for GetYencHeaders peek operation.
+var peekBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, peekBufferSize)
+		return &buf
+	},
+}
+
+func acquirePeekBuffer() *[]byte {
+	return peekBufferPool.Get().(*[]byte)
+}
+
+func releasePeekBuffer(buf *[]byte) {
+	if buf != nil && len(*buf) == peekBufferSize {
+		peekBufferPool.Put(buf)
+	}
+}
+
 type YencHeaders struct {
 	FileName   string
 	FileSize   int64
@@ -29,7 +51,14 @@ type articleBodyReader struct {
 	decoder     *rapidyenc.Decoder
 	conn        *connection
 	responseID  uint
-	buffer      *bytes.Buffer
+
+	// reader is the effective reader after GetYencHeaders is called.
+	// Before GetYencHeaders: reader == nil (use decoder directly)
+	// After GetYencHeaders: reader == io.MultiReader(peekData, decoder)
+	reader   io.Reader
+	peekBuf  *[]byte       // Pooled buffer for GetYencHeaders (returned to pool on Close)
+	peekData *bytes.Reader // Read-only view of peeked data
+
 	headersRead bool
 	yencHeaders *YencHeaders
 	closed      bool
@@ -50,18 +79,12 @@ func (r *articleBodyReader) Read(p []byte) (n int, err error) {
 		return 0, io.EOF
 	}
 
-	if r.buffer != nil && r.buffer.Len() > 0 {
-		n, err = r.buffer.Read(p)
-		if r.buffer.Len() == 0 {
-			r.buffer = nil
-		}
-		if n > 0 || err != nil {
-			return n, err
-		}
+	// Use effective reader if GetYencHeaders was called (MultiReader chains peeked data + decoder)
+	if r.reader != nil {
+		return r.reader.Read(p)
 	}
-
-	n, err = r.decoder.Read(p)
-	return n, err
+	// GetYencHeaders not called, read directly from decoder
+	return r.decoder.Read(p)
 }
 
 func (r *articleBodyReader) GetYencHeaders() (headers YencHeaders, err error) {
@@ -80,11 +103,25 @@ func (r *articleBodyReader) GetYencHeaders() (headers YencHeaders, err error) {
 	}
 
 	if !r.headersRead {
-		buf := make([]byte, 4096)
+		// Acquire buffer from pool (512 bytes, optimized for typical yenc headers)
+		r.peekBuf = acquirePeekBuffer()
+		buf := *r.peekBuf
+
 		n, readErr := r.decoder.Read(buf)
+
 		if n > 0 {
-			r.buffer = bytes.NewBuffer(buf[:n])
+			// Create read-only view of peeked data (no buffer content allocation)
+			r.peekData = bytes.NewReader(buf[:n])
+			// Chain peeked data with remaining decoder data
+			r.reader = io.MultiReader(r.peekData, r.decoder)
+		} else {
+			// No data read, use decoder directly
+			r.reader = r.decoder
+			// Return buffer to pool immediately if unused
+			releasePeekBuffer(r.peekBuf)
+			r.peekBuf = nil
 		}
+
 		r.headersRead = true
 
 		if readErr != nil && readErr != io.EOF {
@@ -120,6 +157,16 @@ func (r *articleBodyReader) Close() (err error) {
 	}
 
 	r.closed = true
+
+	// Return peek buffer to pool
+	if r.peekBuf != nil {
+		releasePeekBuffer(r.peekBuf)
+		r.peekBuf = nil
+	}
+
+	// Clear references
+	r.reader = nil
+	r.peekData = nil
 
 	if r.decoder != nil {
 		_, _ = io.Copy(io.Discard, r.decoder)

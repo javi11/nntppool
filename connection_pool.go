@@ -1370,8 +1370,13 @@ func (p *connectionPool) checkHealth(ctx context.Context) {
 		p.checkProviderHealth(ctx, providersToCheck)
 	}
 
+	// Get current time once for the entire check cycle to avoid repeated time.Now() calls
+	now := time.Now()
+
 	// Then perform the existing connection pool health checks
-	for {
+	// Limit iterations to prevent excessive CPU usage during high churn
+	const maxIterations = 3
+	for i := 0; i < maxIterations; i++ {
 		// If checkMinConns failed we don't destroy any connections since we couldn't
 		// even get to minConns
 		if err := p.checkMinConns(ctx); err != nil {
@@ -1379,7 +1384,7 @@ func (p *connectionPool) checkHealth(ctx context.Context) {
 			break
 		}
 
-		if !p.checkConnsHealth() {
+		if !p.checkConnsHealthWithTime(now) {
 			// Since we didn't destroy any connections we can stop looping
 			break
 		}
@@ -1393,17 +1398,27 @@ func (p *connectionPool) checkHealth(ctx context.Context) {
 			return
 		case <-time.After(500 * time.Millisecond):
 		}
+
+		// Update time for next iteration
+		now = time.Now()
 	}
 }
 
 func (p *connectionPool) checkConnsHealth() bool {
+	return p.checkConnsHealthWithTime(time.Now())
+}
+
+// checkConnsHealthWithTime checks connection health using a pre-computed timestamp
+// to avoid repeated time.Now() calls when checking multiple connections.
+func (p *connectionPool) checkConnsHealthWithTime(now time.Time) bool {
 	var destroyed bool
 
 	p.connPoolsMu.RLock()
 	pools := p.connPools
 	p.connPoolsMu.RUnlock()
 
-	idle := make([]*puddle.Resource[*internalConnection], 0)
+	// Pre-allocate with estimated capacity to reduce allocations
+	idle := make([]*puddle.Resource[*internalConnection], 0, len(pools)*4)
 
 	for _, pool := range pools {
 		idle = append(idle, pool.connectionPool.AcquireAllIdle()...)
@@ -1412,7 +1427,7 @@ func (p *connectionPool) checkConnsHealth() bool {
 	for _, res := range idle {
 		providerTimeout := time.Duration(res.Value().provider.MaxConnectionIdleTimeInSeconds) * time.Second
 
-		if p.isExpired(res) || res.IdleDuration() > providerTimeout {
+		if p.isExpiredAt(res, now) || res.IdleDuration() > providerTimeout {
 			res.Destroy()
 
 			destroyed = true
@@ -1457,7 +1472,13 @@ func (p *connectionPool) checkMinConns(ctx context.Context) error {
 }
 
 func (p *connectionPool) isExpired(res *puddle.Resource[*internalConnection]) bool {
-	return time.Now().After(res.Value().nntp.MaxAgeTime())
+	return p.isExpiredAt(res, time.Now())
+}
+
+// isExpiredAt checks if a connection is expired at a given time.
+// Use this in batch operations to avoid repeated time.Now() calls.
+func (p *connectionPool) isExpiredAt(res *puddle.Resource[*internalConnection], now time.Time) bool {
+	return now.After(res.Value().nntp.MaxAgeTime())
 }
 
 // isConnectionExpiredError checks if the error is likely due to an expired/stale connection
