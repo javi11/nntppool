@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 )
 
 // BenchConfig holds benchmark configuration.

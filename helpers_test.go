@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 	"go.uber.org/mock/gomock"
 )
 
@@ -102,9 +102,9 @@ func TestCreateProxyDialer(t *testing.T) {
 
 func TestIsProxyError(t *testing.T) {
 	tests := []struct {
-		name   string
-		err    error
-		want   bool
+		name string
+		err  error
+		want bool
 	}{
 		{
 			name: "nil error",
@@ -192,11 +192,11 @@ func findSubstring(s, substr string) bool {
 
 func TestDialNNTP_WithProxy(t *testing.T) {
 	tests := []struct {
-		name          string
-		config        UsenetProviderConfig
-		setupMocks    func(*gomock.Controller) nntpcli.Client
-		wantErr       bool
-		errContains   string
+		name        string
+		config      UsenetProviderConfig
+		setupMocks  func(*gomock.Controller) nntpcli.Client
+		wantErr     bool
+		errContains string
 	}{
 		{
 			name: "successful connection without proxy",

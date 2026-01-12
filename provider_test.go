@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v2/internal/netconn"
+	"github.com/javi11/nntppool/v3/internal/netconn"
 	"github.com/yudhasubki/netpool"
 )
 

@@ -1,4 +1,4 @@
-module github.com/javi11/nntppool/v2
+module github.com/javi11/nntppool/v3
 
 go 1.25.1
 

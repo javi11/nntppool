@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/javi11/nntppool/v2/pkg/nntpcli/test"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli/test"
 
 	"github.com/stretchr/testify/assert"
 )

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 )
 
 // pooledBodyReader wraps an io.ReadCloser and manages the associated pooled connection

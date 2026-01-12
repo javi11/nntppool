@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/avast/retry-go/v4"
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 
-	"github.com/javi11/nntppool/v2/internal/config"
+	"github.com/javi11/nntppool/v3/internal/config"
 )
 
 // Logger interface compatible with slog.Logger
@@ -83,10 +83,10 @@ type ProviderConfig interface {
 }
 
 type UsenetProviderConfig struct {
-	Host                           string
-	Username                       string
-	Password                       string
-	VerifyCapabilities             []string
+	Host               string
+	Username           string
+	Password           string
+	VerifyCapabilities []string
 	// ProxyURL is an optional SOCKS5 proxy URL for this provider.
 	// Format: socks5://[user:password@]host:port
 	// Example: socks5://proxy.example.com:1080
@@ -100,10 +100,10 @@ type UsenetProviderConfig struct {
 	// waiting for responses. Set to 0 or 1 to disable pipelining (default).
 	// Recommended values: 2-4 for low latency (<50ms), 4-8 for high latency (100ms+).
 	// Higher values can improve throughput on high-latency connections.
-	PipelineDepth                  int
-	TLS                            bool
-	InsecureSSL                    bool
-	IsBackupProvider               bool
+	PipelineDepth    int
+	TLS              bool
+	InsecureSSL      bool
+	IsBackupProvider bool
 }
 
 func (u *UsenetProviderConfig) ID() string {

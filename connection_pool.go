@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/avast/retry-go/v4"
-	"github.com/javi11/nntppool/v2/internal/netconn"
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/internal/netconn"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 )
 
 const defaultHealthCheckInterval = 1 * time.Minute

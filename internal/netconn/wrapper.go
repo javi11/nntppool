@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 )
 
 // NNTPConnWrapper wraps a net.Conn and its associated nntpcli.Connection.

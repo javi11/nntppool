@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/javi11/nntppool/v2/internal/netconn"
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/internal/netconn"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 	"github.com/yudhasubki/netpool"
 )
 

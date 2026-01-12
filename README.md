@@ -21,7 +21,7 @@ A nntp pool connection with retry and provider rotation.
 To install the `nntppool` package, you can use `go get`:
 
 ```sh
-go get github.com/javi11/nntppool/v2
+go get github.com/javi11/nntppool/v3
 ```
 
 Since this package uses [Rapidyenc](github.com/mnightingale/rapidyenc), you will need to build it with **CGO enabled**
@@ -37,7 +37,7 @@ import (
     "os"
     "time"
 
-    "github.com/javi11/nntppool/v2"
+    "github.com/javi11/nntppool/v3"
 )
 
 func main() {
@@ -242,7 +242,7 @@ To set up the project for development, follow these steps:
 1. Clone the repository:
 
 ```sh
-git clone https://github.com/javi11/nntppool/v2.git
+git clone https://github.com/javi11/nntppool/v3.git
 cd nntppool
 ```
 

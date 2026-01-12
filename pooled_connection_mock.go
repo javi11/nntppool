@@ -12,7 +12,7 @@ package nntppool
 import (
 	reflect "reflect"
 
-	nntpcli "github.com/javi11/nntppool/v2/pkg/nntpcli"
+	nntpcli "github.com/javi11/nntppool/v3/pkg/nntpcli"
 	gomock "go.uber.org/mock/gomock"
 )
 

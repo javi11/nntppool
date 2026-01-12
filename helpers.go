@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
-	"github.com/javi11/nntppool/v2/internal/netconn"
-	"github.com/javi11/nntppool/v2/pkg/nntpcli"
+	"github.com/javi11/nntppool/v3/internal/netconn"
+	"github.com/javi11/nntppool/v3/pkg/nntpcli"
 	"github.com/yudhasubki/netpool"
 	"golang.org/x/net/proxy"
 )
@@ -67,11 +67,6 @@ func getPools(
 				MinPool:     0,
 				DialTimeout: 30 * time.Second,
 				MaxIdleTime: maxIdleTime,
-				// Note: HealthCheck is intentionally nil for performance.
-				// Running Ping() on every Get() adds significant latency.
-				// Bad connections are detected during NNTP operations and
-				// handled by the retry logic. Stale connections are handled
-				// by MaxIdleTime.
 			},
 		)
 		if err != nil {
