@@ -129,7 +129,7 @@ func (c *client) Dial(
 
 	maxAgeTime := time.Now().Add(keepAlive)
 
-	return newConnection(conn, maxAgeTime, c.config.OperationTimeout)
+	return newConnection(conn, maxAgeTime, c.config.OperationTimeout, c.config.getReadBufferSize())
 }
 
 // DialTLS connects to an NNTP server using a TLS-encrypted connection.
@@ -174,5 +174,5 @@ func (c *client) DialTLS(
 
 	maxAgeTime := time.Now().Add(keepAlive)
 
-	return newConnection(tlsConn, maxAgeTime, c.config.OperationTimeout)
+	return newConnection(tlsConn, maxAgeTime, c.config.OperationTimeout, c.config.getReadBufferSize())
 }

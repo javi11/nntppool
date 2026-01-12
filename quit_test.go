@@ -40,7 +40,7 @@ func TestSimplifiedQuit(t *testing.T) {
 	}
 
 	// Test that further operations fail after shutdown
-	_, err = pool.GetConnection(context.Background(), []string{}, false)
+	_, err = pool.GetConnection(context.Background(), []string{})
 	if err == nil {
 		t.Error("GetConnection should fail after shutdown")
 	}

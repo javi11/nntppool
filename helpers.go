@@ -399,3 +399,75 @@ func isProxyError(err error) bool {
 	return strings.Contains(errStr, "socks") ||
 		strings.Contains(errStr, "proxy")
 }
+
+// retryWithProviderRotation executes fn with automatic provider rotation on article-not-found errors.
+// It tries providers in order (primaries first, then backups), skipping hosts that return article-not-found.
+// The function handles connection acquisition and cleanup:
+//   - On success: caller must free/close the connection in fn
+//   - On article-not-found: connection is freed and next provider is tried
+//   - On other errors: connection is closed and error is returned immediately
+//
+// Returns ErrArticleNotFoundInProviders if all providers return article-not-found.
+// Returns the last error if all providers are exhausted for other reasons.
+func (p *connectionPool) retryWithProviderRotation(
+	ctx context.Context,
+	fn func(conn PooledConnection) error,
+) error {
+	skipHosts := make([]string, 0)
+	hadArticleNotFound := false
+
+	for {
+		// Check context before attempting
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		conn, err := p.GetConnection(ctx, skipHosts)
+		if err != nil {
+			// No more providers available
+			if hadArticleNotFound {
+				return ErrArticleNotFoundInProviders
+			}
+			return err
+		}
+
+		// Execute the operation
+		err = fn(conn)
+		if err == nil {
+			// Success - caller is responsible for freeing the connection
+			return nil
+		}
+
+		host := conn.Provider().Host
+
+		if nntpcli.IsArticleNotFoundError(err) {
+			// Article not found - skip this host and try next provider
+			skipHosts = append(skipHosts, host)
+			hadArticleNotFound = true
+
+			p.log.DebugContext(ctx,
+				"Article not found in provider, trying another one...",
+				"provider", host,
+			)
+
+			// Record metrics
+			p.metrics.RecordError(host)
+			p.metrics.RecordRetry()
+
+			// Free connection (it's still healthy, just doesn't have the article)
+			if freeErr := conn.Free(); freeErr != nil {
+				p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
+			}
+
+			continue
+		}
+
+		// Other error - close connection and return
+		p.metrics.RecordError(host)
+		if closeErr := conn.Close(); closeErr != nil {
+			p.log.DebugContext(ctx, "Failed to close connection on error", "error", closeErr)
+		}
+
+		return err
+	}
+}

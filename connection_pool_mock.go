@@ -87,18 +87,18 @@ func (mr *MockUsenetConnectionPoolMockRecorder) BodyReader(ctx, msgID, nntpGroup
 }
 
 // GetConnection mocks base method.
-func (m *MockUsenetConnectionPool) GetConnection(ctx context.Context, skipProviders []string, useBackupProviders bool) (PooledConnection, error) {
+func (m *MockUsenetConnectionPool) GetConnection(ctx context.Context, skipHosts []string) (PooledConnection, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetConnection", ctx, skipProviders, useBackupProviders)
+	ret := m.ctrl.Call(m, "GetConnection", ctx, skipHosts)
 	ret0, _ := ret[0].(PooledConnection)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // GetConnection indicates an expected call of GetConnection.
-func (mr *MockUsenetConnectionPoolMockRecorder) GetConnection(ctx, skipProviders, useBackupProviders any) *gomock.Call {
+func (mr *MockUsenetConnectionPoolMockRecorder) GetConnection(ctx, skipHosts any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetConnection", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetConnection), ctx, skipProviders, useBackupProviders)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetConnection", reflect.TypeOf((*MockUsenetConnectionPool)(nil).GetConnection), ctx, skipHosts)
 }
 
 // GetMetrics mocks base method.

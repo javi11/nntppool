@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/textproto"
 	"testing"
 	"time"
@@ -215,6 +216,9 @@ func TestPartialProviderInitialization(t *testing.T) {
 	mockConn1 := nntpcli.NewMockConnection(ctrl)
 	mockConn1.EXPECT().Close().AnyTimes()
 	mockConn1.EXPECT().Capabilities().Return([]string{"READER"}, nil).AnyTimes()
+	// NetConn is called when wrapping for netpool
+	fakeConn, _ := net.Pipe()
+	mockConn1.EXPECT().NetConn().Return(fakeConn).AnyTimes()
 
 	// Mock a failed connection for another provider
 	mockClient.EXPECT().Dial(gomock.Any(), "working.example.com", 119, gomock.Any()).

@@ -2,6 +2,7 @@
 package nntpcli
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -9,10 +10,20 @@ import (
 	"net/textproto"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
+
+// copyBufPool provides reusable buffers for io.CopyBuffer operations.
+// 128KB buffers reduce syscalls and improve throughput for large transfers.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 128*1024) // 128KB buffer
+		return &buf
+	},
+}
 
 type Connection interface {
 	io.Closer
@@ -53,8 +64,17 @@ type connection struct {
 	operationTimeout   time.Duration
 }
 
-func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time.Duration) (Connection, error) {
-	conn := textproto.NewConn(netconn)
+func newConnection(netconn net.Conn, maxAgeTime time.Time, operationTimeout time.Duration, readBufSize int) (Connection, error) {
+	if readBufSize <= 0 {
+		readBufSize = DefaultReadBufferSize
+	}
+	// Wrap netconn with a larger buffered reader to reduce syscalls
+	bufReader := bufio.NewReaderSize(netconn, readBufSize)
+	conn := textproto.NewConn(struct {
+		io.Reader
+		io.Writer
+		io.Closer
+	}{bufReader, netconn, netconn})
 
 	_, _, err := conn.ReadCodeLine(StatusReady)
 	if err != nil {
@@ -259,14 +279,20 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		return 0, fmt.Errorf("BODY <%s>: %w", msgID, err)
 	}
 
+	// DotReader handles NNTP dot-stuffed format and terminator (.\r\n)
 	dec := rapidyenc.AcquireDecoder(c.conn.R)
 	defer rapidyenc.ReleaseDecoder(dec)
 
-	// Discard the first n lines
+	// Acquire pooled buffer for copy operations
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	copyBuf := *bufPtr
+
+	// Discard the first n bytes
 	if discard > 0 {
 		if _, err = io.CopyN(io.Discard, dec, discard); err != nil {
 			// Attempt to drain the decoder to avoid connection issues
-			if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
+			if _, drainErr := io.CopyBuffer(io.Discard, dec, copyBuf); drainErr != nil {
 				return 0, fmt.Errorf("BODY <%s>: discard %d bytes failed: %w (drain also failed: %v)", msgID, discard, err, drainErr)
 			}
 
@@ -274,10 +300,10 @@ func (c *connection) BodyDecoded(msgID string, w io.Writer, discard int64) (n in
 		}
 	}
 
-	n, err = io.Copy(w, dec)
+	n, err = io.CopyBuffer(w, dec, copyBuf)
 	if err != nil {
 		// Attempt to drain the decoder to avoid connection issues
-		if _, drainErr := io.Copy(io.Discard, dec); drainErr != nil {
+		if _, drainErr := io.CopyBuffer(io.Discard, dec, copyBuf); drainErr != nil {
 			return n, fmt.Errorf("BODY <%s>: copy failed: %w (drain also failed: %v)", msgID, err, drainErr)
 		}
 
@@ -321,6 +347,7 @@ func (c *connection) BodyReader(msgID string) (reader ArticleBodyReader, err err
 		return nil, fmt.Errorf("clear deadline: %w", err)
 	}
 
+	// DotReader handles NNTP dot-stuffed format and terminator (.\r\n)
 	dec := rapidyenc.AcquireDecoder(c.conn.R)
 
 	return &articleBodyReader{

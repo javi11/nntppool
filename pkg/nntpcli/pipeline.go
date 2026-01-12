@@ -105,6 +105,11 @@ func (c *connection) BodyPipelined(requests []PipelineRequest) (results []Pipeli
 		sentCount = i + 1
 	}
 
+	// Acquire pooled buffer for copy operations (shared across all responses)
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	copyBuf := *bufPtr
+
 	// Phase 2: Read all responses in order (for commands that were successfully sent)
 	for i := 0; i < sentCount; i++ {
 		req := requests[i]
@@ -126,13 +131,14 @@ func (c *connection) BodyPipelined(requests []PipelineRequest) (results []Pipeli
 		}
 
 		// Decode body with rapidyenc
-		dec := rapidyenc.AcquireDecoder(c.conn.R)
+		// DotReader handles NNTP dot-stuffed format and terminator (.\r\n)
+		dec := rapidyenc.AcquireDecoder(c.conn.DotReader())
 
 		// Discard the first n bytes if requested
 		if req.Discard > 0 {
 			if _, discardErr := io.CopyN(io.Discard, dec, req.Discard); discardErr != nil {
 				// Attempt to drain the decoder to avoid connection issues
-				_, _ = io.Copy(io.Discard, dec)
+				_, _ = io.CopyBuffer(io.Discard, dec, copyBuf)
 				rapidyenc.ReleaseDecoder(dec)
 				c.conn.EndResponse(ids[i])
 				results[i].Error = fmt.Errorf("BODY <%s>: discard %d bytes failed: %w", req.MessageID, req.Discard, discardErr)
@@ -141,10 +147,10 @@ func (c *connection) BodyPipelined(requests []PipelineRequest) (results []Pipeli
 		}
 
 		// Copy decoded body to writer
-		n, copyErr := io.Copy(req.Writer, dec)
+		n, copyErr := io.CopyBuffer(req.Writer, dec, copyBuf)
 		if copyErr != nil {
 			// Attempt to drain the decoder to avoid connection issues
-			_, _ = io.Copy(io.Discard, dec)
+			_, _ = io.CopyBuffer(io.Discard, dec, copyBuf)
 			rapidyenc.ReleaseDecoder(dec)
 			c.conn.EndResponse(ids[i])
 			results[i].BytesWritten = n

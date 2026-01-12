@@ -44,13 +44,22 @@ type BodyBatchResult struct {
 	ProviderHost string
 }
 
+// retryRequest represents a single article retry request for the worker pool.
+type retryRequest struct {
+	originalIdx int              // Index in original requests slice
+	request     BodyBatchRequest // The original request
+	skipHosts   []string         // Hosts already tried for this article
+	attempt     int              // Current retry attempt number
+}
+
 type UsenetConnectionPool interface {
+	// GetConnection returns a connection from the pool, skipping providers with hosts in skipHosts.
+	// Providers are tried in order: all primary providers first, then backup providers.
+	// If a host is in skipHosts, ALL providers with that host are skipped (useful when
+	// an article is not found - no point trying other accounts on the same host).
 	GetConnection(
 		ctx context.Context,
-		// The list of provider host to skip
-		skipProviders []string,
-		// If true, backup providers will be used
-		useBackupProviders bool,
+		skipHosts []string,
 	) (PooledConnection, error)
 	Body(
 		ctx context.Context,
@@ -297,11 +306,16 @@ func (p *connectionPool) Quit() {
 
 func (p *connectionPool) GetConnection(
 	ctx context.Context,
-	skipProviders []string,
-	useBackupProviders bool,
+	skipHosts []string,
 ) (PooledConnection, error) {
 	if atomic.LoadInt32(&p.isShutdown) == 1 {
 		return nil, ErrConnectionPoolShutdown
+	}
+
+	// Convert skipHosts to map for O(1) lookups
+	skipHostsMap := make(map[string]struct{}, len(skipHosts))
+	for _, host := range skipHosts {
+		skipHostsMap[host] = struct{}{}
 	}
 
 	// Lock access to connPools to prevent TOCTOU race with Quit()
@@ -311,12 +325,32 @@ func (p *connectionPool) GetConnection(
 		return nil, fmt.Errorf("connection pool is not available")
 	}
 
+	// Build ordered candidate list: primary providers first, then backups
+	// Pre-allocate with capacity to avoid reallocations
 	cp := make([]*providerPool, 0, len(p.connPools))
 
+	// First pass: add primaries
 	for _, provider := range p.connPools {
-		if !slices.Contains(skipProviders, provider.provider.ID()) &&
-			(!provider.provider.IsBackupProvider || useBackupProviders) &&
-			provider.IsAcceptingConnections() {
+		if _, skip := skipHostsMap[provider.provider.Host]; skip {
+			continue // Skip all providers with this host
+		}
+		if !provider.IsAcceptingConnections() {
+			continue
+		}
+		if !provider.provider.IsBackupProvider {
+			cp = append(cp, provider)
+		}
+	}
+
+	// Second pass: add backups
+	for _, provider := range p.connPools {
+		if _, skip := skipHostsMap[provider.provider.Host]; skip {
+			continue
+		}
+		if !provider.IsAcceptingConnections() {
+			continue
+		}
+		if provider.provider.IsBackupProvider {
 			cp = append(cp, provider)
 		}
 	}
@@ -340,23 +374,28 @@ func (p *connectionPool) GetConnection(
 	p.metrics.RecordAcquireWaitTime(time.Since(start))
 
 	// Create pooled connection with provider info and pool reference
-	pooledConn := newPooledConnection(conn, pool.provider, pool.connectionPool, p.log, p.metrics)
+	// newPooledConnection returns the extracted nntpConn to avoid duplicate type assertions
+	pooledConn, nntpConn := newPooledConnection(conn, pool.provider, pool.connectionPool, p.log, p.metrics)
 
 	// Register the connection as active for metrics tracking
-	if wrapper, ok := conn.(*netconn.NNTPConnWrapper); ok {
-		p.metrics.RegisterActiveConnection(pooledConn.connectionID(), wrapper.NNTPConnection())
+	if nntpConn != nil {
+		p.metrics.RegisterActiveConnection(pooledConn.connectionID(), nntpConn)
 	}
 
 	return pooledConn, nil
 }
 
 func (p *connectionPool) GetProvidersInfo() []ProviderInfo {
+	// Snapshot pool references under lock, release early to reduce contention
 	p.connPoolsMu.RLock()
-	defer p.connPoolsMu.RUnlock()
+	pools := make([]*providerPool, len(p.connPools))
+	copy(pools, p.connPools)
+	p.connPoolsMu.RUnlock()
 
-	pi := make([]ProviderInfo, 0)
+	// Build results without holding connPoolsMu - Stats() calls happen outside lock
+	pi := make([]ProviderInfo, 0, len(pools))
 
-	for _, pool := range p.connPools {
+	for _, pool := range pools {
 		lastAttempt, lastSuccess, nextRetry, reason, retries := pool.GetConnectionStatus()
 
 		pi = append(pi, ProviderInfo{
@@ -467,168 +506,58 @@ func (p *connectionPool) Body(
 	nntpGroups []string,
 ) (int64, error) {
 	var (
-		totalBytesFromPreviousAttempts int64 // Cumulative bytes written across failed retry attempts
-		conn                           PooledConnection
-		finalBytesWritten              int64  // Total bytes written on successful attempt
-		providerHost                   string // Provider host for metrics tracking
+		bytesWritten int64
+		providerHost string
 	)
 
-	skipProviders := make([]string, 0)
-
-	retryErr := retry.Do(func() error {
-		// In case of skip provider it means that the article was not found,
-		// in such case we want to use backup providers as well
-		var useBackupProviders bool
-		if len(skipProviders) > 0 {
-			useBackupProviders = true
-		}
-
-		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
-		if err != nil {
-			if c != nil {
-				if closeErr := c.Close(); closeErr != nil {
-					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
-				}
-			}
-
-			if errors.Is(err, context.Canceled) {
-				return err
-			}
-
-			return fmt.Errorf("error getting nntp connection: %w", err)
-		}
-
-		conn = c
+	err := p.retryWithProviderRotation(ctx, func(conn PooledConnection) error {
 		nntpConn := conn.Connection()
 
 		if len(nntpGroups) > 0 {
-			err = joinGroup(nntpConn, nntpGroups)
-			if err != nil {
+			if err := joinGroup(nntpConn, nntpGroups); err != nil {
 				return fmt.Errorf("error joining group: %w", err)
 			}
 		}
 
-		n, err := nntpConn.BodyDecoded(msgID, w, totalBytesFromPreviousAttempts)
+		n, err := nntpConn.BodyDecoded(msgID, w, 0)
 		if err != nil {
-			totalBytesFromPreviousAttempts += n
 			return fmt.Errorf("error downloading body: %w", err)
 		}
 
-		finalBytesWritten = n
-
-		// Capture provider host before freeing connection
+		bytesWritten = n
 		providerHost = conn.Provider().Host
 
-		if err := conn.Free(); err != nil {
-			p.log.DebugContext(ctx, "Failed to free connection after successful body download", "error", err)
+		if freeErr := conn.Free(); freeErr != nil {
+			p.log.DebugContext(ctx, "Failed to free connection after successful body download", "error", freeErr)
 		}
 
 		return nil
-	},
-		retry.Context(ctx),
-		retry.Attempts(p.config.MaxRetries),
-		retry.DelayType(p.config.delayTypeFn),
-		retry.Delay(p.config.RetryDelay),
-		retry.RetryIf(func(err error) bool {
-			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
-		}),
-		retry.OnRetry(func(n uint, err error) {
-			p.metrics.RecordRetry()
+	})
 
-			if conn != nil {
-				provider := conn.Provider()
-
-				// Record error for this provider
-				p.metrics.RecordError(provider.Host)
-
-				if nntpcli.IsArticleNotFoundError(err) {
-					skipProviders = append(skipProviders, provider.ID())
-					p.log.DebugContext(ctx,
-						"Article not found in provider, trying another one...",
-						"provider",
-						provider.Host,
-						"segment_id", msgID,
-						"retry", n,
-					)
-
-					if freeErr := conn.Free(); freeErr != nil {
-						p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
-					}
-					conn = nil
-				} else {
-					if closeErr := conn.Close(); closeErr != nil {
-						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
-					}
-					conn = nil
-				}
-			}
-		}),
-	)
-	if retryErr != nil {
-		err := retryErr
-
-		var e retry.Error
-
-		if errors.As(err, &e) {
-			wrappedErrors := e.WrappedErrors()
-			lastError := wrappedErrors[len(wrappedErrors)-1]
-
-			if conn != nil {
-				if errors.Is(lastError, context.Canceled) {
-					if freeErr := conn.Free(); freeErr != nil {
-						p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
-					}
-				} else {
-					if closeErr := conn.Close(); closeErr != nil {
-						p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
-					}
-				}
-			}
-
-			// Check only the last error to determine if article was not found
-			if !errors.Is(lastError, context.Canceled) && nntpcli.IsArticleNotFoundError(lastError) {
-				p.log.DebugContext(ctx,
-					"Segment Not Found in any of the providers",
-					"error", lastError,
-					"segment_id", msgID,
-				)
-
-				// if article not found, we don't want to retry so mark it as corrupted
-				return finalBytesWritten, ErrArticleNotFoundInProviders
-			}
-
-			return finalBytesWritten, lastError
+	if err != nil {
+		if errors.Is(err, ErrArticleNotFoundInProviders) {
+			p.log.DebugContext(ctx,
+				"Segment Not Found in any of the providers",
+				"error", err,
+				"segment_id", msgID,
+			)
 		}
-
-		if conn != nil {
-			if errors.Is(err, context.Canceled) {
-				if freeErr := conn.Free(); freeErr != nil {
-					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
-				}
-			} else {
-				if closeErr := conn.Close(); closeErr != nil {
-					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
-				}
-			}
-		}
-
-		return finalBytesWritten, err
+		return bytesWritten, err
 	}
 
-	conn = nil
-
-	// Record successful download metrics with provider host
-	p.metrics.RecordDownload(finalBytesWritten, providerHost)
+	// Record successful download metrics
+	p.metrics.RecordDownload(bytesWritten, providerHost)
 	p.metrics.RecordArticleDownloaded(providerHost)
 
-	return finalBytesWritten, nil
+	return bytesWritten, nil
 }
 
 // BodyBatch downloads multiple articles using pipelining if supported by the provider.
 // The group parameter specifies the newsgroup to join before downloading.
-// Articles are batched according to the provider's PipelineDepth setting.
 // Returns results in the same order as requests.
-// Failed requests are automatically retried with provider rotation.
+// Failed requests are automatically retried in parallel with provider rotation -
+// each failed article is independently retried on other providers without waiting
+// for other articles to complete.
 //
 // Parameters:
 //   - ctx: The context for the operation.
@@ -661,155 +590,292 @@ func (p *connectionPool) BodyBatch(
 		return results
 	}
 
-	// Track which requests still need to be processed
-	pendingIndices := make([]int, len(requests))
-	for i := range pendingIndices {
-		pendingIndices[i] = i
+	// Check context cancellation early
+	if ctx.Err() != nil {
+		for i := range requests {
+			results[i] = BodyBatchResult{
+				MessageID: requests[i].MessageID,
+				Error:     ctx.Err(),
+			}
+		}
+		return results
 	}
 
-	skipProviders := make([]string, 0)
-	maxAttempts := int(p.config.MaxRetries)
+	// Setup for parallel retry workers
+	var resultsMu sync.Mutex
+	var wg sync.WaitGroup
 
-	for attempt := 0; attempt < maxAttempts && len(pendingIndices) > 0; attempt++ {
-		// Check context cancellation
-		if ctx.Err() != nil {
-			for _, idx := range pendingIndices {
-				results[idx] = BodyBatchResult{
-					MessageID: requests[idx].MessageID,
-					Error:     ctx.Err(),
+	// Buffered channel for retry requests - size allows all requests to potentially need retry
+	retryChan := make(chan retryRequest, len(requests))
+
+	// Determine number of workers based on available providers and requests
+	p.connPoolsMu.RLock()
+	numProviders := len(p.connPools)
+	p.connPoolsMu.RUnlock()
+
+	numWorkers := min(numProviders, len(requests))
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	// Start retry workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go p.bodyBatchRetryWorker(ctx, group, retryChan, results, &resultsMu, &wg)
+	}
+
+	// Get initial connection for pipelined batch
+	conn, err := p.GetConnection(ctx, nil)
+	if err != nil {
+		close(retryChan)
+		wg.Wait()
+		// Mark all as failed
+		for i := range requests {
+			results[i] = BodyBatchResult{
+				MessageID: requests[i].MessageID,
+				Error:     fmt.Errorf("error getting nntp connection: %w", err),
+			}
+		}
+		return results
+	}
+
+	nntpConn := conn.Connection()
+	provider := conn.Provider()
+	pipelineDepth := provider.PipelineDepth
+	initialHost := provider.Host
+
+	// Join the group
+	if err := nntpConn.JoinGroup(group); err != nil {
+		_ = conn.Close()
+		close(retryChan)
+		wg.Wait()
+		for i := range requests {
+			results[i] = BodyBatchResult{
+				MessageID: requests[i].MessageID,
+				Error:     fmt.Errorf("error joining group: %w", err),
+			}
+		}
+		return results
+	}
+
+	// If pipelining is disabled (depth <= 1), fall back to sequential with parallel retries
+	if pipelineDepth <= 1 {
+		for idx, req := range requests {
+			n, bodyErr := nntpConn.BodyDecoded(req.MessageID, req.Writer, req.Discard)
+
+			if bodyErr != nil && nntpcli.IsArticleNotFoundError(bodyErr) {
+				// Article not found - send to retry workers immediately
+				p.metrics.RecordError(provider.Host)
+				retryChan <- retryRequest{
+					originalIdx: idx,
+					request:     req,
+					skipHosts:   []string{initialHost},
+					attempt:     1,
 				}
-			}
-			return results
-		}
-
-		// Get connection
-		useBackupProviders := len(skipProviders) > 0
-		conn, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
-		if err != nil {
-			if conn != nil {
-				_ = conn.Close()
-			}
-			// Mark all pending as failed with this error
-			for _, idx := range pendingIndices {
-				results[idx] = BodyBatchResult{
-					MessageID: requests[idx].MessageID,
-					Error:     fmt.Errorf("error getting nntp connection: %w", err),
+			} else {
+				// Success or non-retryable error
+				if bodyErr != nil {
+					p.metrics.RecordError(provider.Host)
+				} else {
+					p.metrics.RecordDownload(n, provider.Host)
+					p.metrics.RecordArticleDownloaded(provider.Host)
 				}
-			}
-			return results
-		}
-
-		nntpConn := conn.Connection()
-		provider := conn.Provider()
-		pipelineDepth := provider.PipelineDepth
-
-		// Join the group
-		if err := nntpConn.JoinGroup(group); err != nil {
-			_ = conn.Close()
-			// Mark all pending as failed and try next provider
-			for _, idx := range pendingIndices {
-				results[idx].Error = fmt.Errorf("error joining group: %w", err)
-			}
-			continue
-		}
-
-		// If pipelining is disabled (depth <= 1), fall back to sequential
-		if pipelineDepth <= 1 {
-			// Process sequentially
-			newPending := make([]int, 0)
-			for _, idx := range pendingIndices {
-				req := requests[idx]
-				n, bodyErr := nntpConn.BodyDecoded(req.MessageID, req.Writer, req.Discard)
+				resultsMu.Lock()
 				results[idx] = BodyBatchResult{
 					MessageID:    req.MessageID,
 					BytesWritten: n,
 					Error:        bodyErr,
 					ProviderHost: provider.Host,
 				}
+				resultsMu.Unlock()
+			}
+		}
+		_ = conn.Free()
+		close(retryChan)
+		wg.Wait()
+		return results
+	}
 
-				if bodyErr != nil {
-					p.metrics.RecordError(provider.Host)
-					if nntpcli.IsArticleNotFoundError(bodyErr) {
-						// Article not found - will retry with another provider
-						newPending = append(newPending, idx)
-					}
-				} else {
-					p.metrics.RecordDownload(n, provider.Host)
-					p.metrics.RecordArticleDownloaded(provider.Host)
-				}
+	// Build pipeline requests for ALL requests
+	pipelineReqs := make([]nntpcli.PipelineRequest, len(requests))
+	for i, req := range requests {
+		pipelineReqs[i] = nntpcli.PipelineRequest{
+			MessageID: req.MessageID,
+			Writer:    req.Writer,
+			Discard:   req.Discard,
+		}
+	}
+
+	// Execute pipelined batch
+	pipelineResults := nntpConn.BodyPipelined(pipelineReqs)
+	_ = conn.Free()
+
+	// Process results - successes go to results, failures go to retry channel
+	for i, pr := range pipelineResults {
+		if pr.Error != nil && nntpcli.IsArticleNotFoundError(pr.Error) {
+			// Article not found - send to retry workers immediately
+			p.metrics.RecordError(provider.Host)
+			retryChan <- retryRequest{
+				originalIdx: i,
+				request:     requests[i],
+				skipHosts:   []string{initialHost},
+				attempt:     1,
 			}
-			pendingIndices = newPending
-			if len(newPending) > 0 {
-				skipProviders = append(skipProviders, provider.ID())
+		} else {
+			// Success or non-retryable error
+			if pr.Error != nil {
+				p.metrics.RecordError(provider.Host)
+			} else {
+				p.metrics.RecordDownload(pr.BytesWritten, provider.Host)
+				p.metrics.RecordArticleDownloaded(provider.Host)
 			}
-			_ = conn.Free()
+			resultsMu.Lock()
+			results[i] = BodyBatchResult{
+				MessageID:    pr.MessageID,
+				BytesWritten: pr.BytesWritten,
+				Error:        pr.Error,
+				ProviderHost: provider.Host,
+			}
+			resultsMu.Unlock()
+		}
+	}
+
+	// Close retry channel to signal workers to finish
+	close(retryChan)
+
+	// Wait for all retry workers to complete
+	wg.Wait()
+
+	return results
+}
+
+// bodyBatchRetryWorker processes retry requests for articles not found on initial provider.
+// Workers run in parallel, each handling individual article retries independently.
+func (p *connectionPool) bodyBatchRetryWorker(
+	ctx context.Context,
+	group string,
+	retryChan chan retryRequest,
+	results []BodyBatchResult,
+	resultsMu *sync.Mutex,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	for req := range retryChan {
+		// Check context cancellation
+		if ctx.Err() != nil {
+			resultsMu.Lock()
+			results[req.originalIdx] = BodyBatchResult{
+				MessageID: req.request.MessageID,
+				Error:     ctx.Err(),
+			}
+			resultsMu.Unlock()
 			continue
 		}
 
-		// Process in batches according to pipeline depth
-		newPending := make([]int, 0)
-
-		for batchStart := 0; batchStart < len(pendingIndices); batchStart += pipelineDepth {
-			batchEnd := batchStart + pipelineDepth
-			if batchEnd > len(pendingIndices) {
-				batchEnd = len(pendingIndices)
-			}
-			batchIndices := pendingIndices[batchStart:batchEnd]
-
-			// Build pipeline requests for this batch
-			pipelineReqs := make([]nntpcli.PipelineRequest, len(batchIndices))
-			for i, idx := range batchIndices {
-				pipelineReqs[i] = nntpcli.PipelineRequest{
-					MessageID: requests[idx].MessageID,
-					Writer:    requests[idx].Writer,
-					Discard:   requests[idx].Discard,
-				}
-			}
-
-			// Execute pipelined batch
-			pipelineResults := nntpConn.BodyPipelined(pipelineReqs)
-
-			// Process results
-			for i, idx := range batchIndices {
-				pr := pipelineResults[i]
-				results[idx] = BodyBatchResult{
-					MessageID:    pr.MessageID,
-					BytesWritten: pr.BytesWritten,
-					Error:        pr.Error,
-					ProviderHost: provider.Host,
-				}
-
-				if pr.Error != nil {
-					p.metrics.RecordError(provider.Host)
-					if nntpcli.IsArticleNotFoundError(pr.Error) {
-						// Article not found - will retry with another provider
-						newPending = append(newPending, idx)
-					}
-				} else {
-					p.metrics.RecordDownload(pr.BytesWritten, provider.Host)
-					p.metrics.RecordArticleDownloaded(provider.Host)
-				}
-			}
-		}
-
-		pendingIndices = newPending
-		if len(newPending) > 0 {
-			skipProviders = append(skipProviders, provider.ID())
-		}
-		_ = conn.Free()
-	}
-
-	// Mark any remaining pending requests as failed
-	for _, idx := range pendingIndices {
-		if results[idx].Error == nil {
-			results[idx] = BodyBatchResult{
-				MessageID: requests[idx].MessageID,
+		// Get connection from a different provider (skip hosts already tried)
+		conn, err := p.GetConnection(ctx, req.skipHosts)
+		if err != nil {
+			// No more providers available
+			resultsMu.Lock()
+			results[req.originalIdx] = BodyBatchResult{
+				MessageID: req.request.MessageID,
 				Error:     ErrArticleNotFoundInProviders,
 			}
+			resultsMu.Unlock()
+			continue
 		}
-	}
 
-	return results
+		nntpConn := conn.Connection()
+		provider := conn.Provider()
+
+		// Join the group
+		if err := nntpConn.JoinGroup(group); err != nil {
+			_ = conn.Close()
+			// Re-enqueue for retry with this host skipped
+			newSkipHosts := append(append([]string{}, req.skipHosts...), provider.Host)
+			if req.attempt < int(p.config.MaxRetries) {
+				select {
+				case retryChan <- retryRequest{
+					originalIdx: req.originalIdx,
+					request:     req.request,
+					skipHosts:   newSkipHosts,
+					attempt:     req.attempt + 1,
+				}:
+				default:
+					resultsMu.Lock()
+					results[req.originalIdx] = BodyBatchResult{
+						MessageID: req.request.MessageID,
+						Error:     fmt.Errorf("error joining group: %w", err),
+					}
+					resultsMu.Unlock()
+				}
+			} else {
+				resultsMu.Lock()
+				results[req.originalIdx] = BodyBatchResult{
+					MessageID: req.request.MessageID,
+					Error:     fmt.Errorf("error joining group: %w", err),
+				}
+				resultsMu.Unlock()
+			}
+			continue
+		}
+
+		// Try to download the article
+		n, bodyErr := nntpConn.BodyDecoded(req.request.MessageID, req.request.Writer, req.request.Discard)
+
+		if bodyErr != nil && nntpcli.IsArticleNotFoundError(bodyErr) {
+			// Article not found on this provider, try next
+			p.metrics.RecordError(provider.Host)
+			_ = conn.Free()
+
+			newSkipHosts := append(append([]string{}, req.skipHosts...), provider.Host)
+			if req.attempt < int(p.config.MaxRetries) {
+				select {
+				case retryChan <- retryRequest{
+					originalIdx: req.originalIdx,
+					request:     req.request,
+					skipHosts:   newSkipHosts,
+					attempt:     req.attempt + 1,
+				}:
+				default:
+					resultsMu.Lock()
+					results[req.originalIdx] = BodyBatchResult{
+						MessageID: req.request.MessageID,
+						Error:     ErrArticleNotFoundInProviders,
+					}
+					resultsMu.Unlock()
+				}
+			} else {
+				resultsMu.Lock()
+				results[req.originalIdx] = BodyBatchResult{
+					MessageID: req.request.MessageID,
+					Error:     ErrArticleNotFoundInProviders,
+				}
+				resultsMu.Unlock()
+			}
+			continue
+		}
+
+		// Success or non-retryable error
+		if bodyErr != nil {
+			p.metrics.RecordError(provider.Host)
+			_ = conn.Close()
+		} else {
+			p.metrics.RecordDownload(n, provider.Host)
+			p.metrics.RecordArticleDownloaded(provider.Host)
+			_ = conn.Free()
+		}
+
+		resultsMu.Lock()
+		results[req.originalIdx] = BodyBatchResult{
+			MessageID:    req.request.MessageID,
+			BytesWritten: n,
+			Error:        bodyErr,
+			ProviderHost: provider.Host,
+		}
+		resultsMu.Unlock()
+	}
 }
 
 // TestProviderPipelineSupport tests if a specific provider supports pipelining.
@@ -877,151 +943,83 @@ func (p *connectionPool) BodyReader(
 	msgID string,
 	nntpGroups []string,
 ) (nntpcli.ArticleBodyReader, error) {
-	var (
-		conn   PooledConnection
-		reader nntpcli.ArticleBodyReader
-	)
+	skipHosts := make([]string, 0)
 
-	skipProviders := make([]string, 0)
-
-	retryErr := retry.Do(func() error {
-		// In case of skip provider it means that the article was not found,
-		// in such case we want to use backup providers as well
-		var useBackupProviders bool
-		if len(skipProviders) > 0 {
-			useBackupProviders = true
+	for {
+		// Check context before attempting
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 
-		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
+		conn, err := p.GetConnection(ctx, skipHosts)
 		if err != nil {
-			if c != nil {
-				if closeErr := c.Close(); closeErr != nil {
-					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
-				}
-			}
-
-			if errors.Is(err, context.Canceled) {
-				return err
-			}
-
-			return fmt.Errorf("error getting nntp connection: %w", err)
-		}
-
-		conn = c
-		nntpConn := conn.Connection()
-
-		if len(nntpGroups) > 0 {
-			err = joinGroup(nntpConn, nntpGroups)
-			if err != nil {
-				return fmt.Errorf("error joining group: %w", err)
-			}
-		}
-
-		reader, err = nntpConn.BodyReader(msgID)
-		if err != nil {
-			return fmt.Errorf("error getting body reader: %w", err)
-		}
-
-		// Don't free the connection here since the reader needs it
-		// The connection will be managed by a wrapper reader
-
-		return nil
-	},
-		retry.Context(ctx),
-		retry.Attempts(p.config.MaxRetries),
-		retry.DelayType(p.config.delayTypeFn),
-		retry.Delay(p.config.RetryDelay),
-		retry.RetryIf(func(err error) bool {
-			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
-		}),
-		retry.OnRetry(func(n uint, err error) {
-			p.metrics.RecordRetry()
-			if conn != nil {
-				provider := conn.Provider()
-
-				// Record error for this provider
-				p.metrics.RecordError(provider.Host)
-
-				if nntpcli.IsArticleNotFoundError(err) {
-					skipProviders = append(skipProviders, provider.ID())
-					p.log.DebugContext(ctx,
-						"Segment not found in provider, trying another one...",
-						"provider",
-						provider.Host,
-						"segment_id", msgID,
-					)
-
-					if freeErr := conn.Free(); freeErr != nil {
-						p.log.DebugContext(ctx, "Failed to free connection after segment not found", "error", freeErr)
-					}
-					conn = nil
-				} else {
-					if closeErr := conn.Close(); closeErr != nil {
-						p.log.DebugContext(ctx, "Failed to close connection on retry", "error", closeErr)
-					}
-					conn = nil
-				}
-			}
-		}),
-	)
-
-	if retryErr != nil {
-		err := retryErr
-
-		var e retry.Error
-
-		if errors.As(err, &e) {
-			wrappedErrors := e.WrappedErrors()
-			lastError := wrappedErrors[len(wrappedErrors)-1]
-
-			if conn != nil {
-				if errors.Is(lastError, context.Canceled) {
-					if freeErr := conn.Free(); freeErr != nil {
-						p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
-					}
-				} else {
-					if closeErr := conn.Close(); closeErr != nil {
-						p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
-					}
-				}
-			}
-
-			// Check only the last error to determine if article was not found
-			if !errors.Is(lastError, context.Canceled) && nntpcli.IsArticleNotFoundError(lastError) {
+			// No more providers available
+			if nntpcli.IsArticleNotFoundError(err) || errors.Is(err, ErrNoProviderAvailable) {
 				p.log.DebugContext(ctx,
 					"Segment Not Found in any of the providers",
-					"error", lastError,
+					"segment_id", msgID,
+				)
+				return nil, ErrArticleNotFoundInProviders
+			}
+			return nil, err
+		}
+
+		nntpConn := conn.Connection()
+		host := conn.Provider().Host
+
+		// Join group if needed
+		if len(nntpGroups) > 0 {
+			if err := joinGroup(nntpConn, nntpGroups); err != nil {
+				p.metrics.RecordError(host)
+				if closeErr := conn.Close(); closeErr != nil {
+					p.log.DebugContext(ctx, "Failed to close connection after join group error", "error", closeErr)
+				}
+				return nil, fmt.Errorf("error joining group: %w", err)
+			}
+		}
+
+		// Get the body reader
+		reader, err := nntpConn.BodyReader(msgID)
+		if err != nil {
+			if nntpcli.IsArticleNotFoundError(err) {
+				// Article not found - skip this host and try next provider
+				skipHosts = append(skipHosts, host)
+
+				p.log.DebugContext(ctx,
+					"Segment not found in provider, trying another one...",
+					"provider", host,
 					"segment_id", msgID,
 				)
 
-				return nil, ErrArticleNotFoundInProviders
-			}
+				p.metrics.RecordError(host)
+				p.metrics.RecordRetry()
 
-			return nil, lastError
-		}
-
-		if conn != nil {
-			if errors.Is(err, context.Canceled) {
+				// Free connection (it's still healthy, just doesn't have the article)
 				if freeErr := conn.Free(); freeErr != nil {
-					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
+					p.log.DebugContext(ctx, "Failed to free connection after article not found", "error", freeErr)
 				}
-			} else {
-				if closeErr := conn.Close(); closeErr != nil {
-					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
-				}
+
+				continue
 			}
+
+			// Other error - close connection and return
+			p.metrics.RecordError(host)
+			if closeErr := conn.Close(); closeErr != nil {
+				p.log.DebugContext(ctx, "Failed to close connection on error", "error", closeErr)
+			}
+
+			return nil, fmt.Errorf("error getting body reader: %w", err)
 		}
 
-		return nil, err
+		// Success - wrap the reader to manage the connection lifecycle
+		// Don't free the connection here since the reader needs it
+		return &pooledBodyReader{
+			reader:  reader,
+			conn:    conn,
+			metrics: p.metrics,
+			closeCh: make(chan struct{}),
+		}, nil
 	}
-
-	// Wrap the reader to manage the connection lifecycle
-	return &pooledBodyReader{
-		reader:  reader,
-		conn:    conn,
-		metrics: p.metrics,
-		closeCh: make(chan struct{}),
-	}, nil
 }
 
 // Helper that will implement retry mechanism on top of the connection.
@@ -1031,14 +1029,14 @@ func (p *connectionPool) BodyReader(
 // RFC822ish format.
 func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 	var (
-		conn          PooledConnection
-		skipProviders []string
-		bytesPosted   int64
-		providerHost  string // Provider host for metrics tracking
+		conn         PooledConnection
+		skipHosts    []string
+		bytesPosted  int64
+		providerHost string // Provider host for metrics tracking
 	)
 
 	retryErr := retry.Do(func() error {
-		c, err := p.GetConnection(ctx, skipProviders, true)
+		c, err := p.GetConnection(ctx, skipHosts)
 		if err != nil {
 			if c != nil {
 				_ = c.Close()
@@ -1084,7 +1082,7 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 				// Record error for this provider
 				p.metrics.RecordError(provider.Host)
 				if nntpcli.IsSegmentAlreadyExistsError(err) {
-					skipProviders = append(skipProviders, provider.ID())
+					skipHosts = append(skipHosts, provider.Host)
 					p.log.DebugContext(ctx,
 						"Article posting failed in provider, trying another one...",
 						"provider",
@@ -1171,141 +1169,43 @@ func (p *connectionPool) Stat(
 	msgID string,
 	nntpGroups []string,
 ) (int, error) {
-	var (
-		conn PooledConnection
-		res  int
-	)
+	var res int
 
-	skipProviders := make([]string, 0)
-
-	retryErr := retry.Do(func() error {
-		useBackupProviders := true
-
-		c, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
-		if err != nil {
-			if c != nil {
-				if closeErr := c.Close(); closeErr != nil {
-					p.log.DebugContext(ctx, "Failed to close connection after GetConnection error", "error", closeErr)
-				}
-			}
-
-			if errors.Is(err, context.Canceled) {
-				return err
-			}
-
-			return fmt.Errorf("error getting nntp connection: %w", err)
-		}
-
-		conn = c
+	err := p.retryWithProviderRotation(ctx, func(conn PooledConnection) error {
 		nntpConn := conn.Connection()
 
+		// Join group if needed
 		if len(nntpGroups) > 0 {
-			err = joinGroup(nntpConn, nntpGroups)
-			if err != nil {
+			if err := joinGroup(nntpConn, nntpGroups); err != nil {
 				return fmt.Errorf("error joining group: %w", err)
 			}
 		}
 
-		res, err = nntpConn.Stat(msgID)
+		// Check article status
+		r, err := nntpConn.Stat(msgID)
 		if err != nil {
 			return fmt.Errorf("error checking article: %w", err)
 		}
 
-		_ = conn.Free()
+		res = r
+
+		// Free the connection after successful operation
+		if freeErr := conn.Free(); freeErr != nil {
+			p.log.DebugContext(ctx, "Failed to free connection after successful stat", "error", freeErr)
+		}
 
 		return nil
-	},
-		retry.Context(ctx),
-		retry.Attempts(p.config.MaxRetries),
-		retry.DelayType(p.config.delayTypeFn),
-		retry.Delay(p.config.RetryDelay),
-		retry.RetryIf(func(err error) bool {
-			return isRetryableError(err) || errors.Is(err, ErrNoProviderAvailable)
-		}),
-		retry.OnRetry(func(n uint, err error) {
-			p.metrics.RecordRetry()
+	})
 
-			if conn != nil {
-				provider := conn.Provider()
-
-				// Record error for this provider
-				p.metrics.RecordError(provider.Host)
-				if nntpcli.IsArticleNotFoundError(err) {
-					p.log.DebugContext(ctx,
-						"Segment not found in provider, trying another one...",
-						"provider",
-						provider.Host,
-						"segment_id", msgID,
-					)
-
-					_ = conn.Free()
-					conn = nil
-				} else {
-					p.log.DebugContext(ctx,
-						"Closing connection",
-						"error", err,
-						"retry", n,
-						"error_connection_host", provider.Host,
-					)
-
-					_ = conn.Close()
-					conn = nil
-				}
-			}
-		}),
-	)
-	if retryErr != nil {
-		err := retryErr
-
-		var e retry.Error
-
-		if errors.As(err, &e) {
-			wrappedErrors := e.WrappedErrors()
-			lastError := wrappedErrors[len(wrappedErrors)-1]
-
-			if conn != nil {
-				if errors.Is(lastError, context.Canceled) {
-					if freeErr := conn.Free(); freeErr != nil {
-						p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
-					}
-				} else {
-					if closeErr := conn.Close(); closeErr != nil {
-						p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
-					}
-				}
-			}
-
-			// Check only the last error to determine if article was not found
-			if !errors.Is(lastError, context.Canceled) && nntpcli.IsArticleNotFoundError(lastError) {
-				p.log.DebugContext(ctx,
-					"Segment Not Found in any of the providers",
-					"error", lastError,
-					"segment_id", msgID,
-				)
-
-				// if article not found, we don't want to retry so mark it as corrupted
-				return res, ErrArticleNotFoundInProviders
-			}
-
-			return res, lastError
+	if err != nil {
+		if errors.Is(err, ErrArticleNotFoundInProviders) {
+			p.log.DebugContext(ctx,
+				"Segment Not Found in any of the providers",
+				"segment_id", msgID,
+			)
 		}
-
-		if conn != nil {
-			if errors.Is(err, context.Canceled) {
-				if freeErr := conn.Free(); freeErr != nil {
-					p.log.DebugContext(ctx, "Failed to free connection after context cancellation", "error", freeErr)
-				}
-			} else {
-				if closeErr := conn.Close(); closeErr != nil {
-					p.log.DebugContext(ctx, "Failed to close connection after retry exhaustion", "error", closeErr)
-				}
-			}
-		}
-
 		return res, err
 	}
-
-	conn = nil
 
 	return res, nil
 }
@@ -1319,22 +1219,33 @@ func (p *connectionPool) getConnection(
 		poolNumber = 0
 	}
 
-	pool := cPool[poolNumber]
+	// First pass: try pools that are not at capacity
+	for i := poolNumber; i < len(cPool); i++ {
+		pool := cPool[i]
+		stats := pool.connectionPool.Stats()
 
-	// Check if pool is at capacity using Stats()
-	stats := pool.connectionPool.Stats()
-	if stats.InUse >= int(pool.provider.MaxConnections) {
-		if poolNumber < len(cPool)-1 {
-			return p.getConnection(ctx, cPool, poolNumber+1)
+		// Skip pools at capacity
+		if stats.InUse >= int(pool.provider.MaxConnections) {
+			continue
+		}
+
+		conn, err := pool.connectionPool.GetWithContext(ctx)
+		if err != nil {
+			continue // Try next pool on error
+		}
+
+		return conn, pool, nil
+	}
+
+	// Second pass: try any pool (they might have capacity now, or we wait)
+	for i := poolNumber; i < len(cPool); i++ {
+		conn, err := cPool[i].connectionPool.GetWithContext(ctx)
+		if err == nil {
+			return conn, cPool[i], nil
 		}
 	}
 
-	conn, err := pool.connectionPool.GetWithContext(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return conn, pool, nil
+	return nil, nil, ErrNoProviderAvailable
 }
 
 func (p *connectionPool) connectionHealCheck(healthCheckInterval time.Duration) {
@@ -1375,7 +1286,7 @@ func (p *connectionPool) checkHealth(ctx context.Context) {
 
 func (p *connectionPool) createIdleResources(ctx context.Context, toCreate int) error {
 	for i := 0; i < toCreate; i++ {
-		conn, err := p.GetConnection(ctx, []string{}, false)
+		conn, err := p.GetConnection(ctx, []string{})
 		if err != nil {
 			return err
 		}
@@ -1389,11 +1300,20 @@ func (p *connectionPool) createIdleResources(ctx context.Context, toCreate int) 
 }
 
 func (p *connectionPool) checkMinConns(ctx context.Context) error {
+	// Snapshot pool references under lock to avoid race condition
+	p.connPoolsMu.RLock()
+	pools := p.connPools
+	p.connPoolsMu.RUnlock()
+
+	if pools == nil {
+		return nil
+	}
+
 	// TotalConns can include ones that are being destroyed but we should have
 	// sleep(500ms) around all of the destroys to help prevent that from throwing
 	// off this check
 	totalConns := 0
-	for _, pool := range p.connPools {
+	for _, pool := range pools {
 		totalConns += int(pool.connectionPool.Stats().Active)
 	}
 
@@ -1405,17 +1325,8 @@ func (p *connectionPool) checkMinConns(ctx context.Context) error {
 	return nil
 }
 
-// Note: isExpired and isExpiredAt were removed as netpool handles TTL via MaxIdleTime configuration.
-
-// isConnectionExpiredError checks if the error is likely due to an expired/stale connection
-func isConnectionExpiredError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check for common expired connection error patterns
-	return isRetryableError(err)
-}
+// Note: isExpired, isExpiredAt, and isConnectionExpiredError were removed as netpool handles
+// TTL and connection health automatically via MaxIdleTime and HealthCheck configuration.
 
 // providerReconnectionSystem runs indefinitely trying to reconnect failed providers
 func (p *connectionPool) providerReconnectionSystem() {

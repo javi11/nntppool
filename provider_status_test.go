@@ -3,6 +3,7 @@ package nntppool
 import (
 	"io"
 	"log/slog"
+	"net"
 	"testing"
 
 	"github.com/javi11/nntppool/v2/pkg/nntpcli"
@@ -25,6 +26,9 @@ func TestGetProviderStatus(t *testing.T) {
 	mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil).AnyTimes()
 	mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil).AnyTimes()
 	mockConn.EXPECT().Close().AnyTimes()
+	// NetConn is called when wrapping for netpool
+	fakeConn, _ := net.Pipe()
+	mockConn.EXPECT().NetConn().Return(fakeConn).AnyTimes()
 
 	config := Config{
 		Logger:  logger,
@@ -77,6 +81,9 @@ func TestGetProviderStatusWithShutdownPool(t *testing.T) {
 	mockConn.EXPECT().Authenticate("testuser", "testpass").Return(nil).AnyTimes()
 	mockConn.EXPECT().Capabilities().Return([]string{"READER"}, nil).AnyTimes()
 	mockConn.EXPECT().Close().AnyTimes()
+	// NetConn is called when wrapping for netpool
+	fakeConn2, _ := net.Pipe()
+	mockConn.EXPECT().NetConn().Return(fakeConn2).AnyTimes()
 
 	config := Config{
 		Logger:  logger,

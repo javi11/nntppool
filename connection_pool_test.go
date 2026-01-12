@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"testing"
 	"time"
 
@@ -22,6 +23,9 @@ func TestBody(t *testing.T) {
 		mockConn := nntpcli.NewMockConnection(ctrl)
 
 		mockConn.EXPECT().Close().AnyTimes()
+		// NetConn is called when wrapping for netpool
+		fakeConn, _ := net.Pipe()
+		mockConn.EXPECT().NetConn().Return(fakeConn).AnyTimes()
 
 		providers := []UsenetProviderConfig{
 			{
@@ -79,6 +83,9 @@ func TestBodyReader_ContextCancellation(t *testing.T) {
 		mockConn := nntpcli.NewMockConnection(ctrl)
 
 		mockConn.EXPECT().Close().AnyTimes()
+		// NetConn is called when wrapping for netpool
+		fakeConn, _ := net.Pipe()
+		mockConn.EXPECT().NetConn().Return(fakeConn).AnyTimes()
 
 		providers := []UsenetProviderConfig{
 			{
@@ -137,6 +144,9 @@ func TestBodyReader_ContextCancellation(t *testing.T) {
 		mockConn := nntpcli.NewMockConnection(ctrl)
 
 		mockConn.EXPECT().Close().AnyTimes()
+		// NetConn is called when wrapping for netpool
+		fakeConn, _ := net.Pipe()
+		mockConn.EXPECT().NetConn().Return(fakeConn).AnyTimes()
 
 		providers := []UsenetProviderConfig{
 			{
@@ -197,6 +207,9 @@ func TestGetConnection(t *testing.T) {
 		mockConn := nntpcli.NewMockConnection(ctrl)
 
 		mockConn.EXPECT().Close().AnyTimes()
+		// NetConn is called when wrapping for netpool
+		fakeConn, _ := net.Pipe()
+		mockConn.EXPECT().NetConn().Return(fakeConn).AnyTimes()
 
 		providers := []UsenetProviderConfig{
 			{
@@ -234,7 +247,7 @@ func TestGetConnection(t *testing.T) {
 		defer pool.Quit()
 
 		// Test GetConnection
-		conn, err := pool.GetConnection(context.Background(), []string{}, false)
+		conn, err := pool.GetConnection(context.Background(), []string{})
 		assert.NoError(t, err)
 		assert.NotNil(t, conn)
 

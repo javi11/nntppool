@@ -11,6 +11,7 @@ package nntpcli
 
 import (
 	io "io"
+	net "net"
 	reflect "reflect"
 	time "time"
 
@@ -168,6 +169,20 @@ func (m *MockConnection) MaxAgeTime() time.Time {
 func (mr *MockConnectionMockRecorder) MaxAgeTime() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MaxAgeTime", reflect.TypeOf((*MockConnection)(nil).MaxAgeTime))
+}
+
+// NetConn mocks base method.
+func (m *MockConnection) NetConn() net.Conn {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "NetConn")
+	ret0, _ := ret[0].(net.Conn)
+	return ret0
+}
+
+// NetConn indicates an expected call of NetConn.
+func (mr *MockConnectionMockRecorder) NetConn() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NetConn", reflect.TypeOf((*MockConnection)(nil).NetConn))
 }
 
 // Ping mocks base method.

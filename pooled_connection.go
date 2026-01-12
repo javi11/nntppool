@@ -30,18 +30,20 @@ type pooledConnection struct {
 	pool     netpool.Netpooler
 	log      Logger
 	metrics  *PoolMetrics
+	id       string // Cached connection ID to avoid repeated fmt.Sprintf
 }
 
 // newPooledConnection creates a new pooled connection.
 // The connection wraps a net.Conn managed by netpool and provides automatic
 // release/destroy functionality with metrics tracking.
+// Returns the pooled connection and the extracted NNTP connection (to avoid duplicate type assertions).
 func newPooledConnection(
 	conn net.Conn,
 	provider UsenetProviderConfig,
 	pool netpool.Netpooler,
 	log Logger,
 	metrics *PoolMetrics,
-) pooledConnection {
+) (pooledConnection, nntpcli.Connection) {
 	// Extract NNTP connection from wrapper
 	var nntpConn nntpcli.Connection
 	if wrapper, ok := conn.(*netconn.NNTPConnWrapper); ok {
@@ -55,13 +57,14 @@ func newPooledConnection(
 		pool:     pool,
 		log:      log,
 		metrics:  metrics,
-	}
+		id:       fmt.Sprintf("%p", conn), // Cache ID once during construction
+	}, nntpConn
 }
 
 // connectionID returns a unique identifier for this connection based on its pointer.
-// This provides a stable ID for metrics tracking without storing extra state.
+// The ID is cached during construction to avoid repeated fmt.Sprintf allocations.
 func (p pooledConnection) connectionID() string {
-	return fmt.Sprintf("%p", p.conn)
+	return p.id
 }
 
 // Close destroys the connection and removes it from the pool.

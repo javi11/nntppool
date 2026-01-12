@@ -11,7 +11,6 @@ package nntppool
 
 import (
 	reflect "reflect"
-	time "time"
 
 	nntpcli "github.com/javi11/nntppool/v2/pkg/nntpcli"
 	gomock "go.uber.org/mock/gomock"
@@ -67,20 +66,6 @@ func (m *MockPooledConnection) Connection() nntpcli.Connection {
 func (mr *MockPooledConnectionMockRecorder) Connection() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Connection", reflect.TypeOf((*MockPooledConnection)(nil).Connection))
-}
-
-// CreatedAt mocks base method.
-func (m *MockPooledConnection) CreatedAt() time.Time {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CreatedAt")
-	ret0, _ := ret[0].(time.Time)
-	return ret0
-}
-
-// CreatedAt indicates an expected call of CreatedAt.
-func (mr *MockPooledConnectionMockRecorder) CreatedAt() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreatedAt", reflect.TypeOf((*MockPooledConnection)(nil).CreatedAt))
 }
 
 // Free mocks base method.
