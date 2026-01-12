@@ -172,19 +172,18 @@ func createConnections(ctx context.Context, cfg BenchConfig, n int) ([]nntpcli.C
 		}
 		if err != nil {
 			// Close already created connections
-			for _, c := range conns {
-				_ = c.Close()
-			}
+			closeConnections(conns)
 			return nil, fmt.Errorf("connect (conn %d): %w", i+1, err)
 		}
 
 		// Authenticate if credentials provided
 		if cfg.Username != "" {
 			if err := conn.Authenticate(cfg.Username, cfg.Password); err != nil {
-				_ = conn.Close()
-				for _, c := range conns {
-					_ = c.Close()
+				if conn.NetConn() != nil {
+					_ = conn.NetConn().Close()
 				}
+				_ = conn.Close()
+				closeConnections(conns)
 				return nil, fmt.Errorf("authenticate (conn %d): %w", i+1, err)
 			}
 		}
@@ -198,6 +197,11 @@ func createConnections(ctx context.Context, cfg BenchConfig, n int) ([]nntpcli.C
 // closeConnections closes all connections.
 func closeConnections(conns []nntpcli.Connection) {
 	for _, c := range conns {
+		// Close the underlying connection first to ensure any blocking operations
+		// (like BodyDecoded) are interrupted immediately.
+		if c.NetConn() != nil {
+			_ = c.NetConn().Close()
+		}
 		_ = c.Close()
 	}
 }
@@ -306,7 +310,23 @@ func DownloadBench(ctx context.Context, cfg BenchConfig, segments []SegmentInfo)
 		}(seg, i)
 	}
 
-	wg.Wait()
+	// Wait for completion or cancellation
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Force close connections immediately to unblock pending IO
+		closeConnections(conns)
+		progress.Finish()
+		return result, ctx.Err()
+	case <-doneCh:
+		// All done normally
+	}
+
 	progress.Finish()
 
 	result.TotalTime = time.Since(totalStart)
@@ -472,7 +492,23 @@ func DownloadBenchPipeline(ctx context.Context, cfg BenchConfig, segments []Segm
 		}
 	}
 
-	wg.Wait()
+	// Wait for completion or cancellation
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Force close connections immediately to unblock pending IO
+		closeConnections(conns)
+		progress.Finish()
+		return result, ctx.Err()
+	case <-doneCh:
+		// All done normally
+	}
+
 	progress.Finish()
 
 	result.TotalTime = time.Since(totalStart)
