@@ -247,22 +247,40 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer)
 // Body retrieves the body of an article by its message ID.
 func (c *Client) Body(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
-	_, err := c.sendSync(ctx, cmd, w)
-	return err
+	resp, err := c.sendSync(ctx, cmd, w)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+	}
+	return nil
 }
 
 // BodyAt retrieves the body of an article by its message ID, writing to an io.WriterAt.
 func (c *Client) BodyAt(ctx context.Context, id string, w io.WriterAt) error {
 	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
-	_, err := c.sendSync(ctx, cmd, &writerAtAdapter{w: w})
-	return err
+	resp, err := c.sendSync(ctx, cmd, &writerAtAdapter{w: w})
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+	}
+	return nil
 }
 
 // Article retrieves the header and body of an article by its message ID.
 func (c *Client) Article(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("ARTICLE %s\r\n", c.formatID(id))
-	_, err := c.sendSync(ctx, cmd, w)
-	return err
+	resp, err := c.sendSync(ctx, cmd, w)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+	}
+	return nil
 }
 
 // Head retrieves the headers of an article by its message ID.
