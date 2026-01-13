@@ -15,20 +15,31 @@ type MeteredConn struct {
 	net.Conn
 	bytesRead    *uint64
 	bytesWritten *uint64
+	lastActivity *int64
 }
 
 func (m *MeteredConn) Read(b []byte) (n int, err error) {
 	n, err = m.Conn.Read(b)
-	if n > 0 && m.bytesRead != nil {
-		atomic.AddUint64(m.bytesRead, uint64(n))
+	if n > 0 {
+		if m.bytesRead != nil {
+			atomic.AddUint64(m.bytesRead, uint64(n))
+		}
+		if m.lastActivity != nil {
+			atomic.StoreInt64(m.lastActivity, time.Now().Unix())
+		}
 	}
 	return
 }
 
 func (m *MeteredConn) Write(b []byte) (n int, err error) {
 	n, err = m.Conn.Write(b)
-	if n > 0 && m.bytesWritten != nil {
-		atomic.AddUint64(m.bytesWritten, uint64(n))
+	if n > 0 {
+		if m.bytesWritten != nil {
+			atomic.AddUint64(m.bytesWritten, uint64(n))
+		}
+		if m.lastActivity != nil {
+			atomic.StoreInt64(m.lastActivity, time.Now().Unix())
+		}
 	}
 	return
 }
@@ -52,30 +63,60 @@ type NNTPConnection struct {
 	doneMu sync.Once
 
 	failMu sync.Once
+
+	maxIdleTime  time.Duration
+	lastActivity int64
+	maxLifeTime  time.Duration
+	createdAt    time.Time
 }
 
 func newNetConn(addr string, tlsConfig *tls.Config) (net.Conn, error) {
-	if tlsConfig != nil {
-		return tls.Dial("tcp", addr, tlsConfig)
+	dialer := &net.Dialer{
+		Timeout: 30 * time.Second,
 	}
-	return net.Dial("tcp", addr)
+
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Optimize socket buffers for high-speed downloads (10Gbps+)
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		// 8MB receive buffer
+		_ = tcpConn.SetReadBuffer(8 * 1024 * 1024)
+		// 1MB send buffer
+		_ = tcpConn.SetWriteBuffer(1024 * 1024)
+	}
+
+	if tlsConfig != nil {
+		return tls.Client(conn, tlsConfig), nil
+	}
+	return conn, nil
 }
 
-func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth) (*NNTPConnection, error) {
+func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth, maxIdleTime time.Duration, maxLifeTime time.Duration) (*NNTPConnection, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	cctx, cancel := context.WithCancel(ctx)
 
 	c := &NNTPConnection{
-		conn:        conn,
-		ctx:         cctx,
-		cancel:      cancel,
-		reqCh:       reqCh,
-		pending:     make(chan *Request, inflightLimit),
-		inflightSem: make(chan struct{}, inflightLimit),
-		rb:          readBuffer{buf: make([]byte, defaultReadBufSize)},
-		done:        make(chan struct{}),
+		conn:         conn,
+		ctx:          cctx,
+		cancel:       cancel,
+		reqCh:        reqCh,
+		pending:      make(chan *Request, inflightLimit),
+		inflightSem:  make(chan struct{}, inflightLimit),
+		rb:           readBuffer{buf: make([]byte, defaultReadBufSize)},
+		done:         make(chan struct{}),
+		maxIdleTime:  maxIdleTime,
+		lastActivity: time.Now().Unix(),
+		maxLifeTime:  maxLifeTime,
+		createdAt:    time.Now(),
+	}
+
+	if mc, ok := conn.(*MeteredConn); ok {
+		mc.lastActivity = &c.lastActivity
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -102,13 +143,13 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	return c, nil
 }
 
-func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth) (*NNTPConnection, error) {
+func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth, maxIdleTime time.Duration, maxLifeTime time.Duration) (*NNTPConnection, error) {
 	conn, err := newNetConn(addr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, auth)
+	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, auth, maxIdleTime, maxLifeTime)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -245,9 +286,68 @@ func (c *NNTPConnection) Run() {
 		// pull next request
 		var req *Request
 		var ok bool
+
+		var timer *time.Timer
+		var timeout <-chan time.Time
+
+		if c.maxIdleTime > 0 {
+			last := atomic.LoadInt64(&c.lastActivity)
+			if last == 0 {
+				last = time.Now().Unix()
+			}
+			elapsed := time.Since(time.Unix(last, 0))
+			remaining := c.maxIdleTime - elapsed
+			if remaining <= 0 {
+				<-c.inflightSem
+				return
+			}
+			timer = time.NewTimer(remaining)
+			timeout = timer.C
+		}
+
+		var lifeTimer *time.Timer
+		var lifeTimeout <-chan time.Time
+
+		if c.maxLifeTime > 0 {
+			remaining := c.maxLifeTime - time.Since(c.createdAt)
+			if remaining <= 0 {
+				if timer != nil {
+					timer.Stop()
+				}
+				<-c.inflightSem
+				return
+			}
+			lifeTimer = time.NewTimer(remaining)
+			lifeTimeout = lifeTimer.C
+		}
+
 		select {
 		case req, ok = <-c.reqCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			if lifeTimer != nil {
+				lifeTimer.Stop()
+			}
 		case <-c.ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			if lifeTimer != nil {
+				lifeTimer.Stop()
+			}
+			<-c.inflightSem
+			return
+		case <-timeout:
+			if lifeTimer != nil {
+				lifeTimer.Stop()
+			}
+			<-c.inflightSem
+			return
+		case <-lifeTimeout:
+			if timer != nil {
+				timer.Stop()
+			}
 			<-c.inflightSem
 			return
 		}

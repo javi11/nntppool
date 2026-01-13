@@ -319,6 +319,12 @@ func (c *Client) SpeedTest(ctx context.Context, articleIDs []string) (SpeedTestS
 	return stats, nil
 }
 
+func (c *Client) Date(ctx context.Context) error {
+	cmd := "DATE\r\n"
+	_, err := c.sendSync(ctx, cmd, nil)
+	return err
+}
+
 func (c *Client) healthCheckLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()

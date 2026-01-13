@@ -24,6 +24,8 @@ type ProviderConfig struct {
 	MaxConnections        int
 	InitialConnections    int
 	InflightPerConnection int
+	MaxConnIdleTime       time.Duration
+	MaxConnLifetime       time.Duration
 	Auth                  Auth
 	TLSConfig             *tls.Config
 	ConnFactory           ConnFactory
@@ -161,7 +163,7 @@ func (c *Provider) addConnection(syncMode bool) error {
 		bytesWritten: &c.bytesWritten,
 	}
 
-	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth)
+	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth, c.config.MaxConnIdleTime, c.config.MaxConnLifetime)
 	if err != nil {
 		_ = conn.Close()
 		atomic.AddInt32(&c.connCount, -1)
