@@ -133,6 +133,25 @@ func (c *Client) Close() {
 	c.mu.Unlock()
 }
 
+// Metrics returns metrics for all active providers.
+func (c *Client) Metrics() map[string]ProviderMetrics {
+	metrics := make(map[string]ProviderMetrics)
+
+	// Collect from primaries
+	primaries := c.primaries.Load().([]*Provider)
+	for _, p := range primaries {
+		metrics[p.Host] = p.Metrics()
+	}
+
+	// Collect from backups
+	backups := c.backups.Load().([]*Provider)
+	for _, p := range backups {
+		metrics[p.Host] = p.Metrics()
+	}
+
+	return metrics
+}
+
 func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer) <-chan Response {
 	respCh := make(chan Response, 1)
 
@@ -223,6 +242,81 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer)
 	}()
 
 	return respCh
+}
+
+// Body retrieves the body of an article by its message ID.
+func (c *Client) Body(ctx context.Context, id string, w io.Writer) error {
+	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
+	_, err := c.sendSync(ctx, cmd, w)
+	return err
+}
+
+// BodyAt retrieves the body of an article by its message ID, writing to an io.WriterAt.
+func (c *Client) BodyAt(ctx context.Context, id string, w io.WriterAt) error {
+	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
+	_, err := c.sendSync(ctx, cmd, &writerAtAdapter{w: w})
+	return err
+}
+
+// Article retrieves the header and body of an article by its message ID.
+func (c *Client) Article(ctx context.Context, id string, w io.Writer) error {
+	cmd := fmt.Sprintf("ARTICLE %s\r\n", c.formatID(id))
+	_, err := c.sendSync(ctx, cmd, w)
+	return err
+}
+
+// Head retrieves the headers of an article by its message ID.
+func (c *Client) Head(ctx context.Context, id string) (*Response, error) {
+	cmd := fmt.Sprintf("HEAD %s\r\n", c.formatID(id))
+	return c.sendSync(ctx, cmd, nil)
+}
+
+// Stat checks if an article exists by its message ID.
+func (c *Client) Stat(ctx context.Context, id string) (*Response, error) {
+	cmd := fmt.Sprintf("STAT %s\r\n", c.formatID(id))
+	return c.sendSync(ctx, cmd, nil)
+}
+
+// Group selects a newsgroup. Note: In a connection pool, this selection
+// only applies to the specific connection used for this request and is
+// not guaranteed to persist for subsequent requests.
+func (c *Client) Group(ctx context.Context, group string) (*Response, error) {
+	cmd := fmt.Sprintf("GROUP %s\r\n", group)
+	return c.sendSync(ctx, cmd, nil)
+}
+
+// SpeedTest performs a download speed test using the provided article IDs.
+// It downloads articles concurrently using the pool's configured concurrency,
+// discards the content, and returns performance statistics.
+func (c *Client) SpeedTest(ctx context.Context, articleIDs []string) (SpeedTestStats, error) {
+	var stats SpeedTestStats
+	var wg sync.WaitGroup
+	counter := &countingDiscard{}
+
+	start := time.Now()
+
+	for _, id := range articleIDs {
+		wg.Add(1)
+		go func(msgID string) {
+			defer wg.Done()
+			err := c.Body(ctx, msgID, counter)
+			if err != nil {
+				atomic.AddInt32(&stats.FailureCount, 1)
+			} else {
+				atomic.AddInt32(&stats.SuccessCount, 1)
+			}
+		}(id)
+	}
+
+	wg.Wait()
+
+	stats.Duration = time.Since(start)
+	stats.TotalBytes = atomic.LoadInt64(&counter.n)
+	if stats.Duration.Seconds() > 0 {
+		stats.BytesPerSecond = float64(stats.TotalBytes) / stats.Duration.Seconds()
+	}
+
+	return stats, nil
 }
 
 func (c *Client) healthCheckLoop() {
@@ -369,47 +463,6 @@ func (c *Client) sendSync(ctx context.Context, cmd string, w io.Writer) (*Respon
 	}
 }
 
-// Body retrieves the body of an article by its message ID.
-func (c *Client) Body(ctx context.Context, id string, w io.Writer) error {
-	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
-	_, err := c.sendSync(ctx, cmd, w)
-	return err
-}
-
-// BodyAt retrieves the body of an article by its message ID, writing to an io.WriterAt.
-func (c *Client) BodyAt(ctx context.Context, id string, w io.WriterAt) error {
-	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
-	_, err := c.sendSync(ctx, cmd, &writerAtAdapter{w: w})
-	return err
-}
-
-// Article retrieves the header and body of an article by its message ID.
-func (c *Client) Article(ctx context.Context, id string, w io.Writer) error {
-	cmd := fmt.Sprintf("ARTICLE %s\r\n", c.formatID(id))
-	_, err := c.sendSync(ctx, cmd, w)
-	return err
-}
-
-// Head retrieves the headers of an article by its message ID.
-func (c *Client) Head(ctx context.Context, id string) (*Response, error) {
-	cmd := fmt.Sprintf("HEAD %s\r\n", c.formatID(id))
-	return c.sendSync(ctx, cmd, nil)
-}
-
-// Stat checks if an article exists by its message ID.
-func (c *Client) Stat(ctx context.Context, id string) (*Response, error) {
-	cmd := fmt.Sprintf("STAT %s\r\n", c.formatID(id))
-	return c.sendSync(ctx, cmd, nil)
-}
-
-// Group selects a newsgroup. Note: In a connection pool, this selection
-// only applies to the specific connection used for this request and is
-// not guaranteed to persist for subsequent requests.
-func (c *Client) Group(ctx context.Context, group string) (*Response, error) {
-	cmd := fmt.Sprintf("GROUP %s\r\n", group)
-	return c.sendSync(ctx, cmd, nil)
-}
-
 type writerAtAdapter struct {
 	w io.WriterAt
 }
@@ -420,4 +473,13 @@ func (wa *writerAtAdapter) Write(p []byte) (int, error) {
 
 func (wa *writerAtAdapter) WriteAt(p []byte, off int64) (int, error) {
 	return wa.w.WriteAt(p, off)
+}
+
+type countingDiscard struct {
+	n int64
+}
+
+func (c *countingDiscard) Write(p []byte) (int, error) {
+	atomic.AddInt64(&c.n, int64(len(p)))
+	return len(p), nil
 }

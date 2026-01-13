@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 )
 
 type Request struct {
@@ -49,3 +50,11 @@ const (
 	ProviderBackup
 )
 
+// SpeedTestStats contains metrics from a speed test run.
+type SpeedTestStats struct {
+	TotalBytes     int64
+	Duration       time.Duration
+	BytesPerSecond float64
+	SuccessCount   int32
+	FailureCount   int32
+}

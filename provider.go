@@ -8,7 +8,16 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+type ProviderMetrics struct {
+	Host              string
+	ActiveConnections int
+	TotalBytesRead    uint64
+	TotalBytesWritten uint64
+	ThroughputMB      float64 // MB/s
+}
 
 type ProviderConfig struct {
 	Address               string
@@ -34,6 +43,11 @@ type Provider struct {
 
 	connCount int32
 	config    ProviderConfig
+
+	// Metrics
+	bytesRead    uint64
+	bytesWritten uint64
+	currentSpeed uint64 // bytes per second
 }
 
 func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) {
@@ -71,6 +85,9 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 		config: config,
 	}
 
+	// Start metrics monitor
+	go c.monitorSpeed()
+
 	for i := 0; i < config.InitialConnections; i++ {
 		if err := c.addConnection(true); err != nil {
 			c.Close()
@@ -79,6 +96,36 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 	}
 
 	return c, nil
+}
+
+func (c *Provider) monitorSpeed() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastBytesRead uint64
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			current := atomic.LoadUint64(&c.bytesRead)
+			diff := current - lastBytesRead
+			lastBytesRead = current
+			atomic.StoreUint64(&c.currentSpeed, diff)
+		}
+	}
+}
+
+func (c *Provider) Metrics() ProviderMetrics {
+	speed := atomic.LoadUint64(&c.currentSpeed)
+	return ProviderMetrics{
+		Host:              c.Host,
+		ActiveConnections: int(atomic.LoadInt32(&c.connCount)),
+		TotalBytesRead:    atomic.LoadUint64(&c.bytesRead),
+		TotalBytesWritten: atomic.LoadUint64(&c.bytesWritten),
+		ThroughputMB:      float64(speed) / 1024 / 1024,
+	}
 }
 
 func (c *Provider) addConnection(syncMode bool) error {
@@ -107,7 +154,14 @@ func (c *Provider) addConnection(syncMode bool) error {
 		return err
 	}
 
-	w, err := newNNTPConnectionFromConn(c.ctx, conn, c.config.InflightPerConnection, c.reqCh, c.config.Auth)
+	// Wrap with MeteredConn
+	meteredConn := &MeteredConn{
+		Conn:         conn,
+		bytesRead:    &c.bytesRead,
+		bytesWritten: &c.bytesWritten,
+	}
+
+	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth)
 	if err != nil {
 		_ = conn.Close()
 		atomic.AddInt32(&c.connCount, -1)

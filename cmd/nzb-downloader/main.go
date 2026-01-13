@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,7 +35,7 @@ func main() {
 	pflag.StringVar(&password, "pass", "", "Password")
 	pflag.StringVar(&nzbPath, "nzb", "", "Path to the NZB file")
 	pflag.IntVar(&connections, "connections", 10, "Number of concurrent connections")
-	pflag.StringVarP(&output, "output", "o", ".", "Output directory path")
+	pflag.StringVarP(&output, "output", "o", "", "Output directory path")
 	pflag.Parse()
 
 	if host == "" || nzbPath == "" {
@@ -108,6 +109,29 @@ func main() {
 		"Downloading",
 	)
 
+	// Start metrics display
+	stopMetrics := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopMetrics:
+				return
+			case <-ticker.C:
+				metrics := client.Metrics()
+				var parts []string
+				for host, m := range metrics {
+					parts = append(parts, fmt.Sprintf("[%s: %d conn, %.1f MB/s]", host, m.ActiveConnections, m.ThroughputMB))
+				}
+				if len(parts) > 0 {
+					bar.Describe(strings.Join(parts, " "))
+				}
+			}
+		}
+	}()
+
 	// Semaphore to limit concurrency to avoid high memory usage
 	// Using connections * 2 to keep the pipeline full
 	sem := make(chan struct{}, connections*3)
@@ -117,6 +141,9 @@ func main() {
 		var outWriter io.WriterAt
 		var f *os.File
 		var fileWg sync.WaitGroup
+
+		fmt.Printf("Downloading file: %s\n", file.Filename)
+		fmt.Printf("Output directory: %s\n", output)
 
 		if output != "" {
 			// Basic sanitization: take just the filename element to avoid directory traversal
@@ -150,7 +177,7 @@ func main() {
 				defer func() { <-sem }() // Release semaphore
 
 				// Use the high-level Body method which blocks until complete
-				if w != nil {
+				if output == "" {
 					err := client.Body(ctx, msgID, io.Discard)
 					if err != nil {
 						fmt.Printf("Error downloading %s: %v\n", msgID, err)
@@ -175,6 +202,7 @@ func main() {
 
 	log.Println("Waiting for downloads to complete...")
 	wg.Wait()
+	close(stopMetrics)
 
 	duration := time.Since(startTime)
 	log.Printf("Downloaded %d segments in %v", count, duration)

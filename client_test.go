@@ -442,3 +442,89 @@ func TestClientBodyAt(t *testing.T) {
 		t.Errorf("expected 'hello world!', got '%s'", got)
 	}
 }
+
+func TestClientSpeedTest(t *testing.T) {
+	// Mock YEnc response
+	raw := []byte("hello world!")
+	encoded := make([]byte, len(raw))
+	for i, b := range raw {
+		encoded[i] = b + 42
+	}
+	yEncBody := "=ybegin part=1 line=128 size=12 name=test.txt\r\n" +
+		"=ypart begin=1 end=12\r\n" +
+		string(encoded) + // 12 bytes
+		"\r\n=yend size=12 pcrc32=00000000\r\n.\r\n"
+
+	// 1. Start mock server
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				c.Write([]byte("200 Service Ready\r\n"))
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					msg := string(buf[:n])
+					if strings.HasPrefix(msg, "BODY") {
+						c.Write([]byte("222 0 <id> body follows\r\n" + yEncBody))
+					} else if msg == "QUIT\r\n" {
+						c.Write([]byte("205 Bye\r\n"))
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	// 2. Setup Client
+	client := NewClient(10)
+	defer client.Close()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", l.Addr().String())
+	}
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address: l.Addr().String(), MaxConnections: 2, InflightPerConnection: 1, ConnFactory: dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	client.AddProvider(p, ProviderPrimary)
+
+	// 3. Run SpeedTest
+	articles := []string{"1", "2", "3", "4", "5"}
+	stats, err := client.SpeedTest(context.Background(), articles)
+	if err != nil {
+		t.Fatalf("SpeedTest failed: %v", err)
+	}
+
+	// 4. Verify stats
+	if stats.SuccessCount != 5 {
+		t.Errorf("expected 5 successes, got %d", stats.SuccessCount)
+	}
+	if stats.TotalBytes == 0 {
+		t.Errorf("expected total bytes > 0")
+	}
+	// TotalBytes should be 5 * 12 = 60
+	if stats.TotalBytes != 60 {
+		t.Errorf("expected 60 bytes, got %d", stats.TotalBytes)
+	}
+	if stats.BytesPerSecond == 0 {
+		t.Errorf("expected > 0 bytes per second")
+	}
+}

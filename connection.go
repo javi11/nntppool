@@ -7,8 +7,31 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+type MeteredConn struct {
+	net.Conn
+	bytesRead    *uint64
+	bytesWritten *uint64
+}
+
+func (m *MeteredConn) Read(b []byte) (n int, err error) {
+	n, err = m.Conn.Read(b)
+	if n > 0 && m.bytesRead != nil {
+		atomic.AddUint64(m.bytesRead, uint64(n))
+	}
+	return
+}
+
+func (m *MeteredConn) Write(b []byte) (n int, err error) {
+	n, err = m.Conn.Write(b)
+	if n > 0 && m.bytesWritten != nil {
+		atomic.AddUint64(m.bytesWritten, uint64(n))
+	}
+	return
+}
 
 type NNTPConnection struct {
 	conn net.Conn
