@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ func main() {
 		password    string
 		nzbPath     string
 		connections int
+		output      string
 	)
 
 	pflag.StringVar(&host, "host", "", "NNTP server hostname")
@@ -32,6 +34,7 @@ func main() {
 	pflag.StringVar(&password, "pass", "", "Password")
 	pflag.StringVar(&nzbPath, "nzb", "", "Path to the NZB file")
 	pflag.IntVar(&connections, "connections", 10, "Number of concurrent connections")
+	pflag.StringVarP(&output, "output", "o", ".", "Output directory path")
 	pflag.Parse()
 
 	if host == "" || nzbPath == "" {
@@ -83,6 +86,12 @@ func main() {
 
 	log.Println("Connected. Starting download...")
 
+	if output != "" {
+		if err := os.MkdirAll(output, 0755); err != nil {
+			log.Fatalf("Failed to create output directory: %v", err)
+		}
+	}
+
 	var wg sync.WaitGroup
 	count := 0
 	startTime := time.Now()
@@ -105,24 +114,62 @@ func main() {
 
 	// Iterate and send
 	for _, file := range nzb.Files {
+		var outWriter io.WriterAt
+		var f *os.File
+		var fileWg sync.WaitGroup
+
+		if output != "" {
+			// Basic sanitization: take just the filename element to avoid directory traversal
+			fname := filepath.Base(file.Filename)
+			if fname == "." || fname == "/" {
+				// Fallback if filename is weird
+				fname = fmt.Sprintf("file_%d.bin", time.Now().UnixNano())
+			}
+			filePath := filepath.Join(output, fname)
+
+			var err error
+			f, err = os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				log.Printf("Failed to open output file %s: %v", filePath, err)
+			} else {
+				outWriter = f
+			}
+		}
+
 		for _, segment := range file.Segments {
 			wg.Add(1)
+			fileWg.Add(1)
 			count++
 
 			// Acquire semaphore
 			sem <- struct{}{}
 
-			go func(msgID string, segSize int64) {
+			go func(msgID string, segSize int64, w io.WriterAt) {
 				defer wg.Done()
+				defer fileWg.Done()
 				defer func() { <-sem }() // Release semaphore
 
 				// Use the high-level Body method which blocks until complete
-				err := client.Body(ctx, msgID, io.Discard)
-				if err != nil {
-					// fmt.Printf("Error downloading %s: %v\n", msgID, err)
+				if w != nil {
+					err := client.Body(ctx, msgID, io.Discard)
+					if err != nil {
+						fmt.Printf("Error downloading %s: %v\n", msgID, err)
+					}
+				} else {
+					err := client.BodyAt(ctx, msgID, w)
+					if err != nil {
+						fmt.Printf("Error downloading %s: %v\n", msgID, err)
+					}
 				}
 				_ = bar.Add(int(segSize))
-			}(segment.ID, int64(segment.Bytes))
+			}(segment.ID, int64(segment.Bytes), outWriter)
+		}
+
+		if f != nil {
+			go func(fh *os.File) {
+				fileWg.Wait()
+				fh.Close()
+			}(f)
 		}
 	}
 

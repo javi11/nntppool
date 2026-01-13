@@ -376,6 +376,13 @@ func (c *Client) Body(ctx context.Context, id string, w io.Writer) error {
 	return err
 }
 
+// BodyAt retrieves the body of an article by its message ID, writing to an io.WriterAt.
+func (c *Client) BodyAt(ctx context.Context, id string, w io.WriterAt) error {
+	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
+	_, err := c.sendSync(ctx, cmd, &writerAtAdapter{w: w})
+	return err
+}
+
 // Article retrieves the header and body of an article by its message ID.
 func (c *Client) Article(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("ARTICLE %s\r\n", c.formatID(id))
@@ -401,4 +408,16 @@ func (c *Client) Stat(ctx context.Context, id string) (*Response, error) {
 func (c *Client) Group(ctx context.Context, group string) (*Response, error) {
 	cmd := fmt.Sprintf("GROUP %s\r\n", group)
 	return c.sendSync(ctx, cmd, nil)
+}
+
+type writerAtAdapter struct {
+	w io.WriterAt
+}
+
+func (wa *writerAtAdapter) Write(p []byte) (int, error) {
+	return 0, fmt.Errorf("non-sequential write not supported")
+}
+
+func (wa *writerAtAdapter) WriteAt(p []byte, off int64) (int, error) {
+	return wa.w.WriteAt(p, off)
 }

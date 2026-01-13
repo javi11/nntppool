@@ -346,3 +346,99 @@ func TestClientRemoveProvider(t *testing.T) {
 		t.Fatal("expected p3 to be closed")
 	}
 }
+
+type mockWriterAt struct {
+	data []byte
+	mu   sync.Mutex
+}
+
+func (m *mockWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if int64(len(m.data)) < off+int64(len(p)) {
+		newData := make([]byte, off+int64(len(p)))
+		copy(newData, m.data)
+		m.data = newData
+	}
+	copy(m.data[off:], p)
+	return len(p), nil
+}
+
+func TestClientBodyAt(t *testing.T) {
+	// Mock YEnc response
+	// We need to encode "hello world!" by adding 42 to each byte
+	raw := []byte("hello world!")
+	encoded := make([]byte, len(raw))
+	for i, b := range raw {
+		encoded[i] = b + 42
+	}
+
+	yEncBody := "=ybegin part=1 line=128 size=12 name=test.txt\r\n" +
+		"=ypart begin=1 end=12\r\n" +
+		string(encoded) + // 12 bytes
+		"\r\n=yend size=12 pcrc32=00000000\r\n.\r\n"
+
+	// Mock server that returns YEnc body
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				c.Write([]byte("200 Service Ready\r\n"))
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					msg := string(buf[:n])
+					if strings.HasPrefix(msg, "BODY") {
+						c.Write([]byte("222 0 <id> body follows\r\n" + yEncBody))
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	client := NewClient(1)
+	defer client.Close()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", l.Addr().String())
+	}
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address: l.Addr().String(), MaxConnections: 1, ConnFactory: dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	client.AddProvider(p, ProviderPrimary)
+
+	wa := &mockWriterAt{}
+	err = client.BodyAt(context.Background(), "123", wa)
+	if err != nil {
+		t.Fatalf("BodyAt failed: %v", err)
+	}
+
+	wa.mu.Lock()
+	got := string(wa.data)
+	wa.mu.Unlock()
+
+	// Remove null bytes that might be in the buffer if it was resized
+	got = strings.TrimRight(got, "\x00")
+
+	if got != "hello world!" {
+		t.Errorf("expected 'hello world!', got '%s'", got)
+	}
+}

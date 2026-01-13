@@ -268,10 +268,18 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 
 	if produced > 0 {
 		r.CRC = crc32.Update(r.CRC, crc32.IEEETable, buf[:produced])
-		r.BytesDecoded += produced
-		if _, werr := out.Write(buf[:produced]); werr != nil {
-			return n, werr
+
+		if wa, ok := out.(io.WriterAt); ok {
+			if _, werr := wa.WriteAt(buf[:produced], r.PartBegin+int64(r.BytesDecoded)); werr != nil {
+				return n, werr
+			}
+		} else {
+			if _, werr := out.Write(buf[:produced]); werr != nil {
+				return n, werr
+			}
 		}
+
+		r.BytesDecoded += produced
 	}
 	n += int64(consumed)
 

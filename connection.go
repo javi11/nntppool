@@ -177,6 +177,20 @@ func (wr *writerRef) Write(p []byte) (int, error) {
 	return wr.w.Write(p)
 }
 
+type writerRefAt struct {
+	*writerRef
+}
+
+func (wr *writerRefAt) WriteAt(p []byte, off int64) (int, error) {
+	if wr.w == io.Discard {
+		return len(p), nil
+	}
+	if wa, ok := wr.w.(io.WriterAt); ok {
+		return wa.WriteAt(p, off)
+	}
+	return 0, fmt.Errorf("underlying writer does not support WriteAt")
+}
+
 func (c *NNTPConnection) Run() {
 	defer func() {
 		c.cancel()
@@ -299,8 +313,12 @@ func (c *NNTPConnection) readerLoop() {
 		// Allow us to switch output to io.Discard if the request is cancelled while
 		// we are still draining the response.
 		outRef := &writerRef{w: out}
+		var feederOut io.Writer = outRef
+		if _, ok := out.(io.WriterAt); ok {
+			feederOut = &writerRefAt{outRef}
+		}
 
-		err := c.rb.feedUntilDone(c.conn, &decoder, outRef, func() (time.Time, bool) {
+		err := c.rb.feedUntilDone(c.conn, &decoder, feederOut, func() (time.Time, bool) {
 			if deliver {
 				select {
 				case <-req.Ctx.Done():
