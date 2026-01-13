@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -66,15 +65,23 @@ func (p *ProgressTracker) Start() {
 	p.lastPrint = time.Now()
 }
 
-// Add adds downloaded bytes and optionally prints progress.
-func (p *ProgressTracker) Add(bytes int64, success bool) {
+// AddBytes adds downloaded bytes and optionally prints progress.
+func (p *ProgressTracker) AddBytes(bytes int64) {
 	p.downloadedBytes.Add(bytes)
+	p.checkPrint()
+}
+
+// SegmentDone marks a segment as completed or failed and optionally prints progress.
+func (p *ProgressTracker) SegmentDone(success bool) {
 	if success {
 		p.completed.Add(1)
 	} else {
 		p.failed.Add(1)
 	}
+	p.checkPrint()
+}
 
+func (p *ProgressTracker) checkPrint() {
 	// Rate limit progress updates to every 100ms
 	p.mu.Lock()
 	if time.Since(p.lastPrint) > 100*time.Millisecond && !p.done {
@@ -82,6 +89,19 @@ func (p *ProgressTracker) Add(bytes int64, success bool) {
 		p.lastPrint = time.Now()
 	}
 	p.mu.Unlock()
+}
+
+// ProgressWriter wraps io.Writer to track progress.
+type ProgressWriter struct {
+	tracker *ProgressTracker
+}
+
+func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if n > 0 {
+		pw.tracker.AddBytes(int64(n))
+	}
+	return n, nil
 }
 
 func (p *ProgressTracker) printProgress() {
@@ -206,12 +226,6 @@ func closeConnections(conns []nntpcli.Connection) {
 	}
 }
 
-// connWithGroup tracks a connection and its current group.
-type connWithGroup struct {
-	conn         nntpcli.Connection
-	currentGroup string
-}
-
 // DownloadBench performs a download benchmark without pipelining.
 // With multiple connections, segments are distributed across connections.
 func DownloadBench(ctx context.Context, cfg BenchConfig, segments []SegmentInfo) (*DownloadResult, error) {
@@ -240,10 +254,10 @@ func DownloadBench(ctx context.Context, cfg BenchConfig, segments []SegmentInfo)
 
 	result.ConnectTime = time.Since(connectStart)
 
-	// Create connection pool with group tracking
-	connPool := make(chan *connWithGroup, numConns)
+	// Create connection pool
+	connPool := make(chan nntpcli.Connection, numConns)
 	for _, c := range conns {
-		connPool <- &connWithGroup{conn: c, currentGroup: ""}
+		connPool <- c
 	}
 
 	// Create progress tracker
@@ -274,38 +288,26 @@ func DownloadBench(ctx context.Context, cfg BenchConfig, segments []SegmentInfo)
 			defer wg.Done()
 
 			// Acquire connection
-			cg := <-connPool
-			defer func() { connPool <- cg }()
-
-			// Join group if needed
-			targetGroup := ""
-			if len(seg.Groups) > 0 {
-				targetGroup = seg.Groups[0]
-			}
-			if targetGroup != "" && cg.currentGroup != targetGroup {
-				if err := cg.conn.JoinGroup(targetGroup); err != nil {
-					failCount.Add(1)
-					mu.Lock()
-					result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to join group: %v", seg.MessageID, err))
-					mu.Unlock()
-					progress.Add(seg.Bytes, false)
-					return
-				}
-				cg.currentGroup = targetGroup
-			}
+			conn := <-connPool
+			defer func() { connPool <- conn }()
 
 			// Download segment
-			n, err := cg.conn.BodyDecoded(seg.MessageID, io.Discard, 0)
+			pw := &ProgressWriter{tracker: progress}
+			n, err := conn.BodyDecoded(seg.MessageID, pw, 0)
 			if err != nil {
 				failCount.Add(1)
 				mu.Lock()
 				result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", seg.MessageID, err))
 				mu.Unlock()
-				progress.Add(seg.Bytes, false)
+				// Fill remaining bytes for progress bar completeness
+				if n < seg.Bytes {
+					progress.AddBytes(seg.Bytes - n)
+				}
+				progress.SegmentDone(false)
 			} else {
 				successCount.Add(1)
 				bytesTotal.Add(n)
-				progress.Add(n, true)
+				progress.SegmentDone(true)
 			}
 		}(seg, i)
 	}
@@ -373,13 +375,6 @@ func DownloadBenchPipeline(ctx context.Context, cfg BenchConfig, segments []Segm
 		_, _ = fmt.Println("Testing pipeline support...")
 		testID := segments[0].MessageID
 
-		// Join group first if needed
-		if len(segments[0].Groups) > 0 {
-			if err := conns[0].JoinGroup(segments[0].Groups[0]); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to join group for test: %v\n", err)
-			}
-		}
-
 		supported, suggestedDepth, err := conns[0].TestPipelineSupport(testID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Pipeline test failed: %v\n", err)
@@ -391,19 +386,16 @@ func DownloadBenchPipeline(ctx context.Context, cfg BenchConfig, segments []Segm
 		}
 	}
 
-	// Group segments by newsgroup
-	segmentsByGroup := groupSegmentsByGroup(segments)
-
 	// Batch size = pipeline depth
 	batchSize := cfg.PipelineDepth
 	if batchSize <= 0 {
 		batchSize = 8
 	}
 
-	// Create connection pool with group tracking
-	connPool := make(chan *connWithGroup, numConns)
+	// Create connection pool
+	connPool := make(chan nntpcli.Connection, numConns)
 	for _, c := range conns {
-		connPool <- &connWithGroup{conn: c, currentGroup: ""}
+		connPool <- c
 	}
 
 	// Create progress tracker
@@ -419,77 +411,62 @@ func DownloadBenchPipeline(ctx context.Context, cfg BenchConfig, segments []Segm
 	var successCount atomic.Int32
 	var failCount atomic.Int32
 
-	// Process each group's segments
-	for groupName, groupSegs := range segmentsByGroup {
-		// Split group segments into batches
-		for i := 0; i < len(groupSegs); i += batchSize {
-			select {
-			case <-ctx.Done():
-				progress.Finish()
-				return result, ctx.Err()
-			default:
-			}
-
-			end := i + batchSize
-			if end > len(groupSegs) {
-				end = len(groupSegs)
-			}
-			batch := groupSegs[i:end]
-
-			wg.Add(1)
-
-			go func(grp string, segs []SegmentInfo) {
-				defer wg.Done()
-
-				// Acquire connection
-				cg := <-connPool
-				defer func() { connPool <- cg }()
-
-				// Join group if needed
-				if grp != "" && cg.currentGroup != grp {
-					if err := cg.conn.JoinGroup(grp); err != nil {
-						// Mark all segments in this batch as failed
-						for _, seg := range segs {
-							failCount.Add(1)
-							mu.Lock()
-							result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to join group %s: %v", seg.MessageID, grp, err))
-							mu.Unlock()
-							progress.Add(seg.Bytes, false)
-						}
-						return
-					}
-					cg.currentGroup = grp
-				}
-
-				// Build pipeline requests
-				requests := make([]nntpcli.PipelineRequest, len(segs))
-				for j, seg := range segs {
-					requests[j] = nntpcli.PipelineRequest{
-						MessageID: seg.MessageID,
-						Writer:    io.Discard,
-						Discard:   0,
-					}
-				}
-
-				// Execute pipeline
-				results := cg.conn.BodyPipelined(requests)
-
-				// Process results
-				for j, res := range results {
-					if res.Error != nil {
-						failCount.Add(1)
-						mu.Lock()
-						result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", res.MessageID, res.Error))
-						mu.Unlock()
-						progress.Add(segs[j].Bytes, false)
-					} else {
-						successCount.Add(1)
-						bytesTotal.Add(res.BytesWritten)
-						progress.Add(res.BytesWritten, true)
-					}
-				}
-			}(groupName, batch)
+	// Process segments in batches
+	for i := 0; i < len(segments); i += batchSize {
+		select {
+		case <-ctx.Done():
+			progress.Finish()
+			return result, ctx.Err()
+		default:
 		}
+
+		end := i + batchSize
+		if end > len(segments) {
+			end = len(segments)
+		}
+		batch := segments[i:end]
+
+		wg.Add(1)
+
+		go func(segs []SegmentInfo) {
+			defer wg.Done()
+
+			// Acquire connection
+			conn := <-connPool
+			defer func() { connPool <- conn }()
+
+			// Build pipeline requests
+			pw := &ProgressWriter{tracker: progress}
+			requests := make([]nntpcli.PipelineRequest, len(segs))
+			for j, seg := range segs {
+				requests[j] = nntpcli.PipelineRequest{
+					MessageID: seg.MessageID,
+					Writer:    pw,
+					Discard:   0,
+				}
+			}
+
+			// Execute pipeline
+			results := conn.BodyPipelined(requests)
+
+			// Process results
+			for j, res := range results {
+				if res.Error != nil {
+					failCount.Add(1)
+					mu.Lock()
+					result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", res.MessageID, res.Error))
+					mu.Unlock()
+					if res.BytesWritten < segs[j].Bytes {
+						progress.AddBytes(segs[j].Bytes - res.BytesWritten)
+					}
+					progress.SegmentDone(false)
+				} else {
+					successCount.Add(1)
+					bytesTotal.Add(res.BytesWritten)
+					progress.SegmentDone(true)
+				}
+			}
+		}(batch)
 	}
 
 	// Wait for completion or cancellation
@@ -560,17 +537,4 @@ func PrintDownloadResult(r *DownloadResult) {
 	if r.SegmentsFailed > 0 {
 		fmt.Fprintf(os.Stderr, "\nWarning: %d segments failed to download\n", r.SegmentsFailed)
 	}
-}
-
-// groupSegmentsByGroup groups segments by their first newsgroup.
-func groupSegmentsByGroup(segments []SegmentInfo) map[string][]SegmentInfo {
-	result := make(map[string][]SegmentInfo)
-	for _, seg := range segments {
-		group := ""
-		if len(seg.Groups) > 0 {
-			group = seg.Groups[0]
-		}
-		result[group] = append(result[group], seg)
-	}
-	return result
 }

@@ -83,6 +83,19 @@ func (c *client) setupTCPConn(ctx context.Context, host string, port int, cfg Di
 
 	// Configure TCP options only for direct TCP connections (not proxied)
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		// Set large socket buffers for high-bandwidth connections (10 Gbps+)
+		if recvBuf := c.config.getSocketReceiveBuffer(); recvBuf > 0 {
+			if err = tcpConn.SetReadBuffer(recvBuf); err != nil {
+				return nil, 0, err
+			}
+		}
+
+		if sendBuf := c.config.getSocketSendBuffer(); sendBuf > 0 {
+			if err = tcpConn.SetWriteBuffer(sendBuf); err != nil {
+				return nil, 0, err
+			}
+		}
+
 		if err = tcpConn.SetKeepAlive(true); err != nil {
 			return nil, 0, err
 		}
@@ -91,6 +104,7 @@ func (c *client) setupTCPConn(ctx context.Context, host string, port int, cfg Di
 			return nil, 0, err
 		}
 
+		// Disable Nagle's algorithm for low latency
 		if err = tcpConn.SetNoDelay(true); err != nil {
 			return nil, 0, err
 		}
@@ -162,10 +176,20 @@ func (c *client) DialTLS(
 		return nil, err
 	}
 
-	tlsConn := tls.Client(conn, &tls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: insecureSSL,
-	})
+	var tlsConfig *tls.Config
+	if c.config.TLSConfig != nil {
+		// Use custom config if provided
+		tlsConfig = c.config.TLSConfig.Clone()
+		tlsConfig.ServerName = host
+		if insecureSSL {
+			tlsConfig.InsecureSkipVerify = true
+		}
+	} else {
+		// Use optimized defaults
+		tlsConfig = createOptimizedTLSConfig(host, insecureSSL)
+	}
+
+	tlsConn := tls.Client(conn, tlsConfig)
 
 	err = tlsConn.Handshake()
 	if err != nil {
@@ -175,4 +199,25 @@ func (c *client) DialTLS(
 	maxAgeTime := time.Now().Add(keepAlive)
 
 	return newConnection(tlsConn, maxAgeTime, c.config.OperationTimeout, c.config.getReadBufferSize())
+}
+
+// createOptimizedTLSConfig creates a TLS config optimized for high throughput.
+// Prefers TLS 1.3 and uses hardware-accelerated cipher suites (AES-GCM, ChaCha20).
+func createOptimizedTLSConfig(serverName string, insecureSSL bool) *tls.Config {
+	return &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: insecureSSL,
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS13,
+		// Hardware-accelerated cipher suites (AES-GCM uses AES-NI instructions)
+		// TLS 1.3 ciphers are automatically preferred when available
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		},
+	}
 }
