@@ -1,279 +1,308 @@
 # nntppool
 
-<a href="https://www.buymeacoffee.com/qbt52hh7sjd"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=qbt52hh7sjd&button_colour=FFDD00&font_colour=000000&font_family=Comic&outline_colour=000000&coffee_colour=ffffff" /></a>
+[![Go Reference](https://pkg.go.dev/badge/github.com/javi11/nntppool/v3.svg)](https://pkg.go.dev/github.com/javi11/nntppool/v3)
+[![Go Report Card](https://goreportcard.com/badge/github.com/javi11/nntppool/v3)](https://goreportcard.com/report/github.com/javi11/nntppool/v3)
 
-A nntp pool connection with retry and provider rotation.
+High-performance, concurrent NNTP client library for Go with streaming support, automatic failover, and built-in metrics.
 
 ## Features
 
-- Connection pooling
-- Body download retry and yenc decode
-- Post article with retry and yenc encode
-- Stat article with retry
-- TLS support
-- Multiple providers with rotation. In case of failure for article not found the provider will be rotated.
-- Backup providers. If all providers fail, the backup provider will be used for download. Useful for block accounts usage.
-- **Dynamic reconfiguration** - Update provider settings, add/remove providers, or change connection limits without interrupting service
-- **Intelligent metrics system** - Comprehensive metrics with rolling windows, automatic cleanup, and memory management to prevent infinite growth
+- **Streaming API** with memory-efficient `BodyReader` for large article downloads
+- **Multi-provider support** with automatic failover (Primary/Backup tiers)
+- **SOCKS proxy support** (socks4, socks4a, socks5) with authentication
+- **Built-in metrics** with real-time throughput monitoring
+- **Automatic yEnc decoding** with header callbacks for early metadata access
+- **Connection lifecycle management** (idle timeout, max lifetime, automatic rotation)
+- **High concurrency** with configurable inflight limits
+- **Health checking** with automatic provider recovery
+- **TLS support** for secure NNTPS connections
+- **Context-aware** for timeout and cancellation support
 
 ## Installation
 
-To install the `nntppool` package, you can use `go get`:
-
-```sh
-go get github.com/javi11/nntppool/v2
+```bash
+go get github.com/javi11/nntppool/v3
 ```
 
-Since this package uses [Rapidyenc](github.com/mnightingale/rapidyenc), you will need to build it with **CGO enabled**
-
-## Usage Example
+## Quick Start
 
 ```go
 package main
 
 import (
     "context"
-    "log"
+    "crypto/tls"
+    "fmt"
     "os"
-    "time"
 
-    "github.com/javi11/nntppool/v2"
+    "github.com/javi11/nntppool/v3"
 )
 
 func main() {
-    // Configure the connection pool
-    config := nntppool.Config{
-        MinConnections: 5,
-        MaxRetries:    3,
-        Providers: []nntppool.UsenetProviderConfig{
-            {
-                Host:                          "news.example.com",
-                Port:                          119,
-                Username:                      "user",
-                Password:                      "pass",
-                MaxConnections:                10,
-                MaxConnectionIdleTimeInSeconds: 300,
-                TLS:                           false,
-            },
-            {
-                Host:                          "news-backup.example.com",
-                Port:                          119,
-                Username:                      "user",
-                Password:                      "pass",
-                MaxConnections:                5,
-                MaxConnectionIdleTimeInSeconds: 300,
-                TLS:                           true,
-                IsBackupProvider:              true,
-            },
-        },
-    }
-
-    // Create a new connection pool
-    pool, err := nntppool.NewConnectionPool(config)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer pool.Quit()
-
-    // Example: Download an article
     ctx := context.Background()
-    msgID := "<example-message-id@example.com>"
-    file, err := os.Create("article.txt")
+
+    // Create provider configuration
+    provider, err := nntppool.NewProvider(ctx, nntppool.ProviderConfig{
+        Address:        "news.example.com:563",
+        MaxConnections: 10,
+        Auth: nntppool.Auth{
+            Username: "user",
+            Password: "pass",
+        },
+        TLSConfig: &tls.Config{},
+    })
     if err != nil {
-        log.Fatal(err)
+        panic(err)
+    }
+    defer provider.Close()
+
+    // Create client (implements NNTPClient interface)
+    client := nntppool.NewClient(100) // Max 100 concurrent requests
+    client.AddProvider(provider, nntppool.ProviderPrimary)
+    defer client.Close()
+
+    // Download article body
+    file, err := os.Create("output.bin")
+    if err != nil {
+        panic(err)
     }
     defer file.Close()
 
-    written, err := pool.Body(ctx, msgID, file, nil)
-    if err != nil {
-        log.Fatal(err)
-    }
-    log.Printf("Downloaded %d bytes", written)
-
-    // Example: Post an article
-    article, err := os.Open("article.txt")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer article.Close()
-
-    err = pool.Post(ctx, article)
-    if err != nil {
-        log.Fatal(err)
+    if err := client.Body(ctx, "<message-id@example.com>", file); err != nil {
+        panic(err)
     }
 
-    // Example: Check if an article exists
-    msgNum, err := pool.Stat(ctx, msgID, []string{"alt.binaries.test"})
-    if err != nil {
-        log.Fatal(err)
-    }
-    log.Printf("Article number: %d", msgNum)
+    fmt.Println("Article downloaded successfully!")
 }
 ```
 
-### Best Practices
+**Note**: The `Client` type implements the `NNTPClient` interface. See `types.go` for the complete interface definition.
 
-- **Monitor Progress**: Always check reconfiguration status, especially in production
-- **Gradual Changes**: Make incremental changes rather than large configuration overhauls
-- **Error Handling**: Handle reconfiguration errors gracefully and consider rollback strategies
-- **Testing**: Test configuration changes in development before applying to production
+## Usage Examples
 
-## Metrics System
-
-The connection pool includes a comprehensive metrics system that provides detailed insights into connection pool performance while intelligently managing memory usage to prevent infinite growth over time.
-
-### Key Features
-
-- **Rolling Time Windows**: Metrics are organized into configurable time windows (default: 1 hour)
-- **Automatic Cleanup**: Old metrics are automatically cleaned up based on retention policies
-- **Memory Management**: Built-in memory monitoring with configurable thresholds and automatic cleanup
-- **Connection Tracking**: Automatic detection and cleanup of stale connections
-- **Data Compression**: Historical data is compressed into summaries for long-term storage
-- **Real-time Monitoring**: Live metrics for active connections and pool performance
-
-### Getting Metrics
+### Basic Article Retrieval
 
 ```go
-// Get comprehensive metrics snapshot
-snapshot := pool.GetMetrics()
-
-fmt.Printf("Active connections: %d\n", snapshot.ActiveConnections)
-fmt.Printf("Total bytes downloaded: %d\n", snapshot.TotalBytesDownloaded)
-fmt.Printf("Download speed: %.2f bytes/sec\n", snapshot.DownloadSpeed)
-fmt.Printf("Error rate: %.2f%%\n", snapshot.ErrorRate)
-fmt.Printf("Memory usage: %d bytes\n", snapshot.CurrentMemoryUsage)
-
-// Check daily and weekly summaries
-if snapshot.DailySummary != nil {
-    fmt.Printf("Daily summary: %d connections created\n", snapshot.DailySummary.TotalConnectionsCreated)
-}
-
-if snapshot.WeeklySummary != nil {
-    fmt.Printf("Weekly average: %.2f connections/hour\n", snapshot.WeeklySummary.AverageConnectionsPerHour)
-}
+// Simple download to io.Writer
+err := client.Body(ctx, "<message-id>", outputFile)
 ```
 
-### Configuring Metrics Retention
+### Streaming with yEnc Headers
+
+Get early access to yEnc metadata while streaming the body:
 
 ```go
-// Configure metrics retention policy
-config := nntppool.MetricRetentionConfig{
-    DetailedRetentionDuration: 48 * time.Hour,        // Keep detailed metrics for 2 days
-    RotationInterval:          30 * time.Minute,      // Create new windows every 30 minutes
-    MaxHistoricalWindows:      96,                    // Keep 96 windows (2 days of 30-min windows)
-    MemoryThresholdBytes:      50 * 1024 * 1024,      // Trigger cleanup at 50MB
-    AutoCleanupEnabled:        true,                  // Enable automatic cleanup
+reader, err := client.BodyReader(ctx, "<message-id>")
+if err != nil {
+    log.Fatal(err)
+}
+defer reader.Close()
+
+// Headers become available immediately after parsing (non-blocking)
+headers := reader.YencHeaders()
+if headers != nil {
+    fmt.Printf("File: %s, Size: %d bytes\n", headers.FileName, headers.FileSize)
 }
 
-// Apply the configuration
-metrics := pool.GetMetricsInstance() // You'll need to expose this method
-metrics.SetRetentionConfig(config)
+// Stream decoded body to file
+_, err = io.Copy(outputFile, reader)
 ```
 
-### Manual Maintenance
+### Multi-Segment Downloads
+
+Write directly to file offsets for parallel multi-segment downloads:
 
 ```go
-// Perform manual cleanup and rotation check
-metrics.PerformRotationCheck()
-
-// Force connection cleanup
-staleCount := metrics.ForceConnectionCleanup()
-fmt.Printf("Cleaned up %d stale connections\n", staleCount)
-
-// Get system status
-status := metrics.GetRollingMetricsStatus()
-fmt.Printf("Current window: %v to %v\n", status.CurrentWindowStartTime, status.CurrentWindowEndTime)
-fmt.Printf("Historical windows: %d/%d\n", status.HistoricalWindowCount, status.MaxHistoricalWindows)
-
-memory := metrics.GetMemoryUsage()
-fmt.Printf("Memory: %d/%d bytes (%.1f%%)\n",
-    memory.AllocatedBytes,
-    memory.ThresholdBytes,
-    float64(memory.AllocatedBytes)/float64(memory.ThresholdBytes)*100)
+// file must implement io.WriterAt (e.g., *os.File)
+err := client.BodyAt(ctx, "<segment-message-id>", file)
 ```
 
-### Metrics Available
+### Multi-Provider Setup
 
-The system tracks comprehensive metrics including:
+Configure primary and backup providers with automatic failover:
 
-**Connection Metrics:**
+```go
+// Primary provider
+primaryProvider, _ := nntppool.NewProvider(ctx, nntppool.ProviderConfig{
+    Address:        "primary.news.com:563",
+    MaxConnections: 10,
+    Auth:           nntppool.Auth{Username: "user", Password: "pass"},
+    TLSConfig:      &tls.Config{},
+})
 
-- Total connections created/destroyed
-- Active connection count
-- Connection acquire/release operations
-- Connection age and lifecycle
+// Backup provider
+backupProvider, _ := nntppool.NewProvider(ctx, nntppool.ProviderConfig{
+    Address:        "backup.news.com:563",
+    MaxConnections: 5,
+    Auth:           nntppool.Auth{Username: "user2", Password: "pass2"},
+    TLSConfig:      &tls.Config{},
+})
 
-**Performance Metrics:**
+// Add to client with tier priority
+client := nntppool.NewClient(100)
+client.AddProvider(primaryProvider, nntppool.ProviderPrimary)
+client.AddProvider(backupProvider, nntppool.ProviderBackup)
 
-- Download/upload speeds (recent and historical)
-- Command success rates
-- Error rates and retry counts
-- Acquire wait times
-
-**Traffic Metrics:**
-
-- Bytes downloaded/uploaded
-- Articles retrieved/posted
-- Command counts and errors
-
-**System Metrics:**
-
-- Memory usage and thresholds
-- Rolling window status
-- Connection cleanup statistics
-- Provider-specific metrics
-
-### Automatic Cleanup Behavior
-
-The metrics system automatically:
-
-1. **Rotates windows** when time periods expire (e.g., every hour)
-2. **Monitors memory usage** every 5 minutes by default
-3. **Cleans up stale connections** every 30 seconds
-4. **Compresses old data** when retention periods are exceeded
-5. **Triggers aggressive cleanup** when memory thresholds are reached
-
-This ensures that long-running applications maintain stable memory usage while preserving useful historical data for analysis and monitoring.
-
-## Development Setup
-
-To set up the project for development, follow these steps:
-
-1. Clone the repository:
-
-```sh
-git clone https://github.com/javi11/nntppool/v2.git
-cd nntppool
+// Client automatically tries primary first, falls back to backup on errors
 ```
 
-2. Install dependencies:
+### SOCKS Proxy Configuration
 
-```sh
-go mod download
+```go
+config := nntppool.ProviderConfig{
+    Address:        "news.example.com:119",
+    MaxConnections: 10,
+    ProxyURL:       "socks5://user:pass@proxy.example.com:1080",
+    Auth:           nntppool.Auth{Username: "newsuser", Password: "newspass"},
+}
+
+provider, err := nntppool.NewProvider(ctx, config)
 ```
 
-3. Run tests:
+### Metrics Monitoring
 
-```sh
-make test
+Monitor real-time throughput and connection status:
+
+```go
+metrics := client.Metrics()
+for host, m := range metrics {
+    fmt.Printf("%s: %.2f MB/s (%d active connections)\n",
+        host, m.ThroughputMB, m.ActiveConnections)
+    fmt.Printf("  Total read: %d bytes, written: %d bytes\n",
+        m.TotalBytesRead, m.TotalBytesWritten)
+}
 ```
 
-4. Lint the code:
+### Speed Testing
 
-```sh
-make lint
+Measure download performance across multiple articles:
+
+```go
+articleIDs := []string{
+    "<article1@example.com>",
+    "<article2@example.com>",
+    "<article3@example.com>",
+}
+
+stats, err := client.SpeedTest(ctx, articleIDs)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("Speed: %.2f MB/s\n", stats.BytesPerSecond/1024/1024)
+fmt.Printf("Success: %d, Failures: %d\n", stats.SuccessCount, stats.FailureCount)
+fmt.Printf("Total: %d bytes in %v\n", stats.TotalBytes, stats.Duration)
 ```
 
-5. Generate mocks and other code:
+## Configuration Reference
 
-```sh
-make generate
+### ProviderConfig Options
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `Address` | `string` | ✅ | - | NNTP server address in `host:port` format |
+| `MaxConnections` | `int` | ✅ | - | Maximum concurrent connections to maintain |
+| `InitialConnections` | `int` | ❌ | `0` | Number of connections to create on startup (lazy if 0) |
+| `InflightPerConnection` | `int` | ❌ | `1` | Maximum concurrent requests per connection |
+| `MaxConnIdleTime` | `time.Duration` | ❌ | `0` | Auto-close connections idle longer than this duration |
+| `MaxConnLifetime` | `time.Duration` | ❌ | `0` | Auto-rotate connections older than this duration |
+| `Auth` | `Auth` | ❌ | empty | NNTP authentication credentials (`Username`, `Password`) |
+| `TLSConfig` | `*tls.Config` | ❌ | `nil` | TLS configuration (nil = plaintext connection) |
+| `ConnFactory` | `ConnFactory` | ❌ | `nil` | Custom connection factory (overrides proxy/direct dial) |
+| `ProxyURL` | `string` | ❌ | `""` | SOCKS proxy URL (used when `ConnFactory` is nil) |
+
+### Connection Lifecycle
+
+Control connection behavior with lifecycle options:
+
+- **`MaxConnIdleTime`**: Automatically close connections that have been idle (no requests) longer than the specified duration. Useful for preventing stale connections.
+- **`MaxConnLifetime`**: Automatically rotate connections that have been active longer than the specified duration, regardless of usage. Useful for load balancing and preventing resource exhaustion.
+- Both options are disabled by default (0 value = no limit).
+
+### Proxy URL Formats
+
+When `ConnFactory` is `nil`, the `ProxyURL` field supports SOCKS proxies:
+
+- **SOCKS5 without auth**: `socks5://proxy.host:1080`
+- **SOCKS5 with auth**: `socks5://user:pass@proxy.host:1080`
+- **SOCKS4**: `socks4://proxy.host:1080`
+- **SOCKS4a**: `socks4a://proxy.host:1080`
+
+## Advanced Topics
+
+### TLS & Custom Connections
+
+```go
+// TLS configuration for NNTPS (port 563)
+config := nntppool.ProviderConfig{
+    Address: "news.example.com:563",
+    TLSConfig: &tls.Config{
+        MinVersion: tls.VersionTLS12,
+        ServerName: "news.example.com",
+    },
+}
+
+// Custom connection factory for advanced dialing
+config.ConnFactory = func(ctx context.Context) (net.Conn, error) {
+    dialer := &net.Dialer{Timeout: 30 * time.Second}
+    conn, err := dialer.DialContext(ctx, "tcp", "news.example.com:563")
+    if err != nil {
+        return nil, err
+    }
+    // Apply custom socket options, wrapping, etc.
+    return conn, nil
+}
 ```
 
-## Contributing
+### Automatic Features
 
-Contributions are welcome! Please open an issue or submit a pull request. See the [CONTRIBUTING.md](CONTRIBUTING.md) file for details.
+The library includes several automatic features that require no configuration:
+
+- **Health Monitoring**: Providers are automatically checked every 60 seconds using the `DATE` command. Dead providers are marked inactive and automatically recovered when they become responsive again.
+
+- **yEnc Decoding**: All article bodies are automatically detected and decoded if they contain yEnc encoding. Includes CRC32 validation and support for multi-part articles with part metadata tracking.
+
+- **Error Handling**: Status code interpretation follows NNTP standards:
+  - `2xx` status codes indicate success
+  - `430` indicates article not found (triggers failover to backup provider)
+  - Other status codes indicate server or connection errors
+
+## Performance Considerations
+
+- **Connection Pooling**: Each provider maintains an independent connection pool. Connections are created lazily up to `MaxConnections` and reused across requests.
+
+- **Concurrency Control**: Use `maxInflight` parameter in `NewClient(maxInflight)` to limit memory usage with many concurrent requests. Set to `0` for unlimited concurrency.
+
+- **Streaming**: Use `BodyReader()` or `BodyAt()` to avoid buffering large articles in memory. The streaming API decodes yEnc on-the-fly and writes directly to the destination.
+
+- **TCP Buffers**: All connections are automatically optimized with 8MB read buffers and 1MB write buffers for high-speed downloads.
+
+- **Health Checks**: Provider health checks run every 60 seconds with minimal overhead (single `DATE` command per provider).
+
+## Examples
+
+See working example programs in the repository:
+
+- **`examples/proxy_example.go`**: Complete examples of SOCKS proxy configuration (socks4, socks4a, socks5 with authentication)
+- **`cmd/nzb-downloader/`**: Full-featured NZB downloader with concurrent downloads, progress tracking, and metrics display
+
+## Testing
+
+```bash
+# Run all tests
+go test -v ./...
+
+# Run with race detector
+go test -race ./...
+
+# Run benchmarks
+go test -bench=. -benchmem
+```
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT License
+
+---
+
+**Full API Documentation**: See [pkg.go.dev](https://pkg.go.dev/github.com/javi11/nntppool/v3) for complete API reference and additional examples.
