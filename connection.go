@@ -70,16 +70,9 @@ type NNTPConnection struct {
 	createdAt    time.Time
 }
 
-func newNetConn(addr string, tlsConfig *tls.Config) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout: 30 * time.Second,
-	}
-
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
+// applyConnOptimizations applies TCP buffer optimizations and optional TLS wrapping to a connection.
+// This is used for both direct and proxy connections.
+func applyConnOptimizations(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
 	// Optimize socket buffers for high-speed downloads (10Gbps+)
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		// 8MB receive buffer
@@ -92,6 +85,19 @@ func newNetConn(addr string, tlsConfig *tls.Config) (net.Conn, error) {
 		return tls.Client(conn, tlsConfig), nil
 	}
 	return conn, nil
+}
+
+func newNetConn(addr string, tlsConfig *tls.Config) (net.Conn, error) {
+	dialer := &net.Dialer{
+		Timeout: 30 * time.Second,
+	}
+
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	return applyConnOptimizations(conn, tlsConfig)
 }
 
 func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth, maxIdleTime time.Duration, maxLifeTime time.Duration) (*NNTPConnection, error) {
