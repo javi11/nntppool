@@ -94,36 +94,18 @@ func TestClientRotation_AllFail(t *testing.T) {
 		t.Fatal("expected error, got success")
 	}
 
-	// Note: We expect the error to contain "430" or "No Such Article"
-	// The client returns the last error. If both fail with 430, it should return 430.
-	// client.go logic:
-	// - if resp.Err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 -> Success
-	// - else -> continue loop
-	// If all failed, it returns lastResp or lastErr.
-	// Our mock returns 430 with err=nil in response struct, but response.Err might be nil.
-	// client.sendSync returns resp.Err if set, OR &resp.
-	// If 430 is returned, it is a valid response with StatusCode 430.
-	// Body() calls sendSync() which returns (resp, err).
-	// The error should typically contain 430 or "No Such Article"
-	if !strings.Contains(err.Error(), "430") && !strings.Contains(err.Error(), "No Such Article") {
-		t.Logf("Warning: error message doesn't contain expected strings: %v", err)
-		// return &resp, nil
-		//
-		// client.Body implementation:
-		// _, err := c.sendSync(...)
-		// return err
-		//
-		// Wait. sendSync returns err only if resp.Err is set (transport error) or context error.
-		// It returns nil error if we got a valid NNTP response (even 430).
-		// THIS IS A BUG/FEATURE in client.go?
-		// Let's check Client.Body:
-		// func (c *Client) Body(...) error {
-		//     _, err := c.sendSync(...)
-		//     return err
-		// }
-		//
-		// If sendSync returns 430 response and nil error, Body returns nil error?
-		// That would mean 430 is treated as success by Body().
-		// Let's check sendSync again in client.go
+	// Check using helper method
+	if !IsArticleNotFound(err) {
+		t.Fatalf("expected ArticleNotFoundError, got: %T %v", err, err)
+	}
+
+	// Verify error message
+	if !strings.Contains(err.Error(), "article not found") {
+		t.Fatalf("expected 'article not found' in error, got: %v", err)
+	}
+
+	// Verify error contains message ID
+	if !strings.Contains(err.Error(), "123") {
+		t.Fatalf("expected message ID '123' in error, got: %v", err)
 	}
 }
