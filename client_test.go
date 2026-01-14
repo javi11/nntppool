@@ -980,6 +980,104 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 	}
 }
 
+func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
+	// This test reproduces the "response channel closed unexpectedly" error
+	// that occurs when a context times out while waiting to acquire the semaphore
+
+	var requestReceived atomic.Bool
+	requestReceived.Store(false)
+	blockCh := make(chan struct{})
+
+	// Create a mock server that processes requests slowly
+	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "BODY <slow>\r\n" {
+				requestReceived.Store(true)
+				// Block until test tells us to proceed
+				<-blockCh
+				return "222 0 <slow> body follows\r\ntest\r\n.\r\n", nil
+			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	// Create client with maxInflight=1 so only one request can be in-flight
+	client := NewClient(1)
+	defer client.Close()
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "example.com:119",
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           mockDial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	client.AddProvider(p, ProviderPrimary)
+
+	// Start a slow request to fill the semaphore
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		ctx := context.Background()
+		_ = client.Body(ctx, "slow", io.Discard)
+	}()
+
+	// Wait for the slow request to be received and hold the semaphore
+	timeout := time.After(5 * time.Second)
+	for !requestReceived.Load() {
+		select {
+		case <-timeout:
+			close(blockCh)
+			t.Fatal("timeout waiting for slow request to be received")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Give it a bit more time to ensure semaphore is acquired
+	time.Sleep(50 * time.Millisecond)
+
+	// Now try Date() with a short timeout while semaphore is full
+	// This should timeout while waiting for semaphore acquisition
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err = client.Date(ctx)
+
+	// Unblock the slow request
+	close(blockCh)
+
+	// Wait for slow request to complete
+	select {
+	case <-slowDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for slow request to complete")
+	}
+
+	// We expect an error, and it should be the context deadline exceeded
+	// NOT "response channel closed unexpectedly"
+	if err == nil {
+		t.Fatal("expected an error due to context timeout, got nil")
+	}
+
+	// Check if we get the buggy "response channel closed unexpectedly" error
+	if err.Error() == "response channel closed unexpectedly" {
+		t.Errorf("BUG REPRODUCED: got 'response channel closed unexpectedly' error instead of context.DeadlineExceeded")
+	} else if err != context.DeadlineExceeded {
+		t.Logf("Got error: %v (type: %T)", err, err)
+		// We should get context.DeadlineExceeded
+		if err.Error() != "context deadline exceeded" {
+			t.Errorf("expected context deadline exceeded error, got: %v", err)
+		}
+	}
+}
+
 func TestPostYencRoundTrip(t *testing.T) {
 	t.Run("single-part round-trip", func(t *testing.T) {
 		client, cleanup := setupRoundTripClient(t, "RoundTripTest")

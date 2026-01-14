@@ -321,6 +321,7 @@ func (c *Client) sendRequest(req *Request) {
 		case c.sem <- struct{}{}:
 			defer func() { <-c.sem }()
 		case <-req.Ctx.Done():
+			req.RespCh <- Response{Err: req.Ctx.Err()}
 			return
 		}
 	}
