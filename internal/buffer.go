@@ -1,4 +1,4 @@
-package nntppool
+package internal
 
 import (
 	"fmt"
@@ -8,26 +8,26 @@ import (
 )
 
 const (
-	defaultReadBufSize = 32 * 1024
-	maxReadBufSize     = 8 * 1024 * 1024
+	DefaultReadBufSize = 32 * 1024
+	MaxReadBufSize     = 8 * 1024 * 1024
 )
 
-type readBuffer struct {
+type ReadBuffer struct {
 	buf        []byte
 	start, end int
 }
 
-func (rb *readBuffer) init() {
+func (rb *ReadBuffer) Init() {
 	if len(rb.buf) == 0 {
-		rb.buf = make([]byte, defaultReadBufSize)
+		rb.buf = make([]byte, DefaultReadBufSize)
 	}
 }
 
-func (rb *readBuffer) window() []byte {
+func (rb *ReadBuffer) Window() []byte {
 	return rb.buf[rb.start:rb.end]
 }
 
-func (rb *readBuffer) advance(consumed int) {
+func (rb *ReadBuffer) Advance(consumed int) {
 	if consumed <= 0 {
 		return
 	}
@@ -37,7 +37,7 @@ func (rb *readBuffer) advance(consumed int) {
 	}
 }
 
-func (rb *readBuffer) compact() {
+func (rb *ReadBuffer) Compact() {
 	if rb.start == 0 || rb.start == rb.end {
 		return
 	}
@@ -46,12 +46,12 @@ func (rb *readBuffer) compact() {
 	rb.start = 0
 }
 
-func (rb *readBuffer) ensureWriteSpace() error {
+func (rb *ReadBuffer) ensureWriteSpace() error {
 	if rb.end < len(rb.buf) {
 		return nil
 	}
 	if rb.start > 0 {
-		rb.compact()
+		rb.Compact()
 		if rb.end < len(rb.buf) {
 			return nil
 		}
@@ -60,25 +60,25 @@ func (rb *readBuffer) ensureWriteSpace() error {
 	// No space and cannot compact: grow.
 	cur := len(rb.buf)
 	if cur == 0 {
-		cur = defaultReadBufSize
+		cur = DefaultReadBufSize
 	}
 	newLen := cur * 2
-	if newLen > maxReadBufSize {
-		newLen = maxReadBufSize
+	if newLen > MaxReadBufSize {
+		newLen = MaxReadBufSize
 	}
 	if newLen <= len(rb.buf) {
-		return fmt.Errorf("nntp read buffer exceeded %d bytes", maxReadBufSize)
+		return fmt.Errorf("nntp read buffer exceeded %d bytes", MaxReadBufSize)
 	}
 
 	nb := make([]byte, newLen)
-	copy(nb, rb.window())
+	copy(nb, rb.Window())
 	rb.end = rb.end - rb.start
 	rb.start = 0
 	rb.buf = nb
 	return nil
 }
 
-func (rb *readBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bool) (int, error) {
+func (rb *ReadBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bool) (int, error) {
 	if hasDeadline {
 		_ = conn.SetReadDeadline(deadline)
 	} else {
@@ -94,8 +94,8 @@ func (rb *readBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bo
 	return n, err
 }
 
-func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.Writer, deadline func() (time.Time, bool)) error {
-	rb.init()
+func (rb *ReadBuffer) FeedUntilDone(conn net.Conn, feeder StreamFeeder, out io.Writer, deadline func() (time.Time, bool)) error {
+	rb.Init()
 
 	for {
 		// Ensure we have some bytes to feed.
@@ -107,9 +107,9 @@ func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.W
 			}
 		}
 
-		consumed, done, err := feeder.Feed(rb.window(), out)
+		consumed, done, err := feeder.Feed(rb.Window(), out)
 		if consumed > 0 {
-			rb.advance(consumed)
+			rb.Advance(consumed)
 		}
 		if err != nil {
 			return err
@@ -122,7 +122,7 @@ func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.W
 		// If decoder couldn't consume anything but we have buffered bytes,
 		// compact them to the start so the next read appends contiguously.
 		if consumed == 0 && (rb.end-rb.start) > 0 {
-			rb.compact()
+			rb.Compact()
 		}
 
 		dl, ok := deadline()
