@@ -94,3 +94,27 @@ func (b *yencReader) YencHeaders() *YencHeader {
 		return nil
 	}
 }
+
+// NNTPClient defines the public API for NNTP operations.
+// The Client type implements this interface.
+type NNTPClient interface {
+	// Provider management
+	AddProvider(provider *Provider, tier ProviderType)
+	RemoveProvider(provider *Provider)
+	Close()
+
+	// Article retrieval methods
+	Body(ctx context.Context, id string, w io.Writer) error
+	BodyReader(ctx context.Context, id string) (YencReader, error)
+	BodyAt(ctx context.Context, id string, w io.WriterAt) error
+	Article(ctx context.Context, id string, w io.Writer) error
+	Head(ctx context.Context, id string) (*Response, error)
+	Stat(ctx context.Context, id string) (*Response, error)
+	Group(ctx context.Context, group string) (*Response, error)
+
+	// Advanced methods
+	Send(ctx context.Context, payload []byte, bodyWriter io.Writer) <-chan Response
+	Metrics() map[string]ProviderMetrics
+	SpeedTest(ctx context.Context, articleIDs []string) (SpeedTestStats, error)
+	Date(ctx context.Context) error
+}

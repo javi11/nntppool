@@ -21,6 +21,9 @@ type Client struct {
 	closeCh       chan struct{}
 }
 
+// Compile-time check that Client implements NNTPClient interface
+var _ NNTPClient = (*Client)(nil)
+
 func NewClient(maxInflight int) *Client {
 	c := &Client{
 		maxInflight: maxInflight,
