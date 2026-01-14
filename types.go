@@ -3,9 +3,12 @@ package nntppool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"time"
+
+	"github.com/mnightingale/rapidyenc"
 )
 
 type Request struct {
@@ -103,7 +106,42 @@ type YencOptions struct {
 	Total     int64  // For multi-part files, total number of parts
 	PartBegin int64  // For multi-part files, beginning byte offset (1-based)
 	PartEnd   int64  // For multi-part files, ending byte offset (1-based, inclusive)
-	LineSize  int    // Line length for encoding, defaults to 128 if not set
+}
+
+// toMeta validates options and converts to rapidyenc.Meta.
+func (o *YencOptions) toMeta() (rapidyenc.Meta, error) {
+	if o == nil {
+		return rapidyenc.Meta{}, errors.New("YencOptions cannot be nil")
+	}
+	if o.FileName == "" {
+		return rapidyenc.Meta{}, errors.New("YencOptions.FileName is required")
+	}
+	if o.FileSize <= 0 {
+		return rapidyenc.Meta{}, errors.New("YencOptions.FileSize must be positive")
+	}
+
+	isMultiPart := o.Part > 1 || o.Total > 1
+	if isMultiPart && (o.PartBegin <= 0 || o.PartEnd <= 0) {
+		return rapidyenc.Meta{}, errors.New("multi-part requires PartBegin and PartEnd")
+	}
+
+	meta := rapidyenc.Meta{
+		FileName:   o.FileName,
+		FileSize:   o.FileSize,
+		PartNumber: 1,
+		TotalParts: 1,
+		Offset:     0,
+		PartSize:   o.FileSize,
+	}
+
+	if isMultiPart {
+		meta.PartNumber = o.Part
+		meta.TotalParts = o.Total
+		meta.Offset = o.PartBegin - 1 // Convert from 1-based to 0-based
+		meta.PartSize = o.PartEnd - o.PartBegin + 1
+	}
+
+	return meta, nil
 }
 
 // NNTPClient defines the public API for NNTP operations.
