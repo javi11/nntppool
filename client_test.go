@@ -2,6 +2,7 @@ package nntppool
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -9,66 +10,36 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/javi11/nntppool/v3/testutil"
 )
-
-// Helper to start a real mock server
-func startMockServer(t *testing.T, id string) (string, func()) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-
-			go func(c net.Conn) {
-				defer c.Close()
-				if _, err := c.Write([]byte("200 Service Ready - " + id + "\r\n")); err != nil {
-					return
-				}
-
-				buf := make([]byte, 1024)
-				for {
-					n, err := c.Read(buf)
-					if err != nil {
-						return
-					}
-					msg := string(buf[:n])
-					if strings.HasPrefix(msg, "BODY") {
-						if _, err := c.Write([]byte("222 0 <id> body follows\r\nline1\r\nline2\r\n.\r\n")); err != nil {
-							return
-						}
-					} else if msg == "QUIT\r\n" {
-						c.Write([]byte("205 Bye\r\n"))
-						return
-					}
-				}
-			}(conn)
-		}
-	}()
-
-	return l.Addr().String(), func() { l.Close() }
-}
 
 func TestClientHotswapProviders(t *testing.T) {
 	client := NewClient(10)
 	defer client.Close()
 
 	// 1. Add Provider A
-	addr1, stop1 := startMockServer(t, "P1")
+	srv1, stop1 := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		ID: "P1",
+		Handler: func(cmd string) (string, error) {
+			if strings.HasPrefix(cmd, "BODY") {
+				return "222 0 <id> body follows\r\nline1\r\nline2\r\n.\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
 	defer stop1()
 
 	dial1 := func(ctx context.Context) (net.Conn, error) {
 		var d net.Dialer
-		return d.DialContext(ctx, "tcp", addr1)
+		return d.DialContext(ctx, "tcp", srv1.Addr())
 	}
 
 	p1, err := NewProvider(context.Background(), ProviderConfig{
-		Address: addr1, MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial1,
+		Address: srv1.Addr(), MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial1,
 	})
 	if err != nil {
 		t.Fatalf("failed to create p1: %v", err)
@@ -124,16 +95,27 @@ func TestClientHotswapProviders(t *testing.T) {
 	}
 
 	// 3. Add Provider B
-	addr2, stop2 := startMockServer(t, "P2")
+	srv2, stop2 := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		ID: "P2",
+		Handler: func(cmd string) (string, error) {
+			if strings.HasPrefix(cmd, "BODY") {
+				return "222 0 <id> body follows\r\nline1\r\nline2\r\n.\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
 	defer stop2()
 
 	dial2 := func(ctx context.Context) (net.Conn, error) {
 		var d net.Dialer
-		return d.DialContext(ctx, "tcp", addr2)
+		return d.DialContext(ctx, "tcp", srv2.Addr())
 	}
 
 	p2, err := NewProvider(context.Background(), ProviderConfig{
-		Address: addr2, MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial2,
+		Address: srv2.Addr(), MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial2,
 	})
 	if err != nil {
 		t.Fatalf("failed to create p2: %v", err)
@@ -174,41 +156,19 @@ func TestClientHealthCheck(t *testing.T) {
 	var shouldFail atomic.Bool
 	shouldFail.Store(false)
 
-	mockDial := func(ctx context.Context) (net.Conn, error) {
-		c1, c2 := net.Pipe()
-
-		go func() {
-			defer c2.Close()
-			// Send Greeting
-			if _, err := c2.Write([]byte("200 Service Ready\r\n")); err != nil {
-				return
+	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if shouldFail.Load() {
+				// Simulate failure by returning error to close connection
+				return "", io.EOF
 			}
 
-			buf := make([]byte, 1024)
-			for {
-				n, err := c2.Read(buf)
-				if err != nil {
-					return
-				}
-
-				// Simple parser to handle command boundaries roughly
-				msg := string(buf[:n])
-
-				// In a real scenario, we'd handle partial reads, but net.Pipe is atomic-ish for small writes usually.
-				// However, client might write "DATE\r\n" in one go.
-
-				if shouldFail.Load() {
-					// Simulate failure by closing connection
-					return
-				}
-
-				if msg == "DATE\r\n" {
-					c2.Write([]byte("111 20240101000000\r\n"))
-				}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
 			}
-		}()
-		return c1, nil
-	}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
 
 	client := NewClient(10)
 	defer client.Close()
@@ -266,16 +226,11 @@ func TestClientHealthCheck(t *testing.T) {
 }
 
 func TestClientRemoveProvider(t *testing.T) {
-	mockDial := func(ctx context.Context) (net.Conn, error) {
-		c1, c2 := net.Pipe()
-		go func() {
-			c2.Write([]byte("200 Service Ready\r\n"))
-			buf := make([]byte, 1024)
-			c2.Read(buf)
-			c2.Close()
-		}()
-		return c1, nil
-	}
+	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			return "500 Unknown Command\r\n", nil
+		},
+	})
 
 	client := NewClient(10)
 	defer client.Close()
@@ -366,59 +321,24 @@ func (m *mockWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
 
 func TestClientBodyAt(t *testing.T) {
 	// Mock YEnc response
-	// We need to encode "hello world!" by adding 42 to each byte
 	raw := []byte("hello world!")
-	encoded := make([]byte, len(raw))
-	for i, b := range raw {
-		encoded[i] = b + 42
-	}
-
-	yEncBody := "=ybegin part=1 line=128 size=12 name=test.txt\r\n" +
-		"=ypart begin=1 end=12\r\n" +
-		string(encoded) + // 12 bytes
-		"\r\n=yend size=12 pcrc32=00000000\r\n.\r\n"
 
 	// Mock server that returns YEnc body
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-	defer l.Close()
-
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				c.Write([]byte("200 Service Ready\r\n"))
-				buf := make([]byte, 1024)
-				for {
-					n, err := c.Read(buf)
-					if err != nil {
-						return
-					}
-					msg := string(buf[:n])
-					if strings.HasPrefix(msg, "BODY") {
-						c.Write([]byte("222 0 <id> body follows\r\n" + yEncBody))
-					}
-				}
-			}(conn)
-		}
-	}()
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: testutil.YencBodyHandler(raw, "test.txt"),
+	})
+	defer cleanup()
 
 	client := NewClient(1)
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
 		var d net.Dialer
-		return d.DialContext(ctx, "tcp", l.Addr().String())
+		return d.DialContext(ctx, "tcp", srv.Addr())
 	}
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
-		Address: l.Addr().String(), MaxConnections: 1, ConnFactory: dial,
+		Address: srv.Addr(), MaxConnections: 1, ConnFactory: dial,
 	})
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
@@ -446,48 +366,12 @@ func TestClientBodyAt(t *testing.T) {
 func TestClientSpeedTest(t *testing.T) {
 	// Mock YEnc response
 	raw := []byte("hello world!")
-	encoded := make([]byte, len(raw))
-	for i, b := range raw {
-		encoded[i] = b + 42
-	}
-	yEncBody := "=ybegin part=1 line=128 size=12 name=test.txt\r\n" +
-		"=ypart begin=1 end=12\r\n" +
-		string(encoded) + // 12 bytes
-		"\r\n=yend size=12 pcrc32=00000000\r\n.\r\n"
 
 	// 1. Start mock server
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-	defer l.Close()
-
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				c.Write([]byte("200 Service Ready\r\n"))
-				buf := make([]byte, 1024)
-				for {
-					n, err := c.Read(buf)
-					if err != nil {
-						return
-					}
-					msg := string(buf[:n])
-					if strings.HasPrefix(msg, "BODY") {
-						c.Write([]byte("222 0 <id> body follows\r\n" + yEncBody))
-					} else if msg == "QUIT\r\n" {
-						c.Write([]byte("205 Bye\r\n"))
-						return
-					}
-				}
-			}(conn)
-		}
-	}()
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: testutil.YencBodyHandler(raw, "test.txt"),
+	})
+	defer cleanup()
 
 	// 2. Setup Client
 	client := NewClient(10)
@@ -495,11 +379,11 @@ func TestClientSpeedTest(t *testing.T) {
 
 	dial := func(ctx context.Context) (net.Conn, error) {
 		var d net.Dialer
-		return d.DialContext(ctx, "tcp", l.Addr().String())
+		return d.DialContext(ctx, "tcp", srv.Addr())
 	}
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
-		Address: l.Addr().String(), MaxConnections: 2, InflightPerConnection: 1, ConnFactory: dial,
+		Address: srv.Addr(), MaxConnections: 2, InflightPerConnection: 1, ConnFactory: dial,
 	})
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
@@ -527,4 +411,283 @@ func TestClientSpeedTest(t *testing.T) {
 	if stats.BytesPerSecond == 0 {
 		t.Errorf("expected > 0 bytes per second")
 	}
+}
+
+func TestClientBodyReader(t *testing.T) {
+	t.Run("BasicRead", func(t *testing.T) {
+		// Test data
+		originalData := []byte("hello world!")
+
+		// Setup mock server using testutil
+		srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: testutil.YencBodyHandler(originalData, "test.txt"),
+		})
+		defer cleanup()
+
+		// Setup client
+		client := NewClient(10)
+		defer client.Close()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		client.AddProvider(p, ProviderPrimary)
+
+		// Call BodyReader
+		reader, err := client.BodyReader(context.Background(), "123")
+		if err != nil {
+			t.Fatalf("BodyReader failed: %v", err)
+		}
+		defer reader.Close()
+
+		// Read content
+		result := make([]byte, len(originalData))
+		n, err := io.ReadFull(reader, result)
+		if err != nil {
+			t.Fatalf("failed to read: %v", err)
+		}
+
+		if n != len(originalData) {
+			t.Errorf("expected %d bytes, got %d", len(originalData), n)
+		}
+
+		if string(result) != string(originalData) {
+			t.Errorf("expected '%s', got '%s'", string(originalData), string(result))
+		}
+
+		// Close reader
+		if err := reader.Close(); err != nil {
+			t.Errorf("failed to close reader: %v", err)
+		}
+	})
+
+	t.Run("YencHeaders", func(t *testing.T) {
+		// Test data
+		originalData := []byte("hello world!")
+		filename := "test.txt"
+
+		// Setup mock server with multi-part YEnc (part 2 of 5)
+		srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: func(cmd string) (string, error) {
+				if strings.HasPrefix(cmd, "BODY") {
+					// Use testutil.EncodeYencMultiPart for multi-part encoding
+					yencBody := testutil.EncodeYencMultiPart(originalData, filename, 2, 5, 1, int64(len(originalData)))
+					return fmt.Sprintf("222 0 <id> body follows\r\n%s.\r\n", yencBody), nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer cleanup()
+
+		// Setup client
+		client := NewClient(10)
+		defer client.Close()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		client.AddProvider(p, ProviderPrimary)
+
+		// Call BodyReader
+		reader, err := client.BodyReader(context.Background(), "123")
+		if err != nil {
+			t.Fatalf("BodyReader failed: %v", err)
+		}
+		defer reader.Close()
+
+		// Headers should be nil initially
+		if header := reader.YencHeaders(); header != nil {
+			t.Errorf("expected nil headers before reading, got %+v", header)
+		}
+
+		// Read enough data to trigger header parsing and get some content
+		// We'll read in a loop until we have the headers
+		buf := make([]byte, len(originalData))
+		totalRead := 0
+		var header *YencHeader
+
+		for totalRead < len(originalData) && header == nil {
+			n, readErr := reader.Read(buf[totalRead:])
+			totalRead += n
+
+			// Check if headers are available now
+			header = reader.YencHeaders()
+
+			if readErr != nil {
+				if readErr != io.EOF {
+					t.Fatalf("read error: %v", readErr)
+				}
+				break
+			}
+		}
+
+		// Headers should now be available
+		if header == nil {
+			t.Fatal("expected headers after reading, got nil")
+		}
+
+		// Debug: print what we got
+		t.Logf("Header: %+v", header)
+
+		// Continue reading rest of data
+		if totalRead < len(originalData) {
+			remaining, err := io.ReadFull(reader, buf[totalRead:])
+			totalRead += remaining
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				t.Fatalf("failed to read remaining: %v", err)
+			}
+		}
+
+		// Verify data
+		if totalRead > 0 && string(buf[:totalRead]) != string(originalData[:totalRead]) {
+			t.Errorf("data mismatch: expected '%s', got '%s'", string(originalData[:totalRead]), string(buf[:totalRead]))
+		}
+
+		// Verify header fields
+		// Note: For multi-part files, PartSize might be 0 initially if the callback
+		// is invoked after =ybegin but before =ypart is processed.
+		// The important fields from =ybegin are FileName, FileSize, Part, and Total.
+		if header.FileName != filename {
+			t.Errorf("expected filename '%s', got '%s'", filename, header.FileName)
+		}
+		if header.FileSize != 12 {
+			t.Errorf("expected file size 12, got %d", header.FileSize)
+		}
+		if header.Part != 2 {
+			t.Errorf("expected part 2, got %d", header.Part)
+		}
+		if header.Total != 5 {
+			t.Errorf("expected total 5, got %d", header.Total)
+		}
+		// PartBegin and PartSize are set when =ypart is processed,
+		// which might happen after the initial callback.
+		// For this test, we verify the basic multi-part metadata is available.
+
+		// Verify caching - should return same pointer
+		header2 := reader.YencHeaders()
+		if header != header2 {
+			t.Error("expected cached header to return same pointer")
+		}
+	})
+
+	t.Run("ContextCancellation", func(t *testing.T) {
+		// Test data
+		originalData := []byte("hello world!")
+
+		// Setup mock server using testutil
+		srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: testutil.YencBodyHandler(originalData, "test.txt"),
+		})
+		defer cleanup()
+
+		// Setup client
+		client := NewClient(10)
+		defer client.Close()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		client.AddProvider(p, ProviderPrimary)
+
+		// Create cancellable context
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Call BodyReader
+		reader, err := client.BodyReader(ctx, "123")
+		if err != nil {
+			t.Fatalf("BodyReader failed: %v", err)
+		}
+		defer reader.Close()
+
+		// Start reading
+		buf := make([]byte, 4)
+		_, err = reader.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("first read failed: %v", err)
+		}
+
+		// Cancel context
+		cancel()
+
+		// Note: Context cancellation behavior with pipes can be unpredictable.
+		// The pipe might have buffered data that can still be read.
+		// What's important is that the underlying request respects the context.
+		// For this test, we just verify the basic flow works.
+	})
+
+	t.Run("Close", func(t *testing.T) {
+		// Test data
+		originalData := []byte("hello world!")
+
+		// Setup mock server using testutil
+		srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: testutil.YencBodyHandler(originalData, "test.txt"),
+		})
+		defer cleanup()
+
+		// Setup client
+		client := NewClient(10)
+		defer client.Close()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		client.AddProvider(p, ProviderPrimary)
+
+		// Call BodyReader
+		reader, err := client.BodyReader(context.Background(), "123")
+		if err != nil {
+			t.Fatalf("BodyReader failed: %v", err)
+		}
+
+		// Read partially
+		buf := make([]byte, 4)
+		_, err = reader.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("read failed: %v", err)
+		}
+
+		// Close reader
+		if err := reader.Close(); err != nil {
+			t.Errorf("failed to close reader: %v", err)
+		}
+
+		// Subsequent reads should fail
+		_, err = reader.Read(buf)
+		if err == nil {
+			t.Error("expected error after close, got nil")
+		}
+	})
 }

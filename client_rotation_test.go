@@ -3,76 +3,31 @@ package nntppool
 import (
 	"context"
 	"io"
-	"net"
 	"strings"
 	"testing"
+
+	"github.com/javi11/nntppool/v3/testutil"
 )
-
-// mockProviderHandler is a function that takes a command and returns a response.
-// If it returns an error, the connection is closed.
-type mockProviderHandler func(cmd string) (string, error)
-
-func mockDialerWithHandler(handler mockProviderHandler) ConnFactory {
-	return func(ctx context.Context) (net.Conn, error) {
-		c1, c2 := net.Pipe()
-
-		go func() {
-			defer c2.Close()
-			// Initial greeting
-			if _, err := c2.Write([]byte("200 Service Ready\r\n")); err != nil {
-				return
-			}
-
-			buf := make([]byte, 1024)
-			for {
-				n, err := c2.Read(buf)
-				if err != nil {
-					return
-				}
-				cmd := string(buf[:n])
-				resp, err := handler(cmd)
-				if err != nil {
-					return
-				}
-				if _, err := c2.Write([]byte(resp)); err != nil {
-					return
-				}
-			}
-		}()
-
-		return c1, nil
-	}
-}
 
 func TestClientRotation_ArticleNotFound(t *testing.T) {
 	// Scenario: Primary returns 430, Backup returns 200 (Success)
-
-	p1Handler := func(cmd string) (string, error) {
-		if strings.HasPrefix(cmd, "BODY") {
-			return "430 No Such Article\r\n", nil
-		}
-		return "500 Unknown Command\r\n", nil
-	}
-
-	p2Handler := func(cmd string) (string, error) {
-		if strings.HasPrefix(cmd, "BODY") {
-			return "222 0 <id> body follows\r\nline1\r\n.\r\n", nil
-		}
-		return "500 Unknown Command\r\n", nil
-	}
 
 	client := NewClient(10)
 	defer client.Close()
 
 	// Add Primary (Failing)
 	p1, _ := NewProvider(context.Background(), ProviderConfig{
-		Address: "p1:119", MaxConnections: 1, ConnFactory: mockDialerWithHandler(p1Handler),
+		Address: "p1:119", MaxConnections: 1, ConnFactory: testutil.MockDialerWithHandler(testutil.MockServerConfig{
+			Handler: testutil.NotFoundHandler(),
+		}),
 	})
 	client.AddProvider(p1, ProviderPrimary)
 
 	// Add Backup (Succeeding)
 	p2, _ := NewProvider(context.Background(), ProviderConfig{
-		Address: "p2:119", MaxConnections: 1, ConnFactory: mockDialerWithHandler(p2Handler),
+		Address: "p2:119", MaxConnections: 1, ConnFactory: testutil.MockDialerWithHandler(testutil.MockServerConfig{
+			Handler: testutil.SuccessfulBodyHandler("line1"),
+		}),
 	})
 	client.AddProvider(p2, ProviderBackup)
 
@@ -93,19 +48,14 @@ func TestClientRotation_ArticleNotFound(t *testing.T) {
 func TestClientRotation_OnlyBackups(t *testing.T) {
 	// Scenario: No primaries, only Backup returns 200
 
-	p1Handler := func(cmd string) (string, error) {
-		if strings.HasPrefix(cmd, "BODY") {
-			return "222 0 <id> body follows\r\nline1\r\n.\r\n", nil
-		}
-		return "500 Unknown Command\r\n", nil
-	}
-
 	client := NewClient(10)
 	defer client.Close()
 
 	// Add Backup
 	p1, _ := NewProvider(context.Background(), ProviderConfig{
-		Address: "p1:119", MaxConnections: 1, ConnFactory: mockDialerWithHandler(p1Handler),
+		Address: "p1:119", MaxConnections: 1, ConnFactory: testutil.MockDialerWithHandler(testutil.MockServerConfig{
+			Handler: testutil.SuccessfulBodyHandler("line1"),
+		}),
 	})
 	client.AddProvider(p1, ProviderBackup)
 
@@ -119,25 +69,22 @@ func TestClientRotation_OnlyBackups(t *testing.T) {
 func TestClientRotation_AllFail(t *testing.T) {
 	// Scenario: Primary returns 430, Backup returns 430
 
-	notFoundHandler := func(cmd string) (string, error) {
-		if strings.HasPrefix(cmd, "BODY") {
-			return "430 No Such Article\r\n", nil
-		}
-		return "500 Unknown Command\r\n", nil
-	}
-
 	client := NewClient(10)
 	defer client.Close()
 
 	// Add Primary
 	p1, _ := NewProvider(context.Background(), ProviderConfig{
-		Address: "p1:119", MaxConnections: 1, ConnFactory: mockDialerWithHandler(notFoundHandler),
+		Address: "p1:119", MaxConnections: 1, ConnFactory: testutil.MockDialerWithHandler(testutil.MockServerConfig{
+			Handler: testutil.NotFoundHandler(),
+		}),
 	})
 	client.AddProvider(p1, ProviderPrimary)
 
 	// Add Backup
 	p2, _ := NewProvider(context.Background(), ProviderConfig{
-		Address: "p2:119", MaxConnections: 1, ConnFactory: mockDialerWithHandler(notFoundHandler),
+		Address: "p2:119", MaxConnections: 1, ConnFactory: testutil.MockDialerWithHandler(testutil.MockServerConfig{
+			Handler: testutil.NotFoundHandler(),
+		}),
 	})
 	client.AddProvider(p2, ProviderBackup)
 
