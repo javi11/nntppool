@@ -53,6 +53,9 @@ type Provider struct {
 	connCount int32
 	config    ProviderConfig
 
+	closed  atomic.Bool // tracks if provider is closing/closed
+	closeMu sync.Mutex  // ensures Close() only closes channel once
+
 	// Metrics
 	bytesRead    uint64
 	bytesWritten uint64
@@ -162,7 +165,10 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 
 	for i := 0; i < config.InitialConnections; i++ {
 		if err := c.addConnection(true); err != nil {
-			c.Close()
+			if closeErr := c.Close(); closeErr != nil {
+				// Log but don't return closeErr, return original err
+				_ = closeErr
+			}
 			return nil, err
 		}
 	}
@@ -201,6 +207,11 @@ func (c *Provider) Metrics() ProviderMetrics {
 }
 
 func (c *Provider) addConnection(syncMode bool) error {
+	// Don't add connections if provider is closed
+	if c.closed.Load() {
+		return c.ctx.Err()
+	}
+
 	select {
 	case <-c.ctx.Done():
 		return c.ctx.Err()
@@ -256,15 +267,28 @@ func (c *Provider) addConnection(syncMode bool) error {
 
 // Close cancels the provider, closes its request channel, and waits for all connections to stop.
 func (c *Provider) Close() error {
-	c.cancel()
-	close(c.reqCh)
+	// Set closed flag first (atomic store, establishes happens-before)
+	if !c.closed.CompareAndSwap(false, true) {
+		// Already closed
+		return nil
+	}
 
+	// Cancel context to stop new connection creation and signal workers
+	c.cancel()
+
+	// Close request channel with mutex protection (prevents double-close)
+	c.closeMu.Lock()
+	close(c.reqCh)
+	c.closeMu.Unlock()
+
+	// Close all existing connections
 	c.connsMu.Lock()
 	for _, cc := range c.conns {
 		_ = cc.Close()
 	}
 	c.connsMu.Unlock()
 
+	// Wait for all goroutines to finish
 	c.wg.Wait()
 	return nil
 }
@@ -307,23 +331,51 @@ func (c *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 }
 
 func (c *Provider) SendRequest(req *Request) <-chan Response {
-	// Trigger lazy growth if needed
-	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
-		go c.addConnection(false)
+	// Check if provider is closed (fast atomic read)
+	if c.closed.Load() {
+		if req.RespCh != nil {
+			close(req.RespCh)
+		}
+		return req.RespCh
 	}
 
+	// Trigger lazy growth if needed
+	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+		go func() {
+			_ = c.addConnection(false)
+		}()
+	}
+
+	// Use closeMu to synchronize channel send with close operation
+	c.closeMu.Lock()
+	if c.closed.Load() {
+		// Provider was closed while we were waiting for lock
+		c.closeMu.Unlock()
+		if req.RespCh != nil {
+			close(req.RespCh)
+		}
+		return req.RespCh
+	}
+
+	// Safe to send now - channel won't be closed until we release lock
 	select {
 	case <-c.ctx.Done():
+		c.closeMu.Unlock()
+		// Provider context cancelled (closing or closed)
 		if req.RespCh != nil {
 			close(req.RespCh)
 		}
 		return req.RespCh
 	case <-req.Ctx.Done():
+		c.closeMu.Unlock()
+		// Request context cancelled
 		if req.RespCh != nil {
 			close(req.RespCh)
 		}
 		return req.RespCh
 	case c.reqCh <- req:
+		c.closeMu.Unlock()
+		// Successfully queued
 		return req.RespCh
 	}
 }

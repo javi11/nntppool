@@ -446,7 +446,11 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BodyReader failed: %v", err)
 		}
-		defer reader.Close()
+		defer func() {
+			if err := reader.Close(); err != nil {
+				t.Errorf("failed to close reader: %v", err)
+			}
+		}()
 
 		// Read content
 		result := make([]byte, len(originalData))
@@ -509,7 +513,11 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BodyReader failed: %v", err)
 		}
-		defer reader.Close()
+		defer func() {
+			if err := reader.Close(); err != nil {
+				t.Errorf("failed to close reader: %v", err)
+			}
+		}()
 
 		// Headers should be nil initially
 		if header := reader.YencHeaders(); header != nil {
@@ -621,7 +629,11 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("BodyReader failed: %v", err)
 		}
-		defer reader.Close()
+		defer func() {
+			if err := reader.Close(); err != nil {
+				t.Errorf("failed to close reader: %v", err)
+			}
+		}()
 
 		// Start reading
 		buf := make([]byte, 4)

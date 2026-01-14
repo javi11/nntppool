@@ -70,7 +70,9 @@ func (p *mockSOCKSProxy) serve() {
 }
 
 func (p *mockSOCKSProxy) handleConnection(client net.Conn) {
-	defer client.Close()
+	defer func() {
+		_ = client.Close()
+	}()
 
 	buf := make([]byte, 512)
 
@@ -126,7 +128,7 @@ func (p *mockSOCKSProxy) handleConnection(client net.Conn) {
 
 		if !validAuth {
 			// Auth failed
-			client.Write([]byte{1, 1})
+			_, _ = client.Write([]byte{1, 1})
 			return
 		}
 
@@ -149,17 +151,19 @@ func (p *mockSOCKSProxy) handleConnection(client net.Conn) {
 
 	// Parse request
 	if buf[0] != 5 || buf[1] != 1 { // version 5, CONNECT command
-		client.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0}) // command not supported
+		_, _ = client.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0}) // command not supported
 		return
 	}
 
 	// Connect to target
 	target, err := p.dialFunc("tcp", p.targetAddr)
 	if err != nil {
-		client.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0}) // connection refused
+		_, _ = client.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0}) // connection refused
 		return
 	}
-	defer target.Close()
+	defer func() {
+		_ = target.Close()
+	}()
 
 	// Send success response
 	if _, err := client.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
@@ -172,12 +176,12 @@ func (p *mockSOCKSProxy) handleConnection(client net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		io.Copy(target, client)
+		_, _ = io.Copy(target, client)
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(client, target)
+		_, _ = io.Copy(client, target)
 	}()
 
 	wg.Wait()
@@ -205,7 +209,11 @@ func TestProviderWithSOCKSProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create SOCKS proxy: %v", err)
 	}
-	defer proxy.Close()
+	defer func() {
+		if err := proxy.Close(); err != nil {
+			t.Errorf("failed to close proxy: %v", err)
+		}
+	}()
 
 	// Test 1: Connect through proxy without authentication
 	t.Run("NoAuth", func(t *testing.T) {
@@ -221,7 +229,11 @@ func TestProviderWithSOCKSProxy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider with proxy: %v", err)
 		}
-		defer provider.Close()
+		defer func() {
+			if err := provider.Close(); err != nil {
+				t.Errorf("failed to close provider: %v", err)
+			}
+		}()
 
 		// Test DATE command through proxy
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -240,7 +252,11 @@ func TestProviderWithSOCKSProxy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create SOCKS proxy: %v", err)
 		}
-		defer authProxy.Close()
+		defer func() {
+			if err := authProxy.Close(); err != nil {
+				t.Errorf("failed to close authProxy: %v", err)
+			}
+		}()
 		authProxy.SetAuth("testuser", "testpass")
 
 		proxyURL := fmt.Sprintf("socks5://testuser:testpass@%s", authProxy.Addr())
@@ -255,7 +271,11 @@ func TestProviderWithSOCKSProxy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider with auth proxy: %v", err)
 		}
-		defer provider.Close()
+		defer func() {
+			if err := provider.Close(); err != nil {
+				t.Errorf("failed to close provider: %v", err)
+			}
+		}()
 
 		// Test DATE command through proxy with auth
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -298,7 +318,11 @@ func TestProviderWithSOCKSProxy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider with proxy: %v", err)
 		}
-		defer provider.Close()
+		defer func() {
+			if err := provider.Close(); err != nil {
+				t.Errorf("failed to close provider: %v", err)
+			}
+		}()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

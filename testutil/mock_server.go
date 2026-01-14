@@ -3,7 +3,6 @@ package testutil
 import (
 	"context"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -29,7 +28,6 @@ type MockServer struct {
 	addr            string
 	listener        net.Listener
 	connectionCount int32
-	mu              sync.Mutex
 }
 
 // Addr returns the server address.
@@ -45,7 +43,7 @@ func (m *MockServer) ConnectionCount() int {
 // Close shuts down the server.
 func (m *MockServer) Close() {
 	if m.listener != nil {
-		m.listener.Close()
+		_ = m.listener.Close()
 	}
 }
 
@@ -83,7 +81,9 @@ func StartMockNNTPServer(t *testing.T, config MockServerConfig) (*MockServer, fu
 			}
 
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() {
+					_ = c.Close()
+				}()
 
 				// Send greeting
 				if _, err := c.Write([]byte(greeting)); err != nil {
@@ -136,7 +136,9 @@ func MockDialerWithHandler(config MockServerConfig) func(ctx context.Context) (n
 		c1, c2 := net.Pipe()
 
 		go func() {
-			defer c2.Close()
+			defer func() {
+				_ = c2.Close()
+			}()
 
 			// Send initial greeting
 			if _, err := c2.Write([]byte(greeting)); err != nil {

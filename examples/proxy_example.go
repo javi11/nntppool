@@ -20,7 +20,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create provider: %v", err)
 	}
-	defer provider1.Close()
+	defer func() {
+		if err := provider1.Close(); err != nil {
+			log.Printf("Failed to close provider1: %v", err)
+		}
+	}()
 
 	// Example 2: Provider with SOCKS5 proxy with authentication
 	provider2, err := nntppool.NewProvider(context.Background(), nntppool.ProviderConfig{
@@ -37,7 +41,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create provider with auth: %v", err)
 	}
-	defer provider2.Close()
+	defer func() {
+		if err := provider2.Close(); err != nil {
+			log.Printf("Failed to close provider2: %v", err)
+		}
+	}()
 
 	// Example 3: Provider with SOCKS4 proxy
 	provider3, err := nntppool.NewProvider(context.Background(), nntppool.ProviderConfig{
@@ -50,7 +58,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create provider with SOCKS4: %v", err)
 	}
-	defer provider3.Close()
+	defer func() {
+		if err := provider3.Close(); err != nil {
+			log.Printf("Failed to close provider3: %v", err)
+		}
+	}()
 
 	// Use the provider with a client
 	client := nntppool.NewClient(20)

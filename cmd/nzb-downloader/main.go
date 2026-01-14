@@ -48,7 +48,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open NZB file: %v", err)
 	}
-	defer fileData.Close()
+	defer func() {
+		if err := fileData.Close(); err != nil {
+			log.Printf("Failed to close NZB file: %v", err)
+		}
+	}()
 
 	nzb, err := nzbparser.Parse(fileData)
 	if err != nil {
@@ -195,7 +199,9 @@ func main() {
 		if f != nil {
 			go func(fh *os.File) {
 				fileWg.Wait()
-				fh.Close()
+				if err := fh.Close(); err != nil {
+					log.Printf("Failed to close file: %v", err)
+				}
 			}(f)
 		}
 	}

@@ -14,7 +14,9 @@ func TestClientConnectionRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer l.Close()
+	defer func() {
+		_ = l.Close()
+	}()
 
 	var connectionCount int
 	var mu sync.Mutex
@@ -30,8 +32,10 @@ func TestClientConnectionRotation(t *testing.T) {
 			mu.Unlock()
 
 			go func(c net.Conn) {
-				defer c.Close()
-				c.Write([]byte("200 Service Ready\r\n"))
+				defer func() {
+					_ = c.Close()
+				}()
+				_, _ = c.Write([]byte("200 Service Ready\r\n"))
 				buf := make([]byte, 1024)
 				for {
 					if _, err := c.Read(buf); err != nil {

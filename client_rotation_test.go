@@ -39,10 +39,10 @@ func TestClientRotation_ArticleNotFound(t *testing.T) {
 
 	// Verify metrics to ensure rotation happened
 	metrics := client.Metrics()
-	if metrics["p1:119"].ActiveConnections == 0 && metrics["p2:119"].ActiveConnections == 0 {
-		// Connections might be idle but instantiated.
-		// We can't easily check 'calls made' without instrumentation, but success implies p2 was reached.
-	}
+	// Note: metrics["p1:119"].ActiveConnections and metrics["p2:119"].ActiveConnections might be 0
+	// because connections might be idle but instantiated.
+	// We can't easily check 'calls made' without instrumentation, but success implies p2 was reached.
+	_ = metrics
 }
 
 func TestClientRotation_OnlyBackups(t *testing.T) {
@@ -94,19 +94,19 @@ func TestClientRotation_AllFail(t *testing.T) {
 		t.Fatal("expected error, got success")
 	}
 
+	// Note: We expect the error to contain "430" or "No Such Article"
+	// The client returns the last error. If both fail with 430, it should return 430.
+	// client.go logic:
+	// - if resp.Err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 -> Success
+	// - else -> continue loop
+	// If all failed, it returns lastResp or lastErr.
+	// Our mock returns 430 with err=nil in response struct, but response.Err might be nil.
+	// client.sendSync returns resp.Err if set, OR &resp.
+	// If 430 is returned, it is a valid response with StatusCode 430.
+	// Body() calls sendSync() which returns (resp, err).
+	// The error should typically contain 430 or "No Such Article"
 	if !strings.Contains(err.Error(), "430") && !strings.Contains(err.Error(), "No Such Article") {
-		// The client returns the last error.
-		// If both fail with 430, it should return 430.
-		// Wait, client.go logic:
-		// if resp.Err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 -> Success
-		// else -> continue loop
-		// If all failed, it returns lastResp or lastErr.
-		// Our mock returns 430 with err=nil in response struct, but response.Err might be nil.
-		// Wait, client.sendSync returns resp.Err if set, OR &resp.
-		// If 430 is returned, it is a valid response with StatusCode 430.
-		// But Body() calls sendSync() which returns (resp, err).
-		// sendSync implementation:
-		// if resp.Err != nil return nil, resp.Err
+		t.Logf("Warning: error message doesn't contain expected strings: %v", err)
 		// return &resp, nil
 		//
 		// client.Body implementation:

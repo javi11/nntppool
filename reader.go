@@ -37,7 +37,6 @@ type NNTPResponse struct {
 	hasEnd       bool
 	hasCrc       bool
 	hasEmptyline bool // for article requests has the empty line separating headers and body been seen
-	hasBaddata   bool // invalid line lengths for uu decoding; some data lost
 
 	OnYencHeader func(*YencHeader)
 }
@@ -190,7 +189,7 @@ func (r *NNTPResponse) detectFormat(line []byte) {
 	}
 
 	// For Article responses only consider after the headers
-	if !(r.StatusCode == nntpBody || (r.StatusCode == nntpArtiicle && r.hasEmptyline)) {
+	if r.StatusCode != nntpBody && (r.StatusCode != nntpArtiicle || !r.hasEmptyline) {
 		return
 	}
 
@@ -252,10 +251,6 @@ func isMultiline(code int) bool {
 	return code == nntpBody || code == nntpArtiicle || code == nntpHead || code == nntpCapabilities
 }
 
-const yencMinBufferSize = 1024
-const yencMaxBufferSize = 10 * 1024 * 1024
-const yencChunkSize = 64 * 1024
-
 func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -266,7 +261,7 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 	var produced, consumed int
 	var end rapidyenc.End
 
-	produced, consumed, end, err = rapidyenc.DecodeIncremental(buf, buf, &r.State)
+	produced, consumed, end, _ = rapidyenc.DecodeIncremental(buf, buf, &r.State)
 
 	if produced > 0 {
 		r.CRC = crc32.Update(r.CRC, crc32.IEEETable, buf[:produced])
