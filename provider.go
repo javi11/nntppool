@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/javi11/nntppool/v3/internal"
 	"golang.org/x/net/proxy"
 )
 
@@ -114,7 +115,7 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 					if err != nil {
 						return nil, fmt.Errorf("proxy dial failed: %w", err)
 					}
-					return applyConnOptimizations(conn, config.TLSConfig)
+					return internal.ApplyConnOptimizations(conn, config.TLSConfig)
 				}
 
 				// Fallback to non-context dialing
@@ -122,12 +123,12 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 				if err != nil {
 					return nil, fmt.Errorf("proxy dial failed: %w", err)
 				}
-				return applyConnOptimizations(conn, config.TLSConfig)
+				return internal.ApplyConnOptimizations(conn, config.TLSConfig)
 			}
 		} else {
 			// No proxy, use direct connection
 			config.ConnFactory = func(_ context.Context) (net.Conn, error) {
-				return newNetConn(config.Address, config.TLSConfig)
+				return internal.NewNetConn(config.Address, config.TLSConfig)
 			}
 		}
 	}
@@ -237,10 +238,10 @@ func (c *Provider) addConnection(syncMode bool) error {
 	}
 
 	// Wrap with MeteredConn
-	meteredConn := &MeteredConn{
+	meteredConn := &internal.MeteredConn{
 		Conn:         conn,
-		bytesRead:    &c.bytesRead,
-		bytesWritten: &c.bytesWritten,
+		BytesRead:    &c.bytesRead,
+		BytesWritten: &c.bytesWritten,
 	}
 
 	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth, c.config.MaxConnIdleTime, c.config.MaxConnLifetime)

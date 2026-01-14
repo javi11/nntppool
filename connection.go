@@ -9,40 +9,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/javi11/nntppool/v3/internal"
 )
-
-type MeteredConn struct {
-	net.Conn
-	bytesRead    *uint64
-	bytesWritten *uint64
-	lastActivity *int64
-}
-
-func (m *MeteredConn) Read(b []byte) (n int, err error) {
-	n, err = m.Conn.Read(b)
-	if n > 0 {
-		if m.bytesRead != nil {
-			atomic.AddUint64(m.bytesRead, uint64(n))
-		}
-		if m.lastActivity != nil {
-			atomic.StoreInt64(m.lastActivity, time.Now().Unix())
-		}
-	}
-	return
-}
-
-func (m *MeteredConn) Write(b []byte) (n int, err error) {
-	n, err = m.Conn.Write(b)
-	if n > 0 {
-		if m.bytesWritten != nil {
-			atomic.AddUint64(m.bytesWritten, uint64(n))
-		}
-		if m.lastActivity != nil {
-			atomic.StoreInt64(m.lastActivity, time.Now().Unix())
-		}
-	}
-	return
-}
 
 type NNTPConnection struct {
 	conn net.Conn
@@ -55,7 +24,7 @@ type NNTPConnection struct {
 
 	inflightSem chan struct{}
 
-	rb readBuffer
+	rb internal.ReadBuffer
 
 	Greeting NNTPResponse
 
@@ -68,36 +37,6 @@ type NNTPConnection struct {
 	lastActivity int64
 	maxLifeTime  time.Duration
 	createdAt    time.Time
-}
-
-// applyConnOptimizations applies TCP buffer optimizations and optional TLS wrapping to a connection.
-// This is used for both direct and proxy connections.
-func applyConnOptimizations(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
-	// Optimize socket buffers for high-speed downloads (10Gbps+)
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		// 8MB receive buffer
-		_ = tcpConn.SetReadBuffer(8 * 1024 * 1024)
-		// 1MB send buffer
-		_ = tcpConn.SetWriteBuffer(1024 * 1024)
-	}
-
-	if tlsConfig != nil {
-		return tls.Client(conn, tlsConfig), nil
-	}
-	return conn, nil
-}
-
-func newNetConn(addr string, tlsConfig *tls.Config) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout: 30 * time.Second,
-	}
-
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-
-	return applyConnOptimizations(conn, tlsConfig)
 }
 
 func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth, maxIdleTime time.Duration, maxLifeTime time.Duration) (*NNTPConnection, error) {
@@ -113,7 +52,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		reqCh:        reqCh,
 		pending:      make(chan *Request, inflightLimit),
 		inflightSem:  make(chan struct{}, inflightLimit),
-		rb:           readBuffer{buf: make([]byte, defaultReadBufSize)},
+		rb:           internal.ReadBuffer{},
 		done:         make(chan struct{}),
 		maxIdleTime:  maxIdleTime,
 		lastActivity: time.Now().Unix(),
@@ -121,8 +60,8 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		createdAt:    time.Now(),
 	}
 
-	if mc, ok := conn.(*MeteredConn); ok {
-		mc.lastActivity = &c.lastActivity
+	if mc, ok := conn.(*internal.MeteredConn); ok {
+		mc.LastActivity = &c.lastActivity
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -150,7 +89,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 }
 
 func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth, maxIdleTime time.Duration, maxLifeTime time.Duration) (*NNTPConnection, error) {
-	conn, err := newNetConn(addr, tlsConfig)
+	conn, err := internal.NewNetConn(addr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -202,11 +141,6 @@ func (c *NNTPConnection) closeDone() {
 	c.doneMu.Do(func() { close(c.done) })
 }
 
-func safeClose[T any](ch chan T) {
-	defer func() { _ = recover() }()
-	close(ch)
-}
-
 func (c *NNTPConnection) failOutstanding() {
 	c.failMu.Do(func() {
 		for {
@@ -215,7 +149,7 @@ func (c *NNTPConnection) failOutstanding() {
 				if req == nil {
 					continue
 				}
-				safeClose(req.RespCh)
+				internal.SafeClose(req.RespCh)
 				// Best-effort inflight release (not strictly needed once we're shutting down).
 				select {
 				case <-c.inflightSem:
@@ -233,32 +167,6 @@ func (c *NNTPConnection) Close() error {
 	_ = c.conn.Close()
 	<-c.done
 	return nil
-}
-
-type streamFeeder interface {
-	Feed(in []byte, out io.Writer) (consumed int, done bool, err error)
-}
-
-type writerRef struct {
-	w io.Writer
-}
-
-func (wr *writerRef) Write(p []byte) (int, error) {
-	return wr.w.Write(p)
-}
-
-type writerRefAt struct {
-	*writerRef
-}
-
-func (wr *writerRefAt) WriteAt(p []byte, off int64) (int, error) {
-	if wr.w == io.Discard {
-		return len(p), nil
-	}
-	if wa, ok := wr.w.(io.WriterAt); ok {
-		return wa.WriteAt(p, off)
-	}
-	return 0, fmt.Errorf("underlying writer does not support WriteAt")
 }
 
 func (c *NNTPConnection) Run() {
@@ -443,18 +351,18 @@ func (c *NNTPConnection) readerLoop() {
 
 		// Allow us to switch output to io.Discard if the request is cancelled while
 		// we are still draining the response.
-		outRef := &writerRef{w: out}
+		outRef := &internal.WriterRef{W: out}
 		var feederOut io.Writer = outRef
 		if _, ok := out.(io.WriterAt); ok {
-			feederOut = &writerRefAt{outRef}
+			feederOut = &internal.WriterRefAt{WriterRef: outRef}
 		}
 
-		err := c.rb.feedUntilDone(c.conn, &decoder, feederOut, func() (time.Time, bool) {
+		err := c.rb.FeedUntilDone(c.conn, &decoder, feederOut, func() (time.Time, bool) {
 			if deliver {
 				select {
 				case <-req.Ctx.Done():
 					deliver = false
-					outRef.w = io.Discard
+					outRef.W = io.Discard
 				default:
 				}
 			}
@@ -477,7 +385,7 @@ func (c *NNTPConnection) readerLoop() {
 			default:
 			}
 		}
-		safeClose(req.RespCh)
+		internal.SafeClose(req.RespCh)
 
 		// release inflight slot
 		<-c.inflightSem
@@ -495,7 +403,7 @@ func (c *NNTPConnection) readerLoop() {
 // Any unread bytes remain buffered in c.rbuf[c.rstart:c.rend] for subsequent reads.
 func (c *NNTPConnection) readOneResponse(out io.Writer) (NNTPResponse, error) {
 	resp := NNTPResponse{}
-	if err := c.rb.feedUntilDone(c.conn, &resp, out, func() (time.Time, bool) { return time.Time{}, false }); err != nil {
+	if err := c.rb.FeedUntilDone(c.conn, &resp, out, func() (time.Time, bool) { return time.Time{}, false }); err != nil {
 		return resp, err
 	}
 	return resp, nil
