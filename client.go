@@ -1,12 +1,16 @@
 package nntppool
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mnightingale/rapidyenc"
 )
 
 type Client struct {
@@ -555,4 +559,181 @@ type countingDiscard struct {
 func (c *countingDiscard) Write(p []byte) (int, error) {
 	atomic.AddInt64(&c.n, int64(len(p)))
 	return len(p), nil
+}
+
+// Post posts an article to the NNTP server with the given headers and body.
+// The headers map should contain standard NNTP headers like "From", "Newsgroups", "Subject", etc.
+// The body reader provides the article content which will be transmitted with proper dot-stuffing.
+//
+// NNTP response codes:
+//   - 240: Article posted successfully
+//   - 340: Send article to be posted (intermediate response)
+//   - 440: Posting not allowed
+//   - 441: Posting failed
+func (c *Client) Post(ctx context.Context, headers map[string]string, body io.Reader) (*Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Build the complete article (headers + body + termination)
+	var buf bytes.Buffer
+
+	// Write headers
+	for key, value := range headers {
+		fmt.Fprintf(&buf, "%s: %s\r\n", key, value)
+	}
+
+	// Empty line separates headers from body
+	buf.WriteString("\r\n")
+
+	// Write body with dot-stuffing
+	if err := dotStuff(body, &buf); err != nil {
+		return nil, fmt.Errorf("failed to process body: %w", err)
+	}
+
+	// Termination line
+	buf.WriteString(".\r\n")
+
+	// Send POST command first
+	postCmd := []byte("POST\r\n")
+	respCh := c.Send(ctx, postCmd, nil)
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp, ok := <-respCh:
+		if !ok {
+			return nil, fmt.Errorf("POST command channel closed unexpectedly")
+		}
+		if resp.Err != nil {
+			return nil, fmt.Errorf("POST command failed: %w", resp.Err)
+		}
+
+		// Check for 340 response (send article to be posted)
+		if resp.StatusCode != 340 {
+			return &resp, fmt.Errorf("unexpected POST response: %d %s", resp.StatusCode, resp.Status)
+		}
+	}
+
+	// Now send the article
+	articleRespCh := c.Send(ctx, buf.Bytes(), nil)
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp, ok := <-articleRespCh:
+		if !ok {
+			return nil, fmt.Errorf("article send channel closed unexpectedly")
+		}
+		if resp.Err != nil {
+			return nil, resp.Err
+		}
+		return &resp, nil
+	}
+}
+
+// PostYenc posts an article with automatic yEnc encoding.
+// The body reader provides the raw binary content which will be yEnc encoded before posting.
+// The opts parameter specifies yEnc encoding options including filename, file size, and part information.
+//
+// For single-part files, set opts.Part to 0 or 1 and opts.Total to 0 or 1.
+// For multi-part files, set opts.Part and opts.Total appropriately, along with PartBegin and PartEnd.
+//
+// NNTP response codes:
+//   - 240: Article posted successfully
+//   - 340: Send article to be posted (intermediate response)
+//   - 440: Posting not allowed
+//   - 441: Posting failed
+func (c *Client) PostYenc(ctx context.Context, headers map[string]string, body io.Reader, opts *YencOptions) (*Response, error) {
+	if opts == nil {
+		return nil, fmt.Errorf("YencOptions cannot be nil")
+	}
+
+	// Validate required options
+	if opts.FileName == "" {
+		return nil, fmt.Errorf("YencOptions.FileName is required")
+	}
+	if opts.FileSize <= 0 {
+		return nil, fmt.Errorf("YencOptions.FileSize must be positive")
+	}
+
+	// Determine if this is a multi-part file
+	isMultiPart := opts.Part > 1 || opts.Total > 1
+
+	// Prepare Meta struct for rapidyenc encoder
+	var partNumber, totalParts, offset, partSize int64
+
+	if isMultiPart {
+		// Validate multi-part options
+		if opts.PartBegin <= 0 || opts.PartEnd <= 0 {
+			return nil, fmt.Errorf("multi-part requires PartBegin and PartEnd")
+		}
+
+		partNumber = opts.Part
+		totalParts = opts.Total
+		offset = opts.PartBegin - 1 // Convert from 1-based to 0-based
+		partSize = opts.PartEnd - opts.PartBegin + 1
+	} else {
+		// Single-part defaults
+		partNumber = 1
+		totalParts = 1
+		offset = 0
+		partSize = opts.FileSize
+	}
+
+	// Create rapidyenc Meta struct
+	meta := rapidyenc.Meta{
+		FileName:   opts.FileName,
+		FileSize:   opts.FileSize,
+		PartNumber: partNumber,
+		TotalParts: totalParts,
+		Offset:     offset,
+		PartSize:   partSize,
+	}
+
+	// Create buffer for encoded output
+	var encodedBody bytes.Buffer
+
+	// Create rapidyenc encoder (automatically writes =ybegin and =ypart headers)
+	enc, err := rapidyenc.NewEncoder(&encodedBody, meta)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create yEnc encoder: %w", err)
+	}
+
+	// Stream data through encoder
+	if _, err := io.Copy(enc, body); err != nil {
+		return nil, fmt.Errorf("failed to encode data: %w", err)
+	}
+
+	// Close encoder (automatically writes =yend footer with CRC32)
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close encoder: %w", err)
+	}
+
+	// Post the yEnc-encoded article
+	return c.Post(ctx, headers, &encodedBody)
+}
+
+// dotStuff implements NNTP dot-stuffing according to RFC 3977 Section 3.1.1.
+// Lines beginning with a period must have another period prepended.
+// The termination sequence (single period on a line) is added by the caller.
+func dotStuff(r io.Reader, w io.Writer) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Prepend '.' if line starts with '.'
+		if len(line) > 0 && line[0] == '.' {
+			if _, err := w.Write([]byte{'.'}); err != nil {
+				return err
+			}
+		}
+
+		// Write the line with CRLF
+		if _, err := fmt.Fprintf(w, "%s\r\n", line); err != nil {
+			return err
+		}
+	}
+
+	return scanner.Err()
 }

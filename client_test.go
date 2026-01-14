@@ -1,6 +1,7 @@
 package nntppool
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -701,6 +702,554 @@ func TestClientBodyReader(t *testing.T) {
 		_, err = reader.Read(buf)
 		if err == nil {
 			t.Error("expected error after close, got nil")
+		}
+	})
+}
+
+func TestPost(t *testing.T) {
+	t.Run("basic POST", func(t *testing.T) {
+		var receivedArticle string
+
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			ID: "PostTest",
+			Handler: func(cmd string) (string, error) {
+				if cmd == "POST\r\n" {
+					return "340 Send article to be posted\r\n", nil
+				}
+				if strings.Contains(cmd, "Subject:") {
+					// Capture the full article
+					receivedArticle = cmd
+					return "240 Article posted successfully\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+
+		client := NewClient(10)
+		defer client.Close()
+		client.AddProvider(p, ProviderPrimary)
+
+		headers := map[string]string{
+			"From":       "test@example.com",
+			"Newsgroups": "alt.test",
+			"Subject":    "Test Article",
+			"Message-ID": "<test123@example.com>",
+		}
+
+		body := strings.NewReader("This is a test article.\nLine 2")
+
+		resp, err := client.Post(context.Background(), headers, body)
+		if err != nil {
+			t.Fatalf("Post failed: %v", err)
+		}
+
+		if resp.StatusCode != 240 {
+			t.Errorf("expected status 240, got %d", resp.StatusCode)
+		}
+
+		// Verify article contains headers and body
+		if !strings.Contains(receivedArticle, "Subject: Test Article") {
+			t.Error("article missing Subject header")
+		}
+		if !strings.Contains(receivedArticle, "From: test@example.com") {
+			t.Error("article missing From header")
+		}
+	})
+
+	t.Run("dot-stuffing", func(t *testing.T) {
+		var receivedArticle string
+
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			ID: "DotStuffTest",
+			Handler: func(cmd string) (string, error) {
+				if cmd == "POST\r\n" {
+					return "340 Send article to be posted\r\n", nil
+				}
+				if strings.Contains(cmd, "Subject:") {
+					receivedArticle = cmd
+					return "240 Article posted successfully\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+
+		client := NewClient(10)
+		defer client.Close()
+		client.AddProvider(p, ProviderPrimary)
+
+		headers := map[string]string{
+			"From":    "test@example.com",
+			"Subject": "Dot Stuffing Test",
+		}
+
+		// Body with lines starting with '.'
+		body := strings.NewReader(".hidden line\nnormal line\n.another hidden")
+
+		resp, err := client.Post(context.Background(), headers, body)
+		if err != nil {
+			t.Fatalf("Post failed: %v", err)
+		}
+
+		if resp.StatusCode != 240 {
+			t.Errorf("expected status 240, got %d", resp.StatusCode)
+		}
+
+		// Verify dot-stuffing was applied (lines starting with '.' should have '..' prepended)
+		if !strings.Contains(receivedArticle, "..hidden line") {
+			t.Error("dot-stuffing not applied correctly")
+		}
+	})
+}
+
+func TestPostYenc(t *testing.T) {
+	t.Run("single-part yEnc", func(t *testing.T) {
+		var receivedArticle string
+
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			ID: "YencTest",
+			Handler: func(cmd string) (string, error) {
+				if cmd == "POST\r\n" {
+					return "340 Send article to be posted\r\n", nil
+				}
+				if strings.Contains(cmd, "=ybegin") {
+					receivedArticle = cmd
+					return "240 Article posted successfully\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+
+		client := NewClient(10)
+		defer client.Close()
+		client.AddProvider(p, ProviderPrimary)
+
+		headers := map[string]string{
+			"From":       "test@example.com",
+			"Newsgroups": "alt.binaries.test",
+			"Subject":    "Test Binary [1/1]",
+		}
+
+		testData := []byte("Hello, World!")
+		body := strings.NewReader(string(testData))
+
+		opts := &YencOptions{
+			FileName: "test.bin",
+			FileSize: int64(len(testData)),
+			LineSize: 128,
+		}
+
+		resp, err := client.PostYenc(context.Background(), headers, body, opts)
+		if err != nil {
+			t.Fatalf("PostYenc failed: %v", err)
+		}
+
+		if resp.StatusCode != 240 {
+			t.Errorf("expected status 240, got %d", resp.StatusCode)
+		}
+
+		// Verify yEnc headers are present
+		if !strings.Contains(receivedArticle, "=ybegin") {
+			t.Error("missing =ybegin header")
+		}
+		if !strings.Contains(receivedArticle, "name=test.bin") {
+			t.Error("missing filename in yEnc header")
+		}
+		if !strings.Contains(receivedArticle, "=yend") {
+			t.Error("missing =yend footer")
+		}
+		if !strings.Contains(receivedArticle, "crc32=") {
+			t.Error("missing CRC32 in yEnc footer")
+		}
+	})
+
+	t.Run("multi-part yEnc", func(t *testing.T) {
+		var receivedArticle string
+
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			ID: "YencMultiTest",
+			Handler: func(cmd string) (string, error) {
+				if cmd == "POST\r\n" {
+					return "340 Send article to be posted\r\n", nil
+				}
+				if strings.Contains(cmd, "=ybegin") {
+					receivedArticle = cmd
+					return "240 Article posted successfully\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, InflightPerConnection: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+
+		client := NewClient(10)
+		defer client.Close()
+		client.AddProvider(p, ProviderPrimary)
+
+		headers := map[string]string{
+			"From":       "test@example.com",
+			"Newsgroups": "alt.binaries.test",
+			"Subject":    "Test Binary [1/2]",
+		}
+
+		testData := []byte("Part 1 data")
+		body := strings.NewReader(string(testData))
+
+		opts := &YencOptions{
+			FileName:  "test.bin",
+			FileSize:  1024, // Total file size
+			Part:      1,
+			Total:     2,
+			PartBegin: 1,
+			PartEnd:   int64(len(testData)),
+			LineSize:  128,
+		}
+
+		resp, err := client.PostYenc(context.Background(), headers, body, opts)
+		if err != nil {
+			t.Fatalf("PostYenc failed: %v", err)
+		}
+
+		if resp.StatusCode != 240 {
+			t.Errorf("expected status 240, got %d", resp.StatusCode)
+		}
+
+		// Verify multi-part yEnc headers
+		if !strings.Contains(receivedArticle, "=ybegin part=1 total=2") {
+			t.Error("missing multi-part yEnc begin header")
+		}
+		if !strings.Contains(receivedArticle, "=ypart begin=1") {
+			t.Error("missing =ypart header")
+		}
+		if !strings.Contains(receivedArticle, "=yend") {
+			t.Error("missing =yend footer")
+		}
+		if !strings.Contains(receivedArticle, "pcrc32=") {
+			t.Error("missing part CRC32 in yEnc footer")
+		}
+	})
+
+	t.Run("invalid options", func(t *testing.T) {
+		client := NewClient(10)
+		defer client.Close()
+
+		headers := map[string]string{
+			"From":    "test@example.com",
+			"Subject": "Test",
+		}
+
+		body := strings.NewReader("test")
+
+		// Test nil options
+		_, err := client.PostYenc(context.Background(), headers, body, nil)
+		if err == nil {
+			t.Error("expected error for nil options")
+		}
+
+		// Test empty filename
+		opts := &YencOptions{
+			FileName: "",
+			FileSize: 100,
+		}
+		_, err = client.PostYenc(context.Background(), headers, body, opts)
+		if err == nil {
+			t.Error("expected error for empty filename")
+		}
+
+		// Test invalid file size
+		opts = &YencOptions{
+			FileName: "test.bin",
+			FileSize: 0,
+		}
+		_, err = client.PostYenc(context.Background(), headers, body, opts)
+		if err == nil {
+			t.Error("expected error for invalid file size")
+		}
+
+		// Test multi-part without PartBegin/PartEnd
+		opts = &YencOptions{
+			FileName: "test.bin",
+			FileSize: 1000,
+			Part:     2,
+			Total:    3,
+		}
+		_, err = client.PostYenc(context.Background(), headers, body, opts)
+		if err == nil {
+			t.Error("expected error for multi-part without PartBegin/PartEnd")
+		}
+	})
+}
+
+// extractMessageID parses article headers to find Message-ID
+func extractMessageID(article string) string {
+	lines := strings.Split(article, "\r\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Message-ID:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "Message-ID:"))
+		}
+	}
+	return ""
+}
+
+func TestPostYencRoundTrip(t *testing.T) {
+	t.Run("single-part round-trip", func(t *testing.T) {
+		// Storage for posted articles
+		postedArticles := make(map[string]string)
+		var mu sync.Mutex
+
+		// Mock server handler
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			ID: "RoundTripTest",
+			Handler: func(cmd string) (string, error) {
+				if cmd == "POST\r\n" {
+					return "340 Send article to be posted\r\n", nil
+				}
+
+				// Store posted article
+				if strings.Contains(cmd, "=ybegin") {
+					// Extract Message-ID from headers
+					messageID := extractMessageID(cmd)
+					mu.Lock()
+					postedArticles[messageID] = cmd
+					mu.Unlock()
+					return "240 Article posted successfully\r\n", nil
+				}
+
+				// Serve stored article for BODY requests
+				if strings.HasPrefix(cmd, "BODY") {
+					// Extract Message-ID from command: "BODY <id>\r\n"
+					parts := strings.Fields(cmd)
+					if len(parts) >= 2 {
+						messageID := strings.TrimRight(parts[1], "\r\n")
+						mu.Lock()
+						article, ok := postedArticles[messageID]
+						mu.Unlock()
+
+						if ok {
+							return fmt.Sprintf("222 0 %s body follows\r\n%s.\r\n",
+								messageID, article), nil
+						}
+					}
+					return "430 No such article\r\n", nil
+				}
+
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		// Setup client
+		client := NewClient(10)
+		defer client.Close()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		client.AddProvider(p, ProviderPrimary)
+
+		// Test data
+		originalData := []byte("Hello, World! This is test data.")
+		messageID := "<test-roundtrip-single@example.com>"
+
+		// Upload using PostYenc
+		headers := map[string]string{
+			"From":       "test@example.com",
+			"Newsgroups": "alt.binaries.test",
+			"Subject":    "Round-trip test [1/1]",
+			"Message-ID": messageID,
+		}
+
+		opts := &YencOptions{
+			FileName: "test.bin",
+			FileSize: int64(len(originalData)),
+			LineSize: 128,
+		}
+
+		resp, err := client.PostYenc(context.Background(), headers,
+			bytes.NewReader(originalData), opts)
+		if err != nil {
+			t.Fatalf("PostYenc failed: %v", err)
+		}
+		if resp.StatusCode != 240 {
+			t.Fatalf("expected status 240, got %d", resp.StatusCode)
+		}
+
+		// Download using Body
+		var decoded bytes.Buffer
+		err = client.Body(context.Background(), messageID, &decoded)
+		if err != nil {
+			t.Fatalf("Body failed: %v", err)
+		}
+
+		// Verify data integrity
+		if !bytes.Equal(decoded.Bytes(), originalData) {
+			t.Errorf("data mismatch:\noriginal: %q\ndecoded:  %q",
+				string(originalData), decoded.String())
+		}
+	})
+
+	t.Run("multi-part round-trip", func(t *testing.T) {
+		// Storage for posted articles
+		postedArticles := make(map[string]string)
+		var mu sync.Mutex
+
+		// Mock server handler
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			ID: "RoundTripMultiTest",
+			Handler: func(cmd string) (string, error) {
+				if cmd == "POST\r\n" {
+					return "340 Send article to be posted\r\n", nil
+				}
+
+				// Store posted article
+				if strings.Contains(cmd, "=ybegin") {
+					// Extract Message-ID from headers
+					messageID := extractMessageID(cmd)
+					mu.Lock()
+					postedArticles[messageID] = cmd
+					mu.Unlock()
+					return "240 Article posted successfully\r\n", nil
+				}
+
+				// Serve stored article for BODY requests
+				if strings.HasPrefix(cmd, "BODY") {
+					// Extract Message-ID from command: "BODY <id>\r\n"
+					parts := strings.Fields(cmd)
+					if len(parts) >= 2 {
+						messageID := strings.TrimRight(parts[1], "\r\n")
+						mu.Lock()
+						article, ok := postedArticles[messageID]
+						mu.Unlock()
+
+						if ok {
+							return fmt.Sprintf("222 0 %s body follows\r\n%s.\r\n",
+								messageID, article), nil
+						}
+					}
+					return "430 No such article\r\n", nil
+				}
+
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		// Setup client
+		client := NewClient(10)
+		defer client.Close()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address: srv.Addr(), MaxConnections: 1, ConnFactory: dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		client.AddProvider(p, ProviderPrimary)
+
+		// Test data - simulate part 1 of a multi-part file
+		originalData := []byte("Part 1 of multi-part file")
+		messageID := "<test-roundtrip-multi-1@example.com>"
+
+		// Upload using PostYenc with multi-part options
+		headers := map[string]string{
+			"From":       "test@example.com",
+			"Newsgroups": "alt.binaries.test",
+			"Subject":    "Round-trip test [1/3]",
+			"Message-ID": messageID,
+		}
+
+		opts := &YencOptions{
+			FileName:  "test.bin",
+			FileSize:  1000, // Total file size
+			Part:      1,
+			Total:     3,
+			PartBegin: 1,
+			PartEnd:   int64(len(originalData)),
+			LineSize:  128,
+		}
+
+		resp, err := client.PostYenc(context.Background(), headers,
+			bytes.NewReader(originalData), opts)
+		if err != nil {
+			t.Fatalf("PostYenc failed: %v", err)
+		}
+		if resp.StatusCode != 240 {
+			t.Fatalf("expected status 240, got %d", resp.StatusCode)
+		}
+
+		// Download using Body
+		var decoded bytes.Buffer
+		err = client.Body(context.Background(), messageID, &decoded)
+		if err != nil {
+			t.Fatalf("Body failed: %v", err)
+		}
+
+		// Verify data integrity
+		if !bytes.Equal(decoded.Bytes(), originalData) {
+			t.Errorf("data mismatch:\noriginal: %q\ndecoded:  %q",
+				string(originalData), decoded.String())
 		}
 	})
 }
