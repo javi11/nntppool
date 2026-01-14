@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -48,6 +49,18 @@ type Response struct {
 
 	Err     error
 	Request *Request
+}
+
+// ArticleNotFoundError indicates an article was not found (NNTP 430 status).
+type ArticleNotFoundError struct {
+	MessageID  string
+	StatusCode int
+	Status     string
+}
+
+func (e *ArticleNotFoundError) Error() string {
+	return fmt.Sprintf("article not found: %s (status: %d %s)",
+		e.MessageID, e.StatusCode, e.Status)
 }
 
 type Auth struct {

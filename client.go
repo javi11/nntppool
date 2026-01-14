@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -138,6 +139,13 @@ func (c *Client) Close() {
 		_ = p.Close()
 	}
 	c.mu.Unlock()
+}
+
+// IsArticleNotFound checks if an error is an ArticleNotFoundError.
+// Returns true if the error (or any error in the chain) indicates an article was not found.
+func IsArticleNotFound(err error) bool {
+	var notFoundErr *ArticleNotFoundError
+	return errors.As(err, &notFoundErr)
 }
 
 // Metrics returns metrics for all active providers.
@@ -384,6 +392,15 @@ func (c *Client) sendRequest(req *Request) {
 	// All failed
 	if attempted {
 		if lastResp.Request != nil {
+			// If last response was 430 (article not found), create custom error
+			if lastResp.StatusCode == 430 {
+				messageID := extractMessageIDFromPayload(lastResp.Request.Payload)
+				lastResp.Err = &ArticleNotFoundError{
+					MessageID:  messageID,
+					StatusCode: lastResp.StatusCode,
+					Status:     lastResp.Status,
+				}
+			}
 			req.RespCh <- lastResp
 		} else if lastErr != nil {
 			req.RespCh <- Response{Err: lastErr}
@@ -521,6 +538,20 @@ func (c *Client) formatID(id string) string {
 		return id
 	}
 	return "<" + id + ">"
+}
+
+// extractMessageIDFromPayload extracts the message ID from a NNTP request payload.
+func extractMessageIDFromPayload(payload []byte) string {
+	// Payload format: "BODY <message-id>\r\n" or similar
+	parts := bytes.Fields(payload)
+	if len(parts) >= 2 {
+		id := parts[1]
+		// Remove angle brackets if present
+		id = bytes.TrimPrefix(id, []byte("<"))
+		id = bytes.TrimSuffix(id, []byte(">"))
+		return string(id)
+	}
+	return ""
 }
 
 // sendSync sends a command and waits for the response.
