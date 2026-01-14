@@ -1,12 +1,16 @@
 package nntppool
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mnightingale/rapidyenc"
 )
 
 type Client struct {
@@ -555,4 +559,120 @@ type countingDiscard struct {
 func (c *countingDiscard) Write(p []byte) (int, error) {
 	atomic.AddInt64(&c.n, int64(len(p)))
 	return len(p), nil
+}
+
+// Post posts an article to the NNTP server with the given headers and body.
+// The headers map should contain standard NNTP headers like "From", "Newsgroups", "Subject", etc.
+// The body reader provides the article content which will be transmitted with proper dot-stuffing.
+//
+// NNTP response codes:
+//   - 240: Article posted successfully
+//   - 340: Send article to be posted (intermediate response)
+//   - 440: Posting not allowed
+//   - 441: Posting failed
+func (c *Client) Post(ctx context.Context, headers map[string]string, body io.Reader) (*Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Build the complete article (headers + body + termination)
+	var buf bytes.Buffer
+	for key, value := range headers {
+		buf.WriteString(key)
+		buf.WriteString(": ")
+		buf.WriteString(value)
+		buf.WriteString("\r\n")
+	}
+	buf.WriteString("\r\n")
+
+	if err := dotStuff(body, &buf); err != nil {
+		return nil, fmt.Errorf("dotStuff: %w", err)
+	}
+	buf.WriteString(".\r\n")
+
+	// Send POST command and wait for 340 response
+	resp, err := c.awaitResponse(ctx, []byte("POST\r\n"))
+	if err != nil {
+		return nil, fmt.Errorf("POST: %w", err)
+	}
+	if resp.StatusCode != 340 {
+		return resp, fmt.Errorf("POST: unexpected response %d %s", resp.StatusCode, resp.Status)
+	}
+
+	// Send the article
+	return c.awaitResponse(ctx, buf.Bytes())
+}
+
+// awaitResponse sends a command and waits for the response.
+func (c *Client) awaitResponse(ctx context.Context, cmd []byte) (*Response, error) {
+	respCh := c.Send(ctx, cmd, nil)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp, ok := <-respCh:
+		if !ok {
+			return nil, fmt.Errorf("channel closed")
+		}
+		if resp.Err != nil {
+			return nil, resp.Err
+		}
+		return &resp, nil
+	}
+}
+
+// PostYenc posts an article with automatic yEnc encoding.
+// The body reader provides the raw binary content which will be yEnc encoded before posting.
+// The opts parameter specifies yEnc encoding options including filename, file size, and part information.
+//
+// For single-part files, set opts.Part to 0 or 1 and opts.Total to 0 or 1.
+// For multi-part files, set opts.Part and opts.Total appropriately, along with PartBegin and PartEnd.
+//
+// NNTP response codes:
+//   - 240: Article posted successfully
+//   - 340: Send article to be posted (intermediate response)
+//   - 440: Posting not allowed
+//   - 441: Posting failed
+func (c *Client) PostYenc(ctx context.Context, headers map[string]string, body io.Reader, opts *YencOptions) (*Response, error) {
+	meta, err := opts.toMeta()
+	if err != nil {
+		return nil, err
+	}
+
+	var encodedBody bytes.Buffer
+	enc, err := rapidyenc.NewEncoder(&encodedBody, meta)
+	if err != nil {
+		return nil, fmt.Errorf("yEnc encoder: %w", err)
+	}
+
+	if _, err := io.Copy(enc, body); err != nil {
+		return nil, fmt.Errorf("yEnc encode: %w", err)
+	}
+
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("yEnc close: %w", err)
+	}
+
+	return c.Post(ctx, headers, &encodedBody)
+}
+
+// dotStuff implements NNTP dot-stuffing according to RFC 3977 Section 3.1.1.
+// Lines beginning with a period must have another period prepended.
+// The termination sequence (single period on a line) is added by the caller.
+func dotStuff(r io.Reader, w io.Writer) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) > 0 && line[0] == '.' {
+			if _, err := w.Write([]byte{'.'}); err != nil {
+				return err
+			}
+		}
+		if _, err := w.Write(line); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, "\r\n"); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
 }

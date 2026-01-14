@@ -3,9 +3,12 @@ package nntppool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"time"
+
+	"github.com/mnightingale/rapidyenc"
 )
 
 type Request struct {
@@ -95,6 +98,52 @@ func (b *yencReader) YencHeaders() *YencHeader {
 	}
 }
 
+// YencOptions contains options for yEnc encoding when posting articles.
+type YencOptions struct {
+	FileName  string // Required: Name of the file being encoded
+	FileSize  int64  // Required: Total size of the original file
+	Part      int64  // For multi-part files (1-based), 0 or 1 means single-part
+	Total     int64  // For multi-part files, total number of parts
+	PartBegin int64  // For multi-part files, beginning byte offset (1-based)
+	PartEnd   int64  // For multi-part files, ending byte offset (1-based, inclusive)
+}
+
+// toMeta validates options and converts to rapidyenc.Meta.
+func (o *YencOptions) toMeta() (rapidyenc.Meta, error) {
+	if o == nil {
+		return rapidyenc.Meta{}, errors.New("YencOptions cannot be nil")
+	}
+	if o.FileName == "" {
+		return rapidyenc.Meta{}, errors.New("YencOptions.FileName is required")
+	}
+	if o.FileSize <= 0 {
+		return rapidyenc.Meta{}, errors.New("YencOptions.FileSize must be positive")
+	}
+
+	isMultiPart := o.Part > 1 || o.Total > 1
+	if isMultiPart && (o.PartBegin <= 0 || o.PartEnd <= 0) {
+		return rapidyenc.Meta{}, errors.New("multi-part requires PartBegin and PartEnd")
+	}
+
+	meta := rapidyenc.Meta{
+		FileName:   o.FileName,
+		FileSize:   o.FileSize,
+		PartNumber: 1,
+		TotalParts: 1,
+		Offset:     0,
+		PartSize:   o.FileSize,
+	}
+
+	if isMultiPart {
+		meta.PartNumber = o.Part
+		meta.TotalParts = o.Total
+		meta.Offset = o.PartBegin - 1 // Convert from 1-based to 0-based
+		meta.PartSize = o.PartEnd - o.PartBegin + 1
+	}
+
+	return meta, nil
+}
+
 // NNTPClient defines the public API for NNTP operations.
 // The Client type implements this interface.
 type NNTPClient interface {
@@ -111,6 +160,10 @@ type NNTPClient interface {
 	Head(ctx context.Context, id string) (*Response, error)
 	Stat(ctx context.Context, id string) (*Response, error)
 	Group(ctx context.Context, group string) (*Response, error)
+
+	// Article posting methods
+	Post(ctx context.Context, headers map[string]string, body io.Reader) (*Response, error)
+	PostYenc(ctx context.Context, headers map[string]string, body io.Reader, opts *YencOptions) (*Response, error)
 
 	// Advanced methods
 	Send(ctx context.Context, payload []byte, bodyWriter io.Writer) <-chan Response
