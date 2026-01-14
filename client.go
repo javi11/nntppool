@@ -159,89 +159,43 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer)
 		ctx = context.Background()
 	}
 
-	go func() {
-		defer close(respCh)
+	req := &Request{
+		Ctx:        ctx,
+		Payload:    payload,
+		BodyWriter: bodyWriter,
+		RespCh:     respCh,
+	}
 
-		// Acquire global capacity
-		if c.sem != nil {
-			select {
-			case c.sem <- struct{}{}:
-				defer func() { <-c.sem }()
-			case <-ctx.Done():
-				return
-			}
-		}
-
-		var visitedHosts []string
-		var lastErr error
-		var lastResp Response
-		var attempted bool
-
-		// Helper to try a list of providers
-		tryProviders := func(providers []*Provider) bool { // returns true if successful
-			for _, p := range providers {
-				// Check if visited
-				var visited bool
-				for _, h := range visitedHosts {
-					if h == p.Host {
-						visited = true
-						break
-					}
-				}
-				if visited {
-					continue
-				}
-				visitedHosts = append(visitedHosts, p.Host)
-				attempted = true
-
-				ch := p.Send(ctx, payload, bodyWriter)
-				resp, ok := <-ch
-				if !ok {
-					lastErr = fmt.Errorf("provider %s closed unexpectedly", p.Host)
-					continue
-				}
-
-				lastResp = resp
-				lastErr = resp.Err
-
-				// If success (2xx), return true
-				if resp.Err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					respCh <- resp
-					return true
-				}
-
-				// If 430 (Article Not Found) or error, we continue to next provider.
-				// We store the last response/error to return if all fail.
-			}
-			return false
-		}
-
-		// Try primaries
-		if tryProviders(c.primaries.Load().([]*Provider)) {
-			return
-		}
-
-		// Try backups
-		if tryProviders(c.backups.Load().([]*Provider)) {
-			return
-		}
-
-		// All failed
-		if attempted {
-			if lastResp.Request != nil {
-				respCh <- lastResp
-			} else if lastErr != nil {
-				respCh <- Response{Err: lastErr}
-			} else {
-				// Should not happen if attempted is true and logic is correct
-				respCh <- Response{Err: fmt.Errorf("all providers failed")}
-			}
-		} else {
-			respCh <- Response{Err: fmt.Errorf("no providers available")}
-		}
-	}()
+	go c.sendRequest(req)
 
 	return respCh
+}
+
+// BodyReader retrieves the body of an article by its message ID as a stream.
+// It returns a reader that provides access to yEnc headers as soon as they are parsed.
+func (c *Client) BodyReader(ctx context.Context, id string) (YencReader, error) {
+	pr, pw := io.Pipe()
+	headerCh := make(chan *YencHeader, 1)
+
+	req := &Request{
+		Ctx:        ctx,
+		Payload:    []byte(fmt.Sprintf("BODY %s\r\n", c.formatID(id))),
+		BodyWriter: pw,
+		OnYencHeader: func(h *YencHeader) {
+			select {
+			case headerCh <- h:
+			default:
+			}
+		},
+		RespCh: make(chan Response, 1),
+	}
+
+	go c.sendRequest(req)
+
+	return &yencReader{
+		PipeReader: pr,
+		headerCh:   headerCh,
+	}, nil
 }
 
 // Body retrieves the body of an article by its message ID.
@@ -341,6 +295,98 @@ func (c *Client) Date(ctx context.Context) error {
 	cmd := "DATE\r\n"
 	_, err := c.sendSync(ctx, cmd, nil)
 	return err
+}
+
+func (c *Client) sendRequest(req *Request) {
+	defer close(req.RespCh)
+
+	// Acquire global capacity
+	if c.sem != nil {
+		select {
+		case c.sem <- struct{}{}:
+			defer func() { <-c.sem }()
+		case <-req.Ctx.Done():
+			return
+		}
+	}
+
+	var visitedHosts []string
+	var lastErr error
+	var lastResp Response
+	var attempted bool
+
+	// Helper to try a list of providers
+	tryProviders := func(providers []*Provider) bool { // returns true if successful
+		for _, p := range providers {
+			// Check if visited
+			var visited bool
+			for _, h := range visitedHosts {
+				if h == p.Host {
+					visited = true
+					break
+				}
+			}
+			if visited {
+				continue
+			}
+			visitedHosts = append(visitedHosts, p.Host)
+			attempted = true
+
+			// Create a sub-request for each provider attempt
+			attemptCh := make(chan Response, 1)
+			subReq := &Request{
+				Ctx:          req.Ctx,
+				Payload:      req.Payload,
+				BodyWriter:   req.BodyWriter,
+				RespCh:       attemptCh,
+				OnYencHeader: req.OnYencHeader,
+			}
+
+			ch := p.SendRequest(subReq)
+			resp, ok := <-ch
+			if !ok {
+				lastErr = fmt.Errorf("provider %s closed unexpectedly", p.Host)
+				continue
+			}
+
+			lastResp = resp
+			lastErr = resp.Err
+
+			// If success (2xx), return true
+			if resp.Err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				req.RespCh <- resp
+				return true
+			}
+
+			// If 430 (Article Not Found) or error, we continue to next provider.
+			// We store the last response/error to return if all fail.
+		}
+		return false
+	}
+
+	// Try primaries
+	if tryProviders(c.primaries.Load().([]*Provider)) {
+		return
+	}
+
+	// Try backups
+	if tryProviders(c.backups.Load().([]*Provider)) {
+		return
+	}
+
+	// All failed
+	if attempted {
+		if lastResp.Request != nil {
+			req.RespCh <- lastResp
+		} else if lastErr != nil {
+			req.RespCh <- Response{Err: lastErr}
+		} else {
+			// Should not happen if attempted is true and logic is correct
+			req.RespCh <- Response{Err: fmt.Errorf("all providers failed")}
+		}
+	} else {
+		req.RespCh <- Response{Err: fmt.Errorf("no providers available")}
+	}
 }
 
 func (c *Client) healthCheckLoop() {

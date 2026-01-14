@@ -16,6 +16,18 @@ type Request struct {
 
 	// Optional: decoded body bytes are streamed here. If nil, they are buffered into Response.Body.
 	BodyWriter io.Writer
+
+	// Optional: callback for when yEnc headers are parsed
+	OnYencHeader func(*YencHeader)
+}
+
+type YencHeader struct {
+	FileName  string
+	FileSize  int64
+	Part      int64
+	PartBegin int64
+	PartSize  int64
+	Total     int64
 }
 
 type Response struct {
@@ -57,4 +69,28 @@ type SpeedTestStats struct {
 	BytesPerSecond float64
 	SuccessCount   int32
 	FailureCount   int32
+}
+
+type YencReader interface {
+	io.ReadCloser
+	YencHeaders() *YencHeader
+}
+
+type yencReader struct {
+	*io.PipeReader
+	headerCh chan *YencHeader
+	cached   *YencHeader
+}
+
+func (b *yencReader) YencHeaders() *YencHeader {
+	if b.cached != nil {
+		return b.cached
+	}
+	select {
+	case h := <-b.headerCh:
+		b.cached = h
+		return h
+	default:
+		return nil
+	}
 }

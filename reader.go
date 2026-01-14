@@ -38,6 +38,8 @@ type NNTPResponse struct {
 	hasCrc       bool
 	hasEmptyline bool // for article requests has the empty line separating headers and body been seen
 	hasBaddata   bool // invalid line lengths for uu decoding; some data lost
+
+	OnYencHeader func(*YencHeader)
 }
 
 const nntpBody = 222
@@ -305,7 +307,10 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 
 func (r *NNTPResponse) processYencHeader(line []byte) {
 	var err error
+	var isBegin, isPart bool
+
 	if bytes.HasPrefix(line, []byte("=ybegin ")) {
+		isBegin = true
 		line = line[len("=ybegin"):]
 		r.FileSize, _ = extractInt(line, []byte(" size="))
 		r.FileName, _ = extractString(line, []byte(" name="))
@@ -317,6 +322,7 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 		r.Total, _ = extractInt(line, []byte(" total="))
 	} else if bytes.HasPrefix(line, []byte("=ypart ")) {
 		// =ypart signals start of body data in multi-part files
+		isPart = true
 		r.hasPart = true
 		r.body = true
 		line = line[len("=ypart"):]
@@ -339,6 +345,17 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 			r.hasCrc = true
 		}
 		r.EndSize, _ = extractInt(line, []byte(" size="))
+	}
+
+	if r.OnYencHeader != nil && (isBegin || isPart) {
+		r.OnYencHeader(&YencHeader{
+			FileName:  r.FileName,
+			FileSize:  r.FileSize,
+			Part:      r.Part,
+			PartBegin: r.PartBegin,
+			PartSize:  r.PartSize,
+			Total:     r.Total,
+		})
 	}
 }
 

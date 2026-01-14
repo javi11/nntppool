@@ -415,7 +415,9 @@ func (c *NNTPConnection) readerLoop() {
 		resp := Response{
 			Request: req,
 		}
-		decoder := NNTPResponse{}
+		decoder := NNTPResponse{
+			OnYencHeader: req.OnYencHeader,
+		}
 
 		// If the request is cancelled after send, we must still drain its response off the wire,
 		// but we don't deliver it.

@@ -233,6 +233,10 @@ func (c *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 		BodyWriter: bodyWriter,
 	}
 
+	return c.SendRequest(req)
+}
+
+func (c *Provider) SendRequest(req *Request) <-chan Response {
 	// Trigger lazy growth if needed
 	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
 		go c.addConnection(false)
@@ -240,12 +244,16 @@ func (c *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 
 	select {
 	case <-c.ctx.Done():
-		close(respCh)
-		return respCh
-	case <-ctx.Done():
-		close(respCh)
-		return respCh
+		if req.RespCh != nil {
+			close(req.RespCh)
+		}
+		return req.RespCh
+	case <-req.Ctx.Done():
+		if req.RespCh != nil {
+			close(req.RespCh)
+		}
+		return req.RespCh
 	case c.reqCh <- req:
-		return respCh
+		return req.RespCh
 	}
 }
