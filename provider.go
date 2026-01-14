@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 type ProviderMetrics struct {
@@ -29,6 +32,10 @@ type ProviderConfig struct {
 	Auth                  Auth
 	TLSConfig             *tls.Config
 	ConnFactory           ConnFactory
+	// ProxyURL configures SOCKS proxy connection (e.g., "socks5://host:port" or "socks5://user:pass@host:port").
+	// Supports socks4, socks4a, and socks5 protocols.
+	// Only used when ConnFactory is nil.
+	ProxyURL string
 }
 
 type Provider struct {
@@ -54,8 +61,71 @@ type Provider struct {
 
 func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) {
 	if config.ConnFactory == nil {
-		config.ConnFactory = func(_ context.Context) (net.Conn, error) {
-			return newNetConn(config.Address, config.TLSConfig)
+		if config.ProxyURL != "" {
+			// Parse and validate proxy URL
+			proxyURL, err := url.Parse(config.ProxyURL)
+			if err != nil {
+				return nil, fmt.Errorf("invalid proxy URL: %w", err)
+			}
+
+			// Create proxy dialer based on scheme
+			var dialer proxy.Dialer
+			switch proxyURL.Scheme {
+			case "socks5":
+				var auth *proxy.Auth
+				if proxyURL.User != nil {
+					password, _ := proxyURL.User.Password()
+					auth = &proxy.Auth{
+						User:     proxyURL.User.Username(),
+						Password: password,
+					}
+				}
+				dialer, err = proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create SOCKS5 proxy dialer: %w", err)
+				}
+			case "socks4", "socks4a":
+				// Note: socks4/socks4a don't support authentication in golang.org/x/net/proxy
+				// but we can still create the dialer
+				var auth *proxy.Auth
+				if proxyURL.User != nil {
+					password, _ := proxyURL.User.Password()
+					auth = &proxy.Auth{
+						User:     proxyURL.User.Username(),
+						Password: password,
+					}
+				}
+				dialer, err = proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create SOCKS proxy dialer: %w", err)
+				}
+			default:
+				return nil, fmt.Errorf("unsupported proxy scheme: %s (supported: socks4, socks4a, socks5)", proxyURL.Scheme)
+			}
+
+			// Create ConnFactory that uses the proxy dialer
+			config.ConnFactory = func(ctx context.Context) (net.Conn, error) {
+				// Use context-aware dialing if available
+				if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+					conn, err := contextDialer.DialContext(ctx, "tcp", config.Address)
+					if err != nil {
+						return nil, fmt.Errorf("proxy dial failed: %w", err)
+					}
+					return applyConnOptimizations(conn, config.TLSConfig)
+				}
+
+				// Fallback to non-context dialing
+				conn, err := dialer.Dial("tcp", config.Address)
+				if err != nil {
+					return nil, fmt.Errorf("proxy dial failed: %w", err)
+				}
+				return applyConnOptimizations(conn, config.TLSConfig)
+			}
+		} else {
+			// No proxy, use direct connection
+			config.ConnFactory = func(_ context.Context) (net.Conn, error) {
+				return newNetConn(config.Address, config.TLSConfig)
+			}
 		}
 	}
 
