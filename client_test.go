@@ -548,6 +548,7 @@ func TestClientBodyReader(t *testing.T) {
 		// Headers should now be available
 		if header == nil {
 			t.Fatal("expected headers after reading, got nil")
+			return // Explicit return for staticcheck SA5011 (though t.Fatal already stops execution)
 		}
 
 		// Debug: print what we got
