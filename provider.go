@@ -340,7 +340,10 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	// Trigger lazy connection growth
 	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
 		go func() {
-			_ = c.addConnection(false)
+			err := c.addConnection(false)
+			if err != nil {
+				req.RespCh <- Response{Err: err}
+			}
 		}()
 	}
 
@@ -352,12 +355,21 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		return closeAndReturn()
 	}
 
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+
 	select {
 	case <-c.ctx.Done():
 		return closeAndReturn()
 	case <-req.Ctx.Done():
 		return closeAndReturn()
 	case c.reqCh <- req:
+		return req.RespCh
+	case <-timeout.C:
+		if req.RespCh != nil {
+			req.RespCh <- Response{Err: fmt.Errorf("send request timeout after 5s")}
+			close(req.RespCh)
+		}
 		return req.RespCh
 	}
 }

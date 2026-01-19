@@ -77,7 +77,7 @@ func main() {
 	provider, err := nntppool.NewProvider(ctx, nntppool.ProviderConfig{
 		Address:               addr,
 		MaxConnections:        connections,
-		InflightPerConnection: 20,
+		InflightPerConnection: connections * 2,
 		Auth:                  auth,
 		TLSConfig:             tlsConfig,
 	})
@@ -85,8 +85,11 @@ func main() {
 		log.Fatalf("Failed to create provider: %v", err)
 	}
 
-	client := nntppool.NewClient(0)
-	client.AddProvider(provider, nntppool.ProviderPrimary)
+	client := nntppool.NewClient(connections * 2)
+	err = client.AddProvider(provider, nntppool.ProviderPrimary)
+	if err != nil {
+		log.Fatalf("Failed to add provider: %v", err)
+	}
 	defer client.Close()
 
 	log.Println("Connected. Starting download...")

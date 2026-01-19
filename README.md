@@ -58,7 +58,10 @@ func main() {
 
     // Create client (implements NNTPClient interface)
     client := nntppool.NewClient(100) // Max 100 concurrent requests
-    client.AddProvider(provider, nntppool.ProviderPrimary)
+    err = client.AddProvider(provider, nntppool.ProviderPrimary)
+    if err != nil {
+        panic(err)
+    }
     defer client.Close()
 
     // Download article body
@@ -140,8 +143,14 @@ backupProvider, _ := nntppool.NewProvider(ctx, nntppool.ProviderConfig{
 
 // Add to client with tier priority
 client := nntppool.NewClient(100)
-client.AddProvider(primaryProvider, nntppool.ProviderPrimary)
-client.AddProvider(backupProvider, nntppool.ProviderBackup)
+err = client.AddProvider(primaryProvider, nntppool.ProviderPrimary)
+if err != nil {
+    panic(err)
+}
+err = client.AddProvider(backupProvider, nntppool.ProviderBackup)
+if err != nil {
+    panic(err)
+}
 
 // Client automatically tries primary first, falls back to backup on errors
 ```

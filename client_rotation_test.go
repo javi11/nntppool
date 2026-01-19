@@ -21,7 +21,10 @@ func TestClientRotation_ArticleNotFound(t *testing.T) {
 			Handler: testutil.NotFoundHandler(),
 		}),
 	})
-	client.AddProvider(p1, ProviderPrimary)
+	err := client.AddProvider(p1, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p1: %v", err)
+	}
 
 	// Add Backup (Succeeding)
 	p2, _ := NewProvider(context.Background(), ProviderConfig{
@@ -29,10 +32,13 @@ func TestClientRotation_ArticleNotFound(t *testing.T) {
 			Handler: testutil.SuccessfulBodyHandler("line1"),
 		}),
 	})
-	client.AddProvider(p2, ProviderBackup)
+	err = client.AddProvider(p2, ProviderBackup)
+	if err != nil {
+		t.Fatalf("failed to add p2: %v", err)
+	}
 
 	// Execute
-	err := client.Body(context.Background(), "123", io.Discard)
+	err = client.Body(context.Background(), "123", io.Discard)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -57,10 +63,13 @@ func TestClientRotation_OnlyBackups(t *testing.T) {
 			Handler: testutil.SuccessfulBodyHandler("line1"),
 		}),
 	})
-	client.AddProvider(p1, ProviderBackup)
+	err := client.AddProvider(p1, ProviderBackup)
+	if err != nil {
+		t.Fatalf("failed to add p1: %v", err)
+	}
 
 	// Execute
-	err := client.Body(context.Background(), "123", io.Discard)
+	err = client.Body(context.Background(), "123", io.Discard)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
@@ -78,7 +87,10 @@ func TestClientRotation_AllFail(t *testing.T) {
 			Handler: testutil.NotFoundHandler(),
 		}),
 	})
-	client.AddProvider(p1, ProviderPrimary)
+	err := client.AddProvider(p1, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p1: %v", err)
+	}
 
 	// Add Backup
 	p2, _ := NewProvider(context.Background(), ProviderConfig{
@@ -86,10 +98,13 @@ func TestClientRotation_AllFail(t *testing.T) {
 			Handler: testutil.NotFoundHandler(),
 		}),
 	})
-	client.AddProvider(p2, ProviderBackup)
+	err = client.AddProvider(p2, ProviderBackup)
+	if err != nil {
+		t.Fatalf("failed to add p2: %v", err)
+	}
 
 	// Execute
-	err := client.Body(context.Background(), "123", io.Discard)
+	err = client.Body(context.Background(), "123", io.Discard)
 	if err == nil {
 		t.Fatal("expected error, got success")
 	}

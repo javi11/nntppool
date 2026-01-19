@@ -46,9 +46,17 @@ func NewClient(maxInflight int) *Client {
 	return c
 }
 
-func (c *Client) AddProvider(provider *Provider, tier ProviderType) {
+func (c *Client) AddProvider(provider *Provider, tier ProviderType) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err := provider.Date(ctx)
+	if err != nil {
+		return err
+	}
 
 	if tier == ProviderPrimary {
 		current := c.primaries.Load().([]*Provider)
@@ -63,9 +71,11 @@ func (c *Client) AddProvider(provider *Provider, tier ProviderType) {
 		newlist[len(current)] = provider
 		c.backups.Store(newlist)
 	}
+
+	return nil
 }
 
-func (c *Client) RemoveProvider(provider *Provider) {
+func (c *Client) RemoveProvider(provider *Provider) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -114,8 +124,13 @@ func (c *Client) RemoveProvider(provider *Provider) {
 	}
 
 	if found {
-		_ = provider.Close()
+		err := provider.Close()
+		if err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
 func (c *Client) Close() {

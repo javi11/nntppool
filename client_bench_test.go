@@ -43,7 +43,10 @@ func setupBenchmarkClient(b *testing.B, payload []byte, maxInflight int, maxConn
 		b.Fatalf("failed to create provider: %v", err)
 	}
 
-	client.AddProvider(provider, ProviderPrimary)
+	err = client.AddProvider(provider, ProviderPrimary)
+	if err != nil {
+		b.Fatalf("failed to add provider: %v", err)
+	}
 
 	return client
 }
@@ -70,7 +73,10 @@ func setupMultiProviderClient(b *testing.B, payload []byte, maxInflight int) *Cl
 			b.Fatalf("failed to create primary provider %d: %v", i, err)
 		}
 
-		client.AddProvider(provider, ProviderPrimary)
+		err = client.AddProvider(provider, ProviderPrimary)
+		if err != nil {
+			b.Fatalf("failed to add provider: %v", err)
+		}
 	}
 
 	// Add 1 backup provider
@@ -88,7 +94,10 @@ func setupMultiProviderClient(b *testing.B, payload []byte, maxInflight int) *Cl
 		b.Fatalf("failed to create backup provider: %v", err)
 	}
 
-	client.AddProvider(provider, ProviderBackup)
+	err = client.AddProvider(provider, ProviderBackup)
+	if err != nil {
+		b.Fatalf("failed to add backup provider: %v", err)
+	}
 
 	return client
 }
