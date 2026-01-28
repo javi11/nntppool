@@ -320,6 +320,7 @@ func (c *NNTPConnection) readerLoop() {
 		select {
 		case req = <-c.pending:
 		case <-c.ctx.Done():
+			c.failOutstanding()
 			return
 		}
 		if req.Ctx == nil {

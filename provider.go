@@ -15,6 +15,8 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+const sendRequestTimeout = 5 * time.Second
+
 type ProviderMetrics struct {
 	Host              string
 	ActiveConnections int
@@ -275,6 +277,12 @@ func (c *Provider) Close() error {
 
 	c.closeMu.Lock()
 	close(c.reqCh)
+	// Drain any queued requests to prevent caller hangs
+	for req := range c.reqCh {
+		if req != nil && req.RespCh != nil {
+			close(req.RespCh)
+		}
+	}
 	c.closeMu.Unlock()
 
 	c.connsMu.Lock()
@@ -296,13 +304,13 @@ func (c *Provider) Date(ctx context.Context) error {
 		return ctx.Err()
 	case resp, ok := <-ch:
 		if !ok {
-			return fmt.Errorf("response channel closed unexpectedly")
+			return fmt.Errorf("DATE: response channel closed")
 		}
 		if resp.Err != nil {
 			return resp.Err
 		}
 		if resp.StatusCode != 111 {
-			return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+			return fmt.Errorf("DATE: unexpected status code %d: %s", resp.StatusCode, resp.Status)
 		}
 		return nil
 	}
@@ -355,7 +363,7 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		return closeAndReturn()
 	}
 
-	timeout := time.NewTimer(5 * time.Second)
+	timeout := time.NewTimer(sendRequestTimeout)
 	defer timeout.Stop()
 
 	select {
@@ -367,7 +375,7 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		return req.RespCh
 	case <-timeout.C:
 		if req.RespCh != nil {
-			req.RespCh <- Response{Err: fmt.Errorf("send request timeout after 5s")}
+			req.RespCh <- Response{Err: fmt.Errorf("send request timeout after %v", sendRequestTimeout)}
 			close(req.RespCh)
 		}
 		return req.RespCh

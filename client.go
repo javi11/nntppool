@@ -14,6 +14,8 @@ import (
 	"github.com/mnightingale/rapidyenc"
 )
 
+const addProviderTimeout = 20 * time.Second
+
 type Client struct {
 	primaries   atomic.Value // []*Provider
 	backups     atomic.Value // []*Provider
@@ -50,7 +52,7 @@ func (c *Client) AddProvider(provider *Provider, tier ProviderType) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), addProviderTimeout)
 	defer cancel()
 
 	err := provider.Date(ctx)
