@@ -80,6 +80,8 @@ func main() {
 		InflightPerConnection: connections * 2,
 		Auth:                  auth,
 		TLSConfig:             tlsConfig,
+		MaxConnIdleTime:       30 * time.Second,
+		MaxConnLifetime:       30 * time.Second,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create provider: %v", err)

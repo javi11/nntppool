@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -45,19 +46,29 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 	cctx, cancel := context.WithCancel(ctx)
 
+	// Apply 0-30% backward offset to createdAt to prevent thundering herd when
+	// many connections are created at the same time (e.g., at startup).
+	// This makes connections appear to have been created at different times,
+	// spreading out their expiration over 30% of maxLifeTime.
+	createdAt := time.Now()
+	if maxLifeTime > 0 {
+		ageOffset := time.Duration(float64(maxLifeTime) * 0.30 * rand.Float64())
+		createdAt = createdAt.Add(-ageOffset)
+	}
+
 	c := &NNTPConnection{
-		conn:         conn,
-		ctx:          cctx,
-		cancel:       cancel,
-		reqCh:        reqCh,
-		pending:      make(chan *Request, inflightLimit),
-		inflightSem:  make(chan struct{}, inflightLimit),
-		rb:           internal.ReadBuffer{},
-		done:         make(chan struct{}),
-		maxIdleTime:  maxIdleTime,
+		conn:        conn,
+		ctx:         cctx,
+		cancel:      cancel,
+		reqCh:       reqCh,
+		pending:     make(chan *Request, inflightLimit),
+		inflightSem: make(chan struct{}, inflightLimit),
+		rb:          internal.ReadBuffer{},
+		done:        make(chan struct{}),
+		maxIdleTime: maxIdleTime,
 		lastActivity: time.Now().Unix(),
-		maxLifeTime:  maxLifeTime,
-		createdAt:    time.Now(),
+		maxLifeTime: maxLifeTime,
+		createdAt:   createdAt,
 	}
 
 	if mc, ok := conn.(*internal.MeteredConn); ok {
@@ -139,6 +150,22 @@ func (c *NNTPConnection) Done() <-chan struct{} { return c.done }
 
 func (c *NNTPConnection) closeDone() {
 	c.doneMu.Do(func() { close(c.done) })
+}
+
+// drainPending waits for all in-flight requests to complete before returning.
+// This is used during graceful shutdown when connection lifetime expires,
+// ensuring pending requests get their responses before the connection closes.
+func (c *NNTPConnection) drainPending() {
+	slots := cap(c.inflightSem)
+	for i := 0; i < slots; i++ {
+		select {
+		case c.inflightSem <- struct{}{}:
+			// Acquired a slot, continue
+		case <-c.ctx.Done():
+			return
+		}
+	}
+	// All slots acquired = no in-flight requests, safe to close
 }
 
 func (c *NNTPConnection) failOutstanding() {
@@ -229,6 +256,7 @@ func (c *NNTPConnection) Run() {
 					timer.Stop()
 				}
 				<-c.inflightSem
+				c.drainPending()
 				return
 			}
 			lifeTimer = time.NewTimer(remaining)
@@ -263,6 +291,7 @@ func (c *NNTPConnection) Run() {
 				timer.Stop()
 			}
 			<-c.inflightSem
+			c.drainPending()
 			return
 		}
 		if !ok {
