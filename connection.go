@@ -311,6 +311,11 @@ func (c *NNTPConnection) Run() {
 		select {
 		case <-req.Ctx.Done():
 			<-c.inflightSem
+			// Send cancellation error so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: req.Ctx.Err(), Request: req}:
+			default:
+			}
 			close(req.RespCh)
 			continue
 		default:
