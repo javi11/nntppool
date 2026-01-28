@@ -176,6 +176,11 @@ func (c *NNTPConnection) failOutstanding() {
 				if req == nil {
 					continue
 				}
+				// Send error response so caller can distinguish from successful completion
+				select {
+				case req.RespCh <- Response{Err: context.Canceled, Request: req}:
+				default:
+				}
 				internal.SafeClose(req.RespCh)
 				// Best-effort inflight release (not strictly needed once we're shutting down).
 				select {

@@ -3,6 +3,7 @@ package nntppool
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,9 @@ import (
 )
 
 const sendRequestTimeout = 5 * time.Second
+
+// ErrProviderClosed is returned when a request is made to a closed provider.
+var ErrProviderClosed = errors.New("provider closed")
 
 type ProviderMetrics struct {
 	Host              string
@@ -299,6 +303,11 @@ func (c *Provider) Close() error {
 	// Drain any queued requests to prevent caller hangs
 	for req := range c.reqCh {
 		if req != nil && req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: ErrProviderClosed, Request: req}:
+			default:
+			}
 			close(req.RespCh)
 		}
 	}
@@ -352,8 +361,13 @@ func (c *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 }
 
 func (c *Provider) SendRequest(req *Request) <-chan Response {
-	closeAndReturn := func() <-chan Response {
+	closeWithError := func(err error) <-chan Response {
 		if req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: err, Request: req}:
+			default:
+			}
 			close(req.RespCh)
 		}
 		return req.RespCh
@@ -361,7 +375,7 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 
 	// Fast path: provider already closed
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
 	}
 
 	// Trigger lazy connection growth
@@ -379,7 +393,7 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	defer c.closeMu.Unlock()
 
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
 	}
 
 	timeout := time.NewTimer(sendRequestTimeout)
@@ -387,9 +401,9 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 
 	select {
 	case <-c.ctx.Done():
-		return closeAndReturn()
+		return closeWithError(c.ctx.Err())
 	case <-req.Ctx.Done():
-		return closeAndReturn()
+		return closeWithError(req.Ctx.Err())
 	case c.reqCh <- req:
 		return req.RespCh
 	case <-timeout.C:
