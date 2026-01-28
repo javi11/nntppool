@@ -3,6 +3,7 @@ package nntppool
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,11 @@ import (
 	"github.com/javi11/nntppool/v3/internal"
 	"golang.org/x/net/proxy"
 )
+
+const sendRequestTimeout = 5 * time.Second
+
+// ErrProviderClosed is returned when a request is made to a closed provider.
+var ErrProviderClosed = errors.New("provider closed")
 
 type ProviderMetrics struct {
 	Host              string
@@ -260,9 +266,28 @@ func (c *Provider) addConnection(syncMode bool) error {
 		defer c.wg.Done()
 		defer atomic.AddInt32(&c.connCount, -1)
 		w.Run()
+		// Remove connection from slice after it exits
+		c.removeConnection(w)
 	}()
 
 	return nil
+}
+
+// removeConnection removes a connection from the conns slice.
+// Called when a connection exits (lifetime, idle, error).
+func (c *Provider) removeConnection(conn *NNTPConnection) {
+	c.connsMu.Lock()
+	defer c.connsMu.Unlock()
+
+	for i, cc := range c.conns {
+		if cc == conn {
+			// Remove by swapping with last element and truncating
+			c.conns[i] = c.conns[len(c.conns)-1]
+			c.conns[len(c.conns)-1] = nil // Clear reference for GC
+			c.conns = c.conns[:len(c.conns)-1]
+			return
+		}
+	}
 }
 
 // Close cancels the provider, closes its request channel, and waits for all connections to stop.
@@ -275,6 +300,17 @@ func (c *Provider) Close() error {
 
 	c.closeMu.Lock()
 	close(c.reqCh)
+	// Drain any queued requests to prevent caller hangs
+	for req := range c.reqCh {
+		if req != nil && req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: ErrProviderClosed, Request: req}:
+			default:
+			}
+			close(req.RespCh)
+		}
+	}
 	c.closeMu.Unlock()
 
 	c.connsMu.Lock()
@@ -296,13 +332,13 @@ func (c *Provider) Date(ctx context.Context) error {
 		return ctx.Err()
 	case resp, ok := <-ch:
 		if !ok {
-			return fmt.Errorf("response channel closed unexpectedly")
+			return fmt.Errorf("DATE: response channel closed")
 		}
 		if resp.Err != nil {
 			return resp.Err
 		}
 		if resp.StatusCode != 111 {
-			return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+			return fmt.Errorf("DATE: unexpected status code %d: %s", resp.StatusCode, resp.Status)
 		}
 		return nil
 	}
@@ -325,8 +361,13 @@ func (c *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 }
 
 func (c *Provider) SendRequest(req *Request) <-chan Response {
-	closeAndReturn := func() <-chan Response {
+	closeWithError := func(err error) <-chan Response {
 		if req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: err, Request: req}:
+			default:
+			}
 			close(req.RespCh)
 		}
 		return req.RespCh
@@ -334,13 +375,16 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 
 	// Fast path: provider already closed
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
 	}
 
 	// Trigger lazy connection growth
 	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
 		go func() {
-			_ = c.addConnection(false)
+			err := c.addConnection(false)
+			if err != nil {
+				req.RespCh <- Response{Err: err}
+			}
 		}()
 	}
 
@@ -349,15 +393,24 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	defer c.closeMu.Unlock()
 
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
 	}
+
+	timeout := time.NewTimer(sendRequestTimeout)
+	defer timeout.Stop()
 
 	select {
 	case <-c.ctx.Done():
-		return closeAndReturn()
+		return closeWithError(c.ctx.Err())
 	case <-req.Ctx.Done():
-		return closeAndReturn()
+		return closeWithError(req.Ctx.Err())
 	case c.reqCh <- req:
+		return req.RespCh
+	case <-timeout.C:
+		if req.RespCh != nil {
+			req.RespCh <- Response{Err: fmt.Errorf("send request timeout after %v", sendRequestTimeout)}
+			close(req.RespCh)
+		}
 		return req.RespCh
 	}
 }

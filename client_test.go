@@ -26,6 +26,9 @@ func TestClientHotswapProviders(t *testing.T) {
 			if strings.HasPrefix(cmd, "BODY") {
 				return "222 0 <id> body follows\r\nline1\r\nline2\r\n.\r\n", nil
 			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			if cmd == "QUIT\r\n" {
 				return "205 Bye\r\n", nil
 			}
@@ -45,7 +48,10 @@ func TestClientHotswapProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create p1: %v", err)
 	}
-	client.AddProvider(p1, ProviderPrimary)
+	err = client.AddProvider(p1, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p1: %v", err)
+	}
 
 	// 2. Start load
 	ctx, cancel := context.WithCancel(context.Background())
@@ -102,6 +108,9 @@ func TestClientHotswapProviders(t *testing.T) {
 			if strings.HasPrefix(cmd, "BODY") {
 				return "222 0 <id> body follows\r\nline1\r\nline2\r\n.\r\n", nil
 			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			if cmd == "QUIT\r\n" {
 				return "205 Bye\r\n", nil
 			}
@@ -121,11 +130,17 @@ func TestClientHotswapProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create p2: %v", err)
 	}
-	client.AddProvider(p2, ProviderPrimary)
+	err = client.AddProvider(p2, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p2: %v", err)
+	}
 
 	// 4. Remove Provider A
 	time.Sleep(50 * time.Millisecond)
-	client.RemoveProvider(p1)
+	err = client.RemoveProvider(p1)
+	if err != nil {
+		t.Fatalf("failed to remove p1: %v", err)
+	}
 
 	// 5. Verify flow continues
 	startSuccess := atomic.LoadInt64(&successCount)
@@ -184,7 +199,10 @@ func TestClientHealthCheck(t *testing.T) {
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	// Verify initially active
 	primaries := client.primaries.Load().([]*Provider)
@@ -229,6 +247,9 @@ func TestClientHealthCheck(t *testing.T) {
 func TestClientRemoveProvider(t *testing.T) {
 	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
 		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			return "500 Unknown Command\r\n", nil
 		},
 	})
@@ -244,8 +265,14 @@ func TestClientRemoveProvider(t *testing.T) {
 		Address: "p2.example.com:119", MaxConnections: 1, ConnFactory: mockDial,
 	})
 
-	client.AddProvider(p1, ProviderPrimary)
-	client.AddProvider(p2, ProviderBackup)
+	err := client.AddProvider(p1, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p1: %v", err)
+	}
+	err = client.AddProvider(p2, ProviderBackup)
+	if err != nil {
+		t.Fatalf("failed to add p2: %v", err)
+	}
 
 	// Verify they are added
 	if len(client.primaries.Load().([]*Provider)) != 1 {
@@ -256,7 +283,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	}
 
 	// Remove p1 (primary)
-	client.RemoveProvider(p1)
+	err = client.RemoveProvider(p1)
+	if err != nil {
+		t.Fatalf("failed to remove p1: %v", err)
+	}
 
 	// Verify p1 removed and closed
 	if len(client.primaries.Load().([]*Provider)) != 0 {
@@ -267,7 +297,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	}
 
 	// Remove p2 (backup)
-	client.RemoveProvider(p2)
+	err = client.RemoveProvider(p2)
+	if err != nil {
+		t.Fatalf("failed to remove p2: %v", err)
+	}
 
 	// Verify p2 removed and closed
 	if len(client.backups.Load().([]*Provider)) != 0 {
@@ -281,7 +314,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	p3, _ := NewProvider(context.Background(), ProviderConfig{
 		Address: "p3.example.com:119", MaxConnections: 1, ConnFactory: mockDial,
 	})
-	client.AddProvider(p3, ProviderPrimary)
+	err = client.AddProvider(p3, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p3: %v", err)
+	}
 
 	// Manually move to dead for testing
 	client.mu.Lock()
@@ -289,7 +325,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	client.deadPrimaries = append(client.deadPrimaries, p3)
 	client.mu.Unlock()
 
-	client.RemoveProvider(p3)
+	err = client.RemoveProvider(p3)
+	if err != nil {
+		t.Fatalf("failed to remove p3: %v", err)
+	}
 
 	client.mu.Lock()
 	if len(client.deadPrimaries) != 0 {
@@ -344,7 +383,10 @@ func TestClientBodyAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	wa := &mockWriterAt{}
 	err = client.BodyAt(context.Background(), "123", wa)
@@ -389,7 +431,10 @@ func TestClientSpeedTest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	// 3. Run SpeedTest
 	articles := []string{"1", "2", "3", "4", "5"}
@@ -440,7 +485,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Call BodyReader
 		reader, err := client.BodyReader(context.Background(), "123")
@@ -487,6 +535,9 @@ func TestClientBodyReader(t *testing.T) {
 					yencBody := testutil.EncodeYencMultiPart(originalData, filename, 2, 5, 1, int64(len(originalData)))
 					return fmt.Sprintf("222 0 <id> body follows\r\n%s.\r\n", yencBody), nil
 				}
+				if cmd == "DATE\r\n" {
+					return "111 20240101000000\r\n", nil
+				}
 				return "500 Unknown Command\r\n", nil
 			},
 		})
@@ -507,7 +558,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Call BodyReader
 		reader, err := client.BodyReader(context.Background(), "123")
@@ -621,7 +675,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Create cancellable context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -678,7 +735,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Call BodyReader
 		reader, err := client.BodyReader(context.Background(), "123")
@@ -716,6 +776,9 @@ func setupPostClient(t *testing.T, id string, onArticle func(string)) (*Client, 
 			if cmd == "POST\r\n" {
 				return "340 Send article to be posted\r\n", nil
 			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			if strings.Contains(cmd, "Subject:") || strings.Contains(cmd, "=ybegin") {
 				if onArticle != nil {
 					onArticle(cmd)
@@ -740,7 +803,10 @@ func setupPostClient(t *testing.T, id string, onArticle func(string)) (*Client, 
 	}
 
 	client := NewClient(10)
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	return client, func() {
 		client.Close()
@@ -934,6 +1000,9 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 			if cmd == "POST\r\n" {
 				return "340 Send article to be posted\r\n", nil
 			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			if strings.Contains(cmd, "=ybegin") {
 				msgID := extractMessageID(cmd)
 				mu.Lock()
@@ -972,7 +1041,10 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 	}
 
 	client := NewClient(10)
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	return client, func() {
 		client.Close()
@@ -1018,7 +1090,10 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	// Start a slow request to fill the semaphore
 	slowDone := make(chan struct{})

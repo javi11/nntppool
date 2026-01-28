@@ -11,6 +11,9 @@ func SuccessfulBodyHandler(content string) Handler {
 		if strings.HasPrefix(cmd, "BODY") {
 			return fmt.Sprintf("222 0 <id> body follows\r\n%s\r\n.\r\n", content), nil
 		}
+		if cmd == "DATE\r\n" {
+			return "111 20240101000000\r\n", nil
+		}
 		if strings.HasPrefix(cmd, "QUIT") {
 			return "205 Bye\r\n", nil
 		}
@@ -25,6 +28,9 @@ func YencBodyHandler(data []byte, filename string) Handler {
 		if strings.HasPrefix(cmd, "BODY") {
 			return fmt.Sprintf("222 0 <id> body follows\r\n%s.\r\n", yencBody), nil
 		}
+		if cmd == "DATE\r\n" {
+			return "111 20240101000000\r\n", nil
+		}
 		if strings.HasPrefix(cmd, "QUIT") {
 			return "205 Bye\r\n", nil
 		}
@@ -37,6 +43,9 @@ func NotFoundHandler() Handler {
 	return func(cmd string) (string, error) {
 		if strings.HasPrefix(cmd, "BODY") || strings.HasPrefix(cmd, "ARTICLE") {
 			return "430 No Such Article\r\n", nil
+		}
+		if cmd == "DATE\r\n" {
+			return "111 20240101000000\r\n", nil
 		}
 		if strings.HasPrefix(cmd, "QUIT") {
 			return "205 Bye\r\n", nil
