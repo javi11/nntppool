@@ -408,12 +408,15 @@ func (c *NNTPConnection) readerLoop() {
 		resp.Lines = decoder.Lines
 		resp.Meta = decoder
 
-		if deliver {
-			// Best effort: don't block forever if the receiver abandoned the channel.
-			select {
-			case req.RespCh <- resp:
-			default:
-			}
+		// Always send a response so caller can distinguish cancellation from provider failure.
+		// If request was cancelled mid-response, set the error to context.Canceled.
+		if !deliver {
+			resp.Err = context.Canceled
+		}
+		// Best effort: don't block forever if the receiver abandoned the channel.
+		select {
+		case req.RespCh <- resp:
+		default:
 		}
 		internal.SafeClose(req.RespCh)
 

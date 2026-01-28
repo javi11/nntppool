@@ -262,9 +262,28 @@ func (c *Provider) addConnection(syncMode bool) error {
 		defer c.wg.Done()
 		defer atomic.AddInt32(&c.connCount, -1)
 		w.Run()
+		// Remove connection from slice after it exits
+		c.removeConnection(w)
 	}()
 
 	return nil
+}
+
+// removeConnection removes a connection from the conns slice.
+// Called when a connection exits (lifetime, idle, error).
+func (c *Provider) removeConnection(conn *NNTPConnection) {
+	c.connsMu.Lock()
+	defer c.connsMu.Unlock()
+
+	for i, cc := range c.conns {
+		if cc == conn {
+			// Remove by swapping with last element and truncating
+			c.conns[i] = c.conns[len(c.conns)-1]
+			c.conns[len(c.conns)-1] = nil // Clear reference for GC
+			c.conns = c.conns[:len(c.conns)-1]
+			return
+		}
+	}
 }
 
 // Close cancels the provider, closes its request channel, and waits for all connections to stop.
