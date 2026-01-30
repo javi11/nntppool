@@ -10,6 +10,9 @@ import (
 	"github.com/mnightingale/rapidyenc"
 )
 
+// crlf is a package-level constant to avoid allocations in hot paths
+var crlf = []byte("\r\n")
+
 type NNTPResponse struct {
 	BytesDecoded  int
 	BytesConsumed int
@@ -74,14 +77,18 @@ func (r *NNTPResponse) decode(buf []byte, out io.Writer) (read int, err error) {
 	// Line by line processing
 	if !r.body {
 		var line []byte
-		var found bool
 		for {
-			if line, buf, found = bytes.Cut(buf, []byte("\r\n")); !found {
+			// Manual indexing is faster than bytes.Cut for hot paths
+			idx := bytes.Index(buf, crlf)
+			if idx == -1 {
 				break
 			}
-			read += len(line) + 2
+			line = buf[:idx]
+			buf = buf[idx+2:]
+			read += idx + 2
 
-			if bytes.Equal(line, []byte(".")) {
+			// Check for terminator (single dot)
+			if len(line) == 1 && line[0] == '.' {
 				r.eof = true
 				break
 			}

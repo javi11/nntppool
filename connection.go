@@ -370,6 +370,7 @@ func (c *NNTPConnection) readerLoop() {
 			Request: req,
 		}
 		decoder := NNTPResponse{
+			Lines:        make([]string, 0, 8), // Pre-allocate for typical response
 			OnYencHeader: req.OnYencHeader,
 		}
 

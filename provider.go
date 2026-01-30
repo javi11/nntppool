@@ -60,8 +60,8 @@ type Provider struct {
 	connCount int32
 	config    ProviderConfig
 
-	closed  atomic.Bool
-	closeMu sync.Mutex
+	closed atomic.Bool
+	sendWg sync.WaitGroup // Tracks in-flight SendRequest calls for safe channel close
 
 	// Metrics
 	bytesRead    uint64
@@ -276,6 +276,11 @@ func (c *Provider) addConnection(syncMode bool) error {
 // removeConnection removes a connection from the conns slice.
 // Called when a connection exits (lifetime, idle, error).
 func (c *Provider) removeConnection(conn *NNTPConnection) {
+	// Flush any accumulated metrics before removing
+	if mc, ok := conn.conn.(*internal.MeteredConn); ok {
+		mc.Flush()
+	}
+
 	c.connsMu.Lock()
 	defer c.connsMu.Unlock()
 
@@ -298,7 +303,10 @@ func (c *Provider) Close() error {
 
 	c.cancel()
 
-	c.closeMu.Lock()
+	// Wait for all in-flight SendRequest calls to complete before closing channel.
+	// This prevents the race between sending on reqCh and closing it.
+	c.sendWg.Wait()
+
 	close(c.reqCh)
 	// Drain any queued requests to prevent caller hangs
 	for req := range c.reqCh {
@@ -311,7 +319,6 @@ func (c *Provider) Close() error {
 			close(req.RespCh)
 		}
 	}
-	c.closeMu.Unlock()
 
 	c.connsMu.Lock()
 	for _, cc := range c.conns {
@@ -388,10 +395,11 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		}()
 	}
 
-	// Synchronize with Close() to prevent send-on-closed-channel
-	c.closeMu.Lock()
-	defer c.closeMu.Unlock()
+	// Track this send operation so Close() can wait for us
+	c.sendWg.Add(1)
+	defer c.sendWg.Done()
 
+	// Re-check closed after adding to wait group
 	if c.closed.Load() {
 		return closeWithError(ErrProviderClosed)
 	}
@@ -407,10 +415,6 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	case c.reqCh <- req:
 		return req.RespCh
 	case <-timeout.C:
-		if req.RespCh != nil {
-			req.RespCh <- Response{Err: fmt.Errorf("send request timeout after %v", sendRequestTimeout)}
-			close(req.RespCh)
-		}
-		return req.RespCh
+		return closeWithError(fmt.Errorf("send request timeout after %v", sendRequestTimeout))
 	}
 }
