@@ -14,8 +14,8 @@ const (
 	MaxReadBufSize     = 8 * 1024 * 1024
 
 	// DefaultReadTimeout is used when no context deadline is set.
-	// Prevents indefinite hangs on stalled connections.
-	DefaultReadTimeout = 5 * time.Minute
+	// Prevents indefinite hangs on stalled connections (e.g., after laptop sleep).
+	DefaultReadTimeout = 60 * time.Second
 )
 
 type ReadBuffer struct {

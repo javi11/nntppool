@@ -80,6 +80,10 @@ func ApplyConnOptimizations(conn net.Conn, tlsConfig *tls.Config) (net.Conn, err
 		_ = tcpConn.SetReadBuffer(8 * 1024 * 1024)
 		// 1MB send buffer
 		_ = tcpConn.SetWriteBuffer(1024 * 1024)
+		// Enable TCP keepalive to detect dead connections after laptop sleep/idle.
+		// OS sends probe packets every 30s; connection marked dead after ~8-9 failed probes.
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	if tlsConfig != nil {
