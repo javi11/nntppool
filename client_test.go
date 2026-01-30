@@ -1225,3 +1225,85 @@ func TestPostYencRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// TestWriterClosedEarlyConnectionReused verifies that when a user closes their
+// writer early (e.g., io.Pipe reader), the connection drains the response and
+// stays alive for subsequent requests.
+func TestWriterClosedEarlyConnectionReused(t *testing.T) {
+	requestCount := atomic.Int32{}
+	originalData := []byte("hello world! this is test data for the closed pipe test")
+
+	// Setup mock server that returns yEnc-encoded responses (which get written to the output)
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if strings.HasPrefix(cmd, "BODY") {
+				requestCount.Add(1)
+				// Use yEnc so the data actually gets written to the output writer
+				yencBody := testutil.EncodeYenc(originalData, "test.txt", 1, 1)
+				return fmt.Sprintf("222 0 <id> body follows\r\n%s.\r\n", yencBody), nil
+			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer cleanup()
+
+	// Setup client with single connection to verify reuse
+	client := NewClient(10)
+	defer client.Close()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:        srv.Addr(),
+		MaxConnections: 1, // Single connection to verify reuse
+		ConnFactory:    dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	if err := client.AddProvider(p, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Use io.Pipe so we can close the reader early
+	pr, pw := io.Pipe()
+
+	// Close the reader immediately to trigger io.ErrClosedPipe on write
+	pr.Close()
+
+	// Make a request that will try to write to the closed pipe
+	err = client.Body(context.Background(), "123", pw)
+
+	// Should get io.ErrClosedPipe (the original error)
+	if err == nil {
+		t.Fatal("expected error when writer is closed, got nil")
+	}
+	if err != io.ErrClosedPipe {
+		t.Errorf("expected io.ErrClosedPipe, got: %v (type %T)", err, err)
+	}
+
+	pw.Close()
+
+	// Now make another request - the connection should still be alive
+	var buf bytes.Buffer
+	err = client.Body(context.Background(), "456", &buf)
+	if err != nil {
+		t.Fatalf("second request failed (connection should have been reused): %v", err)
+	}
+
+	// Verify both requests were served (connection was reused)
+	if got := requestCount.Load(); got != 2 {
+		t.Errorf("expected 2 requests, got %d", got)
+	}
+
+	// Verify second request got data
+	if buf.Len() == 0 {
+		t.Error("expected data from second request")
+	}
+}

@@ -411,7 +411,12 @@ func (c *NNTPConnection) readerLoop() {
 			return req.Ctx.Deadline()
 		})
 		_ = c.conn.SetReadDeadline(time.Time{})
-		if err != nil {
+
+		// Check for write errors (user closed their writer)
+		// Prioritize write errors - response was drained but write failed
+		if writeErr := outRef.Err(); writeErr != nil {
+			resp.Err = writeErr // Return original error (e.g., io.ErrClosedPipe)
+		} else if err != nil {
 			resp.Err = err
 		}
 
@@ -436,10 +441,14 @@ func (c *NNTPConnection) readerLoop() {
 		<-c.inflightSem
 
 		// If we hit a network error or IO error, close the connection.
-		// Don't close on context.Canceled - that's just a cancelled request, not a connection problem.
+		// Don't close on:
+		// - context.Canceled: just a cancelled request, not a connection problem
+		// - io.ErrClosedPipe: user closed their writer early, response was drained successfully
 		// This is critical for pipelining: if one request is cancelled (e.g., reader moved to next segment),
 		// we don't want to kill the connection and fail all other pipelined requests.
-		if resp.Err != nil && !errors.Is(resp.Err, context.Canceled) {
+		if resp.Err != nil &&
+			!errors.Is(resp.Err, context.Canceled) &&
+			!errors.Is(resp.Err, io.ErrClosedPipe) {
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
