@@ -376,7 +376,20 @@ func (c *Client) sendRequest(req *Request) {
 			}
 
 			ch := p.SendRequest(subReq)
-			resp, ok := <-ch
+
+			// Wait for response with context awareness to prevent indefinite blocking
+			var resp Response
+			var ok bool
+			select {
+			case resp, ok = <-ch:
+				// Got response from provider
+			case <-req.Ctx.Done():
+				// Context cancelled while waiting for response
+				// The request is already sent to provider, but we should not block indefinitely
+				lastErr = req.Ctx.Err()
+				continue
+			}
+
 			if !ok {
 				lastErr = fmt.Errorf("provider %s closed unexpectedly", p.Host)
 				continue

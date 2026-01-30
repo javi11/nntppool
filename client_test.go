@@ -1309,6 +1309,314 @@ func TestWriterClosedEarlyConnectionReused(t *testing.T) {
 	}
 }
 
+// TestClientResponseTimeoutDoesNotHang verifies that when a provider is slow to respond,
+// the client respects the context timeout and does not hang indefinitely.
+// This tests the fix for the unbounded response wait in tryProviders.
+func TestClientResponseTimeoutDoesNotHang(t *testing.T) {
+	// Create a provider that accepts requests quickly but responds slowly
+	requestReceived := make(chan struct{})
+	slowResponseCh := make(chan struct{})
+
+	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				// Signal that request was received
+				close(requestReceived)
+				// Wait for the slow response signal (simulating slow network)
+				<-slowResponseCh
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	client := NewClient(10)
+	defer client.Close()
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "example.com:119",
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           mockDial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Create a context with short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Track when request completes
+	doneCh := make(chan error, 1)
+	go func() {
+		err := client.Body(ctx, "123", io.Discard)
+		doneCh <- err
+	}()
+
+	// Wait for the request to be received by server
+	select {
+	case <-requestReceived:
+		// Good, request reached the server
+	case <-time.After(5 * time.Second):
+		close(slowResponseCh)
+		t.Fatal("timeout waiting for request to be received")
+	}
+
+	// Now wait for the client to timeout (should happen within 200ms + some buffer)
+	select {
+	case err := <-doneCh:
+		// Request completed - should be some kind of timeout/cancellation error
+		// The important thing is that the request completed without hanging
+		if err == nil {
+			t.Error("expected timeout-related error, got nil")
+		} else {
+			// Accept context deadline exceeded or timeout-related errors
+			// The fix ensures the request doesn't hang - the exact error type
+			// depends on what layer times out first (context or network)
+			t.Logf("request completed with error: %v (this is expected)", err)
+		}
+	case <-time.After(2 * time.Second):
+		// If we get here, the fix didn't work - the client is hanging
+		t.Fatal("client hung waiting for slow provider response - fix not working")
+	}
+
+	// Cleanup - unblock the server
+	close(slowResponseCh)
+}
+
+// TestClientFallbackWhenPrimarySlowToRespond verifies that when a primary provider
+// is slow to respond, the client respects the context timeout and doesn't hang.
+// In this implementation, we try providers sequentially, so a slow primary will
+// cause a timeout before we can try the backup.
+func TestClientFallbackWhenPrimarySlowToRespond(t *testing.T) {
+	// Primary provider: accepts immediately but responds slowly
+	primaryRequestReceived := make(chan struct{})
+	primarySlowResponseCh := make(chan struct{})
+
+	primaryMock := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				close(primaryRequestReceived)
+				<-primarySlowResponseCh
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	// Backup provider: responds quickly
+	var backupUsed atomic.Bool
+	backupMock := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				backupUsed.Store(true)
+				return "222 0 <id> body follows\r\nbackup-data\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	client := NewClient(10)
+	defer client.Close()
+
+	primary, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "primary.example.com:119",
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           primaryMock,
+	})
+	if err != nil {
+		t.Fatalf("failed to create primary provider: %v", err)
+	}
+
+	backup, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "backup.example.com:119",
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           backupMock,
+	})
+	if err != nil {
+		t.Fatalf("failed to create backup provider: %v", err)
+	}
+
+	err = client.AddProvider(primary, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add primary provider: %v", err)
+	}
+	err = client.AddProvider(backup, ProviderBackup)
+	if err != nil {
+		t.Fatalf("failed to add backup provider: %v", err)
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	doneCh := make(chan error, 1)
+	go func() {
+		err := client.Body(ctx, "123", io.Discard)
+		doneCh <- err
+	}()
+
+	// Wait for request to reach primary
+	select {
+	case <-primaryRequestReceived:
+		// Good
+	case <-time.After(5 * time.Second):
+		close(primarySlowResponseCh)
+		t.Fatal("timeout waiting for request to reach primary")
+	}
+
+	// Wait for request to complete (via timeout or backup)
+	select {
+	case err := <-doneCh:
+		// The request should have timed out since primary is slow
+		// and we don't get to try backup until primary times out
+		if err == nil {
+			// If backup was used, that's fine too
+			if backupUsed.Load() {
+				t.Log("backup provider was used successfully")
+			}
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			// This is the expected behavior - primary was slow, context timed out
+			t.Log("context deadline exceeded as expected (primary was too slow)")
+		} else {
+			t.Errorf("unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client hung - should have respected context timeout")
+	}
+
+	// Cleanup
+	close(primarySlowResponseCh)
+}
+
+// TestSemaphoreReleasedOnContextCancellation verifies that the semaphore is properly
+// released when a context is cancelled while waiting for a provider response.
+// This prevents semaphore exhaustion and ensures subsequent requests can proceed.
+func TestSemaphoreReleasedOnContextCancellation(t *testing.T) {
+	// Create a provider that will be slow to respond
+	slowResponseCh := make(chan struct{})
+	var requestsStarted atomic.Int32
+
+	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				requestsStarted.Add(1)
+				<-slowResponseCh
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	// Create client with maxInflight=2
+	client := NewClient(2)
+	defer client.Close()
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "example.com:119",
+		MaxConnections:        2,
+		InflightPerConnection: 1,
+		ConnFactory:           mockDial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Start two requests that will use up the semaphore
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel1()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+
+	done1 := make(chan struct{})
+	done2 := make(chan struct{})
+
+	go func() {
+		_ = client.Body(ctx1, "1", io.Discard)
+		close(done1)
+	}()
+	go func() {
+		_ = client.Body(ctx2, "2", io.Discard)
+		close(done2)
+	}()
+
+	// Wait for both requests to start
+	timeout := time.After(5 * time.Second)
+	for requestsStarted.Load() < 2 {
+		select {
+		case <-timeout:
+			close(slowResponseCh)
+			t.Fatal("timeout waiting for requests to start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Wait for both contexts to timeout and goroutines to complete
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not complete after context timeout")
+	}
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second request did not complete after context timeout")
+	}
+
+	// Now try a third request - the semaphore should have been released
+	// If semaphore was NOT released, this would hang
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel3()
+
+	done3 := make(chan error, 1)
+	go func() {
+		err := client.Body(ctx3, "3", io.Discard)
+		done3 <- err
+	}()
+
+	select {
+	case err := <-done3:
+		// We expect this to also timeout (since server is still slow)
+		// but the important thing is it didn't hang waiting for semaphore
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Log("third request completed with context timeout - semaphore was properly released")
+		} else if err != nil {
+			t.Logf("third request completed with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("third request hung - semaphore may not have been released")
+	}
+
+	// Cleanup
+	close(slowResponseCh)
+}
+
 // TestOrphanedRequestsDrainedOnConnectionFailure verifies that requests
 // queued in the provider's reqCh are drained with ErrProviderUnavailable
 // when all connections die, preventing callers from hanging indefinitely.
