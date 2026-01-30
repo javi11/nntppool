@@ -12,6 +12,10 @@ const (
 	// 1MB matches TCP receive buffer better for high-throughput connections.
 	DefaultReadBufSize = 1 * 1024 * 1024
 	MaxReadBufSize     = 8 * 1024 * 1024
+
+	// DefaultReadTimeout is used when no context deadline is set.
+	// Prevents indefinite hangs on stalled connections.
+	DefaultReadTimeout = 5 * time.Minute
 )
 
 type ReadBuffer struct {
@@ -109,11 +113,21 @@ func (rb *ReadBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bo
 func (rb *ReadBuffer) FeedUntilDone(conn net.Conn, feeder StreamFeeder, out io.Writer, deadline func() (time.Time, bool)) error {
 	rb.Init()
 
+	// Helper to get deadline, using default timeout if none provided
+	getDeadline := func() (time.Time, bool) {
+		dl, ok := deadline()
+		if ok {
+			return dl, true
+		}
+		// No context deadline - use default timeout to prevent indefinite hangs
+		return time.Now().Add(DefaultReadTimeout), true
+	}
+
 	for {
 		// Ensure we have some bytes to feed.
 		if rb.start == rb.end {
 			rb.start, rb.end = 0, 0
-			dl, ok := deadline()
+			dl, ok := getDeadline()
 			if _, err := rb.readMore(conn, dl, ok); err != nil {
 				return err
 			}
@@ -141,7 +155,7 @@ func (rb *ReadBuffer) FeedUntilDone(conn net.Conn, feeder StreamFeeder, out io.W
 			}
 		}
 
-		dl, ok := deadline()
+		dl, ok := getDeadline()
 		if _, err := rb.readMore(conn, dl, ok); err != nil {
 			return err
 		}

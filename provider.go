@@ -385,14 +385,9 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		return closeWithError(ErrProviderClosed)
 	}
 
-	// Trigger lazy connection growth
+	// Trigger lazy connection growth (errors are ignored - request will use existing connections or timeout)
 	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
-		go func() {
-			err := c.addConnection(false)
-			if err != nil {
-				req.RespCh <- Response{Err: err}
-			}
-		}()
+		go c.addConnection(false)
 	}
 
 	// Track this send operation so Close() can wait for us
