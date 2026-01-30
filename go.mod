@@ -3,9 +3,11 @@ module github.com/javi11/nntppool/v3
 go 1.25.1
 
 require (
+	github.com/avast/retry-go/v4 v4.7.0
 	github.com/javi11/nzbparser v0.5.4
 	github.com/mnightingale/rapidyenc v0.0.0-20251128204712-7aafef1eaf1c
 	github.com/schollz/progressbar/v3 v3.19.0
+	github.com/sourcegraph/conc v0.3.0
 	github.com/spf13/pflag v1.0.10
 	golang.org/x/net v0.49.0
 )
@@ -38,7 +40,6 @@ require (
 	github.com/alingse/nilnesserr v0.2.0 // indirect
 	github.com/ashanbrown/forbidigo/v2 v2.3.0 // indirect
 	github.com/ashanbrown/makezero/v2 v2.1.0 // indirect
-	github.com/avast/retry-go/v4 v4.7.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bkielbasa/cyclop v1.2.3 // indirect
@@ -175,7 +176,6 @@ require (
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/sivchari/containedctx v1.0.3 // indirect
 	github.com/sonatard/noctx v0.4.0 // indirect
-	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/sourcegraph/go-diff v0.7.0 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.5.0 // indirect

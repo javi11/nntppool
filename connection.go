@@ -3,6 +3,7 @@ package nntppool
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -435,7 +436,10 @@ func (c *NNTPConnection) readerLoop() {
 		<-c.inflightSem
 
 		// If we hit a network error or IO error, close the connection.
-		if resp.Err != nil {
+		// Don't close on context.Canceled - that's just a cancelled request, not a connection problem.
+		// This is critical for pipelining: if one request is cancelled (e.g., reader moved to next segment),
+		// we don't want to kill the connection and fail all other pipelined requests.
+		if resp.Err != nil && !errors.Is(resp.Err, context.Canceled) {
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
