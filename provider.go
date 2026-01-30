@@ -21,6 +21,10 @@ const sendRequestTimeout = 5 * time.Second
 // ErrProviderClosed is returned when a request is made to a closed provider.
 var ErrProviderClosed = errors.New("provider closed")
 
+// ErrProviderUnavailable is returned when all connections to a provider have failed.
+// This error is retryable - the client should try other providers or retry later.
+var ErrProviderUnavailable = errors.New("provider unavailable: all connections failed")
+
 type ProviderMetrics struct {
 	Host              string
 	ActiveConnections int
@@ -62,6 +66,12 @@ type Provider struct {
 
 	closed atomic.Bool
 	sendWg sync.WaitGroup // Tracks in-flight SendRequest calls for safe channel close
+
+	// deadCh is closed when all connections die (connCount reaches 0)
+	// and reopened when a new connection is established.
+	// This allows SendRequest to immediately fail when provider is unavailable.
+	deadCh   chan struct{}
+	deadChMu sync.Mutex
 
 	// Metrics
 	bytesRead    uint64
@@ -165,6 +175,7 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 		reqCh:  make(chan *Request, config.MaxConnections),
 		conns:  make([]*NNTPConnection, 0, config.MaxConnections),
 		config: config,
+		deadCh: make(chan struct{}),
 	}
 
 	// Start metrics monitor
@@ -258,8 +269,14 @@ func (c *Provider) addConnection(syncMode bool) error {
 	}
 
 	c.connsMu.Lock()
+	wasEmpty := len(c.conns) == 0
 	c.conns = append(c.conns, w)
 	c.connsMu.Unlock()
+
+	// If this is the first connection after being dead, re-enable the provider
+	if wasEmpty {
+		c.signalAlive()
+	}
 
 	c.wg.Add(1)
 	go func() {
@@ -290,7 +307,66 @@ func (c *Provider) removeConnection(conn *NNTPConnection) {
 			c.conns[i] = c.conns[len(c.conns)-1]
 			c.conns[len(c.conns)-1] = nil // Clear reference for GC
 			c.conns = c.conns[:len(c.conns)-1]
-			return
+			break
+		}
+	}
+
+	// Check if this was the last connection - signal unavailability and drain
+	// so callers can retry with other providers or wait for reconnect
+	if len(c.conns) == 0 && !c.closed.Load() {
+		c.signalDead()
+		c.drainOrphanedRequests()
+	}
+}
+
+// signalDead closes deadCh to signal that provider is unavailable.
+// This unblocks any SendRequest calls waiting to send to reqCh.
+func (c *Provider) signalDead() {
+	c.deadChMu.Lock()
+	defer c.deadChMu.Unlock()
+	// Only close if not already closed (check by trying to receive)
+	select {
+	case <-c.deadCh:
+		// Already closed
+	default:
+		close(c.deadCh)
+	}
+}
+
+// signalAlive creates a new deadCh to allow SendRequest calls to proceed.
+// Called when a new connection is established after provider was dead.
+func (c *Provider) signalAlive() {
+	c.deadChMu.Lock()
+	defer c.deadChMu.Unlock()
+	// Only recreate if currently closed
+	select {
+	case <-c.deadCh:
+		// Was closed, recreate
+		c.deadCh = make(chan struct{})
+	default:
+		// Still open, nothing to do
+	}
+}
+
+// drainOrphanedRequests drains any requests from reqCh with ErrProviderUnavailable.
+// Called when all connections have died but the provider is not closed.
+// This allows callers to fail fast and retry with other providers.
+func (c *Provider) drainOrphanedRequests() {
+	for {
+		select {
+		case req := <-c.reqCh:
+			if req != nil && req.RespCh != nil {
+				select {
+				case req.RespCh <- Response{Err: ErrProviderUnavailable, Request: req}:
+				default:
+				}
+				internal.SafeClose(req.RespCh)
+			}
+			// Note: We don't call sendWg.Done() here because the request
+			// was already tracked and the caller's SendRequest defer already
+			// handled the Done() call when sending completed.
+		default:
+			return // Channel empty
 		}
 	}
 }
@@ -385,8 +461,16 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		return closeWithError(ErrProviderClosed)
 	}
 
-	// Trigger lazy connection growth (errors are ignored - request will use existing connections or timeout)
-	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+	// If provider has no connections, try to add one synchronously.
+	// This handles recovery from a dead state (all connections died).
+	if atomic.LoadInt32(&c.connCount) == 0 {
+		// Try to add a connection synchronously - this will call signalAlive() on success
+		if err := c.addConnection(false); err != nil {
+			// Connection failed - provider is truly unavailable
+			return closeWithError(ErrProviderUnavailable)
+		}
+	} else if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+		// Have some connections but not at max - grow asynchronously
 		go c.addConnection(false)
 	}
 
@@ -402,12 +486,21 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	timeout := time.NewTimer(sendRequestTimeout)
 	defer timeout.Stop()
 
+	// Get current deadCh - used to detect when all connections die while we're waiting
+	c.deadChMu.Lock()
+	deadCh := c.deadCh
+	c.deadChMu.Unlock()
+
 	select {
 	case <-c.ctx.Done():
 		return closeWithError(c.ctx.Err())
 	case <-req.Ctx.Done():
 		return closeWithError(req.Ctx.Err())
+	case <-deadCh:
+		// Provider became unavailable while we were waiting (all connections died)
+		return closeWithError(ErrProviderUnavailable)
 	case c.reqCh <- req:
+		// Request is now in the channel, waiting to be processed
 		return req.RespCh
 	case <-timeout.C:
 		return closeWithError(fmt.Errorf("send request timeout after %v", sendRequestTimeout))

@@ -33,8 +33,6 @@ type NNTPConnection struct {
 	done   chan struct{}
 	doneMu sync.Once
 
-	failMu sync.Once
-
 	maxIdleTime  time.Duration
 	lastActivity int64
 	maxLifeTime  time.Duration
@@ -170,29 +168,29 @@ func (c *NNTPConnection) drainPending() {
 }
 
 func (c *NNTPConnection) failOutstanding() {
-	c.failMu.Do(func() {
-		for {
-			select {
-			case req := <-c.pending:
-				if req == nil {
-					continue
-				}
-				// Send error response so caller can distinguish from successful completion
-				select {
-				case req.RespCh <- Response{Err: context.Canceled, Request: req}:
-				default:
-				}
-				internal.SafeClose(req.RespCh)
-				// Best-effort inflight release (not strictly needed once we're shutting down).
-				select {
-				case <-c.inflightSem:
-				default:
-				}
-			default:
-				return
+	// Note: This can be called multiple times (from readerLoop and from Run).
+	// Each call drains whatever is currently in pending.
+	for {
+		select {
+		case req := <-c.pending:
+			if req == nil {
+				continue
 			}
+			// Send error response so caller can distinguish from successful completion
+			select {
+			case req.RespCh <- Response{Err: context.Canceled, Request: req}:
+			default:
+			}
+			internal.SafeClose(req.RespCh)
+			// Best-effort inflight release (not strictly needed once we're shutting down).
+			select {
+			case <-c.inflightSem:
+			default:
+			}
+		default:
+			return
 		}
-	})
+	}
 }
 
 func (c *NNTPConnection) Close() error {

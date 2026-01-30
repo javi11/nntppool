@@ -3,6 +3,7 @@ package nntppool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1305,5 +1306,146 @@ func TestWriterClosedEarlyConnectionReused(t *testing.T) {
 	// Verify second request got data
 	if buf.Len() == 0 {
 		t.Error("expected data from second request")
+	}
+}
+
+// TestOrphanedRequestsDrainedOnConnectionFailure verifies that requests
+// queued in the provider's reqCh are drained with ErrProviderUnavailable
+// when all connections die, preventing callers from hanging indefinitely.
+func TestOrphanedRequestsDrainedOnConnectionFailure(t *testing.T) {
+	// Use a sync point to control when the connection dies
+	var requestsReceived atomic.Int32
+	firstRequestReceivedCh := make(chan struct{})
+	killConnectionCh := make(chan struct{})
+
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		ID: "orphan-test",
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				count := requestsReceived.Add(1)
+				// After first request received, signal and wait for kill signal
+				if count == 1 {
+					close(firstRequestReceivedCh)
+					// Wait for signal to kill connection
+					<-killConnectionCh
+					return "", io.EOF
+				}
+				// Subsequent requests (shouldn't happen if drain works)
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	var dialCount atomic.Int32
+	dial := func(ctx context.Context) (net.Conn, error) {
+		// Only allow 1 connection total to prevent lazy growth
+		if dialCount.Add(1) > 1 {
+			return nil, fmt.Errorf("simulated connection limit")
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with small buffer - MaxConnections determines reqCh buffer size
+	// But ConnFactory limits actual connections to 1
+	provider, err := NewProvider(context.Background(), ProviderConfig{
+		Address:            srv.Addr(),
+		MaxConnections:     5,  // reqCh buffer size
+		InitialConnections: 1,  // Only 1 actual connection (ConnFactory blocks more)
+		ConnFactory:        dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer provider.Close()
+
+	client := NewClient(100)
+	defer client.Close()
+
+	if err := client.AddProvider(provider, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Start a request that will hang until we signal it
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = client.Body(ctx, "first", io.Discard)
+	}()
+
+	// Wait for the first request to be received by the server (connection is now busy)
+	select {
+	case <-firstRequestReceivedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for first request to be received")
+	}
+
+	// Now queue more requests - these will be queued in reqCh
+	// because the single connection is busy processing the first request
+	numQueuedRequests := 5
+	queuedErrorsCh := make(chan error, numQueuedRequests)
+	for i := 0; i < numQueuedRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			err := client.Body(ctx, fmt.Sprintf("queued-%d", idx), io.Discard)
+			queuedErrorsCh <- err
+		}(i)
+	}
+
+	// Give time for requests to be queued in reqCh
+	// The 5 requests should fit in the buffer (size=5)
+	time.Sleep(2 * time.Second)
+
+	// Now kill the connection by signaling the server
+	close(killConnectionCh)
+	// The connection will see EOF when trying to read, causing it to exit
+	// This triggers removeConnection which should drain orphaned requests
+
+	// Wait for all requests to complete (should not hang forever)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - all requests completed without hanging
+	case <-time.After(15 * time.Second):
+		t.Fatal("requests did not complete within timeout - orphaned requests may not have been drained")
+	}
+
+	// Collect and verify queued request errors
+	close(queuedErrorsCh)
+	var unavailableCount, otherErrCount int
+	for err := range queuedErrorsCh {
+		if err != nil {
+			if errors.Is(err, ErrProviderUnavailable) {
+				unavailableCount++
+			} else {
+				otherErrCount++
+			}
+		}
+	}
+
+	// All queued requests should have gotten an error (not hung)
+	totalErrors := unavailableCount + otherErrCount
+	if totalErrors != numQueuedRequests {
+		t.Errorf("expected %d errors, got %d (unavailable=%d, other=%d)",
+			numQueuedRequests, totalErrors, unavailableCount, otherErrCount)
 	}
 }
