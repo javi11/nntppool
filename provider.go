@@ -471,7 +471,7 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		}
 	} else if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
 		// Have some connections but not at max - grow asynchronously
-		go c.addConnection(false)
+		go func() { _ = c.addConnection(false) }()
 	}
 
 	// Track this send operation so Close() can wait for us

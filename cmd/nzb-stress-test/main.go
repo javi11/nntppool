@@ -57,7 +57,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open NZB file: %v", err)
 	}
-	defer fileData.Close()
+	defer func() { _ = fileData.Close() }()
 
 	nzb, err := nzbparser.Parse(fileData)
 	if err != nil {
@@ -156,7 +156,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				defer pw.Close()
+				defer func() { _ = pw.Close() }()
 
 				downloadErr = downloadWithRetry(segCtx, client, seg.ID, pw, func() {
 					atomic.AddInt64(&retryCount, 1)
@@ -186,15 +186,15 @@ func main() {
 
 					// Simulate early close (reader doesn't need all data)
 					if shouldCancel && bytesRead > 1024 {
-						segCancel() // Cancel the download context
-						pr.Close()  // Close reader pipe
+						segCancel()    // Cancel the download context
+						_ = pr.Close() // Close reader pipe
 						break
 					}
 
 					// Partial read mode - close after reading some data
 					if readPartial && bytesRead > seg.Size/2 {
 						segCancel()
-						pr.Close()
+						_ = pr.Close()
 						break
 					}
 				}
@@ -280,10 +280,7 @@ func downloadWithRetry(ctx context.Context, client *nntppool.Client, msgID strin
 			}
 			// Check for article not found
 			var articleErr *nntppool.ArticleNotFoundError
-			if errors.As(err, &articleErr) {
-				return false
-			}
-			return true
+			return !errors.As(err, &articleErr)
 		}),
 		retry.OnRetry(func(n uint, err error) {
 			onRetry()

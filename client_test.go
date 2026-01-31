@@ -1276,7 +1276,7 @@ func TestWriterClosedEarlyConnectionReused(t *testing.T) {
 	pr, pw := io.Pipe()
 
 	// Close the reader immediately to trigger io.ErrClosedPipe on write
-	pr.Close()
+	_ = pr.Close()
 
 	// Make a request that will try to write to the closed pipe
 	err = client.Body(context.Background(), "123", pw)
@@ -1289,7 +1289,7 @@ func TestWriterClosedEarlyConnectionReused(t *testing.T) {
 		t.Errorf("expected io.ErrClosedPipe, got: %v (type %T)", err, err)
 	}
 
-	pw.Close()
+	_ = pw.Close()
 
 	// Now make another request - the connection should still be alive
 	var buf bytes.Buffer
@@ -1673,7 +1673,7 @@ func TestOrphanedRequestsDrainedOnConnectionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	defer provider.Close()
+	defer func() { _ = provider.Close() }()
 
 	client := NewClient(100)
 	defer client.Close()
