@@ -8,13 +8,28 @@ import (
 )
 
 const (
-	DefaultReadBufSize = 32 * 1024
+	// DefaultReadBufSize is the initial read buffer size.
+	// 1MB matches TCP receive buffer better for high-throughput connections.
+	DefaultReadBufSize = 1 * 1024 * 1024
 	MaxReadBufSize     = 8 * 1024 * 1024
+
+	// DefaultReadTimeout is used when no context deadline is set.
+	// Prevents indefinite hangs on stalled connections (e.g., after laptop sleep).
+	DefaultReadTimeout = 60 * time.Second
+
+	// DefaultResponseTimeout is the maximum time for a complete response.
+	// Prevents slow-drip attacks where server sends minimal data to stay alive.
+	// This deadline is calculated once at the start and does not reset on data received.
+	DefaultResponseTimeout = 60 * time.Second
 )
 
 type ReadBuffer struct {
 	buf        []byte
 	start, end int
+
+	// Deadline caching to avoid redundant SetReadDeadline syscalls
+	lastDeadline time.Time
+	deadlineSet  bool
 }
 
 func (rb *ReadBuffer) Init() {
@@ -79,10 +94,16 @@ func (rb *ReadBuffer) ensureWriteSpace() error {
 }
 
 func (rb *ReadBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bool) (int, error) {
+	// Only call SetReadDeadline if the deadline actually changed
 	if hasDeadline {
-		_ = conn.SetReadDeadline(deadline)
-	} else {
+		if !rb.deadlineSet || !deadline.Equal(rb.lastDeadline) {
+			_ = conn.SetReadDeadline(deadline)
+			rb.lastDeadline = deadline
+			rb.deadlineSet = true
+		}
+	} else if rb.deadlineSet {
 		_ = conn.SetReadDeadline(time.Time{})
+		rb.deadlineSet = false
 	}
 	if err := rb.ensureWriteSpace(); err != nil {
 		return 0, err
@@ -97,11 +118,36 @@ func (rb *ReadBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bo
 func (rb *ReadBuffer) FeedUntilDone(conn net.Conn, feeder StreamFeeder, out io.Writer, deadline func() (time.Time, bool)) error {
 	rb.Init()
 
+	// Calculate response deadline ONCE at start (prevents slow-drip resets).
+	// This ensures a maximum total time for the response, regardless of how
+	// much data trickles in.
+	responseDeadline := time.Now().Add(DefaultResponseTimeout)
+
+	// Helper to get the earliest applicable deadline
+	getDeadline := func() (time.Time, bool) {
+		// Per-read deadline (detects completely stalled connections)
+		perReadDeadline := time.Now().Add(DefaultReadTimeout)
+
+		// Context deadline from caller
+		contextDeadline, hasContext := deadline()
+
+		// Use the earliest applicable deadline
+		earliest := responseDeadline
+		if perReadDeadline.Before(earliest) {
+			earliest = perReadDeadline
+		}
+		if hasContext && contextDeadline.Before(earliest) {
+			earliest = contextDeadline
+		}
+
+		return earliest, true
+	}
+
 	for {
 		// Ensure we have some bytes to feed.
 		if rb.start == rb.end {
 			rb.start, rb.end = 0, 0
-			dl, ok := deadline()
+			dl, ok := getDeadline()
 			if _, err := rb.readMore(conn, dl, ok); err != nil {
 				return err
 			}
@@ -120,12 +166,16 @@ func (rb *ReadBuffer) FeedUntilDone(conn net.Conn, feeder StreamFeeder, out io.W
 
 		// Need more data.
 		// If decoder couldn't consume anything but we have buffered bytes,
-		// compact them to the start so the next read appends contiguously.
+		// compact only when write space is critically low (<10% remaining).
+		// This reduces unnecessary memmove operations.
 		if consumed == 0 && (rb.end-rb.start) > 0 {
-			rb.Compact()
+			writeSpace := len(rb.buf) - rb.end
+			if writeSpace < len(rb.buf)/10 {
+				rb.Compact()
+			}
 		}
 
-		dl, ok := deadline()
+		dl, ok := getDeadline()
 		if _, err := rb.readMore(conn, dl, ok); err != nil {
 			return err
 		}

@@ -161,8 +161,8 @@ func (o *YencOptions) toMeta() (rapidyenc.Meta, error) {
 // The Client type implements this interface.
 type NNTPClient interface {
 	// Provider management
-	AddProvider(provider *Provider, tier ProviderType)
-	RemoveProvider(provider *Provider)
+	AddProvider(provider *Provider, tier ProviderType) error
+	RemoveProvider(provider *Provider) error
 	Close()
 
 	// Article retrieval methods

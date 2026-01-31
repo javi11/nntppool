@@ -3,8 +3,10 @@ package nntppool
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -31,8 +33,6 @@ type NNTPConnection struct {
 	done   chan struct{}
 	doneMu sync.Once
 
-	failMu sync.Once
-
 	maxIdleTime  time.Duration
 	lastActivity int64
 	maxLifeTime  time.Duration
@@ -45,19 +45,29 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 	cctx, cancel := context.WithCancel(ctx)
 
+	// Apply 0-30% backward offset to createdAt to prevent thundering herd when
+	// many connections are created at the same time (e.g., at startup).
+	// This makes connections appear to have been created at different times,
+	// spreading out their expiration over 30% of maxLifeTime.
+	createdAt := time.Now()
+	if maxLifeTime > 0 {
+		ageOffset := time.Duration(float64(maxLifeTime) * 0.30 * rand.Float64())
+		createdAt = createdAt.Add(-ageOffset)
+	}
+
 	c := &NNTPConnection{
-		conn:         conn,
-		ctx:          cctx,
-		cancel:       cancel,
-		reqCh:        reqCh,
-		pending:      make(chan *Request, inflightLimit),
-		inflightSem:  make(chan struct{}, inflightLimit),
-		rb:           internal.ReadBuffer{},
-		done:         make(chan struct{}),
-		maxIdleTime:  maxIdleTime,
+		conn:        conn,
+		ctx:         cctx,
+		cancel:      cancel,
+		reqCh:       reqCh,
+		pending:     make(chan *Request, inflightLimit),
+		inflightSem: make(chan struct{}, inflightLimit),
+		rb:          internal.ReadBuffer{},
+		done:        make(chan struct{}),
+		maxIdleTime: maxIdleTime,
 		lastActivity: time.Now().Unix(),
-		maxLifeTime:  maxLifeTime,
-		createdAt:    time.Now(),
+		maxLifeTime: maxLifeTime,
+		createdAt:   createdAt,
 	}
 
 	if mc, ok := conn.(*internal.MeteredConn); ok {
@@ -141,25 +151,52 @@ func (c *NNTPConnection) closeDone() {
 	c.doneMu.Do(func() { close(c.done) })
 }
 
-func (c *NNTPConnection) failOutstanding() {
-	c.failMu.Do(func() {
-		for {
-			select {
-			case req := <-c.pending:
-				if req == nil {
-					continue
-				}
-				internal.SafeClose(req.RespCh)
-				// Best-effort inflight release (not strictly needed once we're shutting down).
-				select {
-				case <-c.inflightSem:
-				default:
-				}
-			default:
-				return
-			}
+// drainPending waits for all in-flight requests to complete before returning.
+// This is used during graceful shutdown when connection lifetime expires,
+// ensuring pending requests get their responses before the connection closes.
+func (c *NNTPConnection) drainPending() {
+	slots := cap(c.inflightSem)
+	for i := 0; i < slots; i++ {
+		select {
+		case c.inflightSem <- struct{}{}:
+			// Acquired a slot, continue
+		case <-c.ctx.Done():
+			return
 		}
-	})
+	}
+	// All slots acquired = no in-flight requests, safe to close
+}
+
+func (c *NNTPConnection) failOutstanding() {
+	// This can be called multiple times (from readerLoop and from Run).
+	// Each call drains whatever is currently in pending at that moment.
+	// The semaphore release uses select{default:} to avoid blocking if
+	// the semaphore is already drained or if the reader already released
+	// the slot for this request.
+	for {
+		select {
+		case req := <-c.pending:
+			if req == nil {
+				continue
+			}
+			// Send error response so caller can distinguish from successful completion
+			select {
+			case req.RespCh <- Response{Err: context.Canceled, Request: req}:
+			default:
+			}
+			internal.SafeClose(req.RespCh)
+			// Release the inflight slot for this request (best-effort).
+			// Uses select{default:} because:
+			// 1. The reader may have already picked this request and released the slot
+			// 2. Multiple calls to failOutstanding may race
+			select {
+			case <-c.inflightSem:
+			default:
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (c *NNTPConnection) Close() error {
@@ -229,6 +266,7 @@ func (c *NNTPConnection) Run() {
 					timer.Stop()
 				}
 				<-c.inflightSem
+				c.drainPending()
 				return
 			}
 			lifeTimer = time.NewTimer(remaining)
@@ -263,6 +301,7 @@ func (c *NNTPConnection) Run() {
 				timer.Stop()
 			}
 			<-c.inflightSem
+			c.drainPending()
 			return
 		}
 		if !ok {
@@ -277,6 +316,11 @@ func (c *NNTPConnection) Run() {
 		select {
 		case <-req.Ctx.Done():
 			<-c.inflightSem
+			// Send cancellation error so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: req.Ctx.Err(), Request: req}:
+			default:
+			}
 			close(req.RespCh)
 			continue
 		default:
@@ -294,10 +338,11 @@ func (c *NNTPConnection) Run() {
 
 		// pipeline write
 		if _, err := c.conn.Write(req.Payload); err != nil {
-			<-c.inflightSem
-			// We don't close req.RespCh here because it might have been picked up by readerLoop
-			// (since we pushed to pending above).
-			// Closing connection below will cause readerLoop to error and handle req.RespCh.
+			// DON'T release inflightSem here - the request is already in pending.
+			// failOutstanding() will handle releasing the slot when draining pending.
+			// If the reader already picked it up, the reader will release it at line 440.
+			// Releasing here would cause double-release when reader finishes normally,
+			// which blocks the reader forever trying to release from an empty semaphore.
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
@@ -320,6 +365,7 @@ func (c *NNTPConnection) readerLoop() {
 		select {
 		case req = <-c.pending:
 		case <-c.ctx.Done():
+			c.failOutstanding()
 			return
 		}
 		if req.Ctx == nil {
@@ -330,6 +376,7 @@ func (c *NNTPConnection) readerLoop() {
 			Request: req,
 		}
 		decoder := NNTPResponse{
+			Lines:        make([]string, 0, 8), // Pre-allocate for typical response
 			OnYencHeader: req.OnYencHeader,
 		}
 
@@ -369,7 +416,12 @@ func (c *NNTPConnection) readerLoop() {
 			return req.Ctx.Deadline()
 		})
 		_ = c.conn.SetReadDeadline(time.Time{})
-		if err != nil {
+
+		// Check for write errors (user closed their writer)
+		// Prioritize write errors - response was drained but write failed
+		if writeErr := outRef.Err(); writeErr != nil {
+			resp.Err = writeErr // Return original error (e.g., io.ErrClosedPipe)
+		} else if err != nil {
 			resp.Err = err
 		}
 
@@ -378,12 +430,15 @@ func (c *NNTPConnection) readerLoop() {
 		resp.Lines = decoder.Lines
 		resp.Meta = decoder
 
-		if deliver {
-			// Best effort: don't block forever if the receiver abandoned the channel.
-			select {
-			case req.RespCh <- resp:
-			default:
-			}
+		// Always send a response so caller can distinguish cancellation from provider failure.
+		// If request was cancelled mid-response, set the error to context.Canceled.
+		if !deliver {
+			resp.Err = context.Canceled
+		}
+		// Best effort: don't block forever if the receiver abandoned the channel.
+		select {
+		case req.RespCh <- resp:
+		default:
 		}
 		internal.SafeClose(req.RespCh)
 
@@ -391,7 +446,14 @@ func (c *NNTPConnection) readerLoop() {
 		<-c.inflightSem
 
 		// If we hit a network error or IO error, close the connection.
-		if resp.Err != nil {
+		// Don't close on:
+		// - context.Canceled: just a cancelled request, not a connection problem
+		// - io.ErrClosedPipe: user closed their writer early, response was drained successfully
+		// This is critical for pipelining: if one request is cancelled (e.g., reader moved to next segment),
+		// we don't want to kill the connection and fail all other pipelined requests.
+		if resp.Err != nil &&
+			!errors.Is(resp.Err, context.Canceled) &&
+			!errors.Is(resp.Err, io.ErrClosedPipe) {
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return

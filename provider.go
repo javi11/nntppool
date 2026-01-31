@@ -3,6 +3,7 @@ package nntppool
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,15 @@ import (
 	"github.com/javi11/nntppool/v3/internal"
 	"golang.org/x/net/proxy"
 )
+
+const sendRequestTimeout = 5 * time.Second
+
+// ErrProviderClosed is returned when a request is made to a closed provider.
+var ErrProviderClosed = errors.New("provider closed")
+
+// ErrProviderUnavailable is returned when all connections to a provider have failed.
+// This error is retryable - the client should try other providers or retry later.
+var ErrProviderUnavailable = errors.New("provider unavailable: all connections failed")
 
 type ProviderMetrics struct {
 	Host              string
@@ -54,8 +64,14 @@ type Provider struct {
 	connCount int32
 	config    ProviderConfig
 
-	closed  atomic.Bool
-	closeMu sync.Mutex
+	closed atomic.Bool
+	sendWg sync.WaitGroup // Tracks in-flight SendRequest calls for safe channel close
+
+	// deadCh is closed when all connections die (connCount reaches 0)
+	// and reopened when a new connection is established.
+	// This allows SendRequest to immediately fail when provider is unavailable.
+	deadCh   chan struct{}
+	deadChMu sync.Mutex
 
 	// Metrics
 	bytesRead    uint64
@@ -159,6 +175,7 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 		reqCh:  make(chan *Request, config.MaxConnections),
 		conns:  make([]*NNTPConnection, 0, config.MaxConnections),
 		config: config,
+		deadCh: make(chan struct{}),
 	}
 
 	// Start metrics monitor
@@ -252,17 +269,106 @@ func (c *Provider) addConnection(syncMode bool) error {
 	}
 
 	c.connsMu.Lock()
+	wasEmpty := len(c.conns) == 0
 	c.conns = append(c.conns, w)
 	c.connsMu.Unlock()
+
+	// If this is the first connection after being dead, re-enable the provider
+	if wasEmpty {
+		c.signalAlive()
+	}
 
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		defer atomic.AddInt32(&c.connCount, -1)
 		w.Run()
+		// Remove connection from slice after it exits
+		c.removeConnection(w)
 	}()
 
 	return nil
+}
+
+// removeConnection removes a connection from the conns slice.
+// Called when a connection exits (lifetime, idle, error).
+func (c *Provider) removeConnection(conn *NNTPConnection) {
+	// Flush any accumulated metrics before removing
+	if mc, ok := conn.conn.(*internal.MeteredConn); ok {
+		mc.Flush()
+	}
+
+	c.connsMu.Lock()
+	defer c.connsMu.Unlock()
+
+	for i, cc := range c.conns {
+		if cc == conn {
+			// Remove by swapping with last element and truncating
+			c.conns[i] = c.conns[len(c.conns)-1]
+			c.conns[len(c.conns)-1] = nil // Clear reference for GC
+			c.conns = c.conns[:len(c.conns)-1]
+			break
+		}
+	}
+
+	// Check if this was the last connection - signal unavailability and drain
+	// so callers can retry with other providers or wait for reconnect
+	if len(c.conns) == 0 && !c.closed.Load() {
+		c.signalDead()
+		c.drainOrphanedRequests()
+	}
+}
+
+// signalDead closes deadCh to signal that provider is unavailable.
+// This unblocks any SendRequest calls waiting to send to reqCh.
+func (c *Provider) signalDead() {
+	c.deadChMu.Lock()
+	defer c.deadChMu.Unlock()
+	// Only close if not already closed (check by trying to receive)
+	select {
+	case <-c.deadCh:
+		// Already closed
+	default:
+		close(c.deadCh)
+	}
+}
+
+// signalAlive creates a new deadCh to allow SendRequest calls to proceed.
+// Called when a new connection is established after provider was dead.
+func (c *Provider) signalAlive() {
+	c.deadChMu.Lock()
+	defer c.deadChMu.Unlock()
+	// Only recreate if currently closed
+	select {
+	case <-c.deadCh:
+		// Was closed, recreate
+		c.deadCh = make(chan struct{})
+	default:
+		// Still open, nothing to do
+	}
+}
+
+// drainOrphanedRequests drains any requests from reqCh with ErrProviderUnavailable.
+// Called when all connections have died but the provider is not closed.
+// This allows callers to fail fast and retry with other providers.
+func (c *Provider) drainOrphanedRequests() {
+	for {
+		select {
+		case req := <-c.reqCh:
+			if req != nil && req.RespCh != nil {
+				select {
+				case req.RespCh <- Response{Err: ErrProviderUnavailable, Request: req}:
+				default:
+				}
+				internal.SafeClose(req.RespCh)
+			}
+			// Note: We don't call sendWg.Done() here because the request
+			// was already tracked and the caller's SendRequest defer already
+			// handled the Done() call when sending completed.
+		default:
+			return // Channel empty
+		}
+	}
 }
 
 // Close cancels the provider, closes its request channel, and waits for all connections to stop.
@@ -273,9 +379,22 @@ func (c *Provider) Close() error {
 
 	c.cancel()
 
-	c.closeMu.Lock()
+	// Wait for all in-flight SendRequest calls to complete before closing channel.
+	// This prevents the race between sending on reqCh and closing it.
+	c.sendWg.Wait()
+
 	close(c.reqCh)
-	c.closeMu.Unlock()
+	// Drain any queued requests to prevent caller hangs
+	for req := range c.reqCh {
+		if req != nil && req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: ErrProviderClosed, Request: req}:
+			default:
+			}
+			close(req.RespCh)
+		}
+	}
 
 	c.connsMu.Lock()
 	for _, cc := range c.conns {
@@ -296,13 +415,13 @@ func (c *Provider) Date(ctx context.Context) error {
 		return ctx.Err()
 	case resp, ok := <-ch:
 		if !ok {
-			return fmt.Errorf("response channel closed unexpectedly")
+			return fmt.Errorf("DATE: response channel closed")
 		}
 		if resp.Err != nil {
 			return resp.Err
 		}
 		if resp.StatusCode != 111 {
-			return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+			return fmt.Errorf("DATE: unexpected status code %d: %s", resp.StatusCode, resp.Status)
 		}
 		return nil
 	}
@@ -325,8 +444,13 @@ func (c *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 }
 
 func (c *Provider) SendRequest(req *Request) <-chan Response {
-	closeAndReturn := func() <-chan Response {
+	closeWithError := func(err error) <-chan Response {
 		if req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: err, Request: req}:
+			default:
+			}
 			close(req.RespCh)
 		}
 		return req.RespCh
@@ -334,30 +458,51 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 
 	// Fast path: provider already closed
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
 	}
 
-	// Trigger lazy connection growth
-	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
-		go func() {
-			_ = c.addConnection(false)
-		}()
+	// If provider has no connections, try to add one synchronously.
+	// This handles recovery from a dead state (all connections died).
+	if atomic.LoadInt32(&c.connCount) == 0 {
+		// Try to add a connection synchronously - this will call signalAlive() on success
+		if err := c.addConnection(false); err != nil {
+			// Connection failed - provider is truly unavailable
+			return closeWithError(ErrProviderUnavailable)
+		}
+	} else if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+		// Have some connections but not at max - grow asynchronously
+		go func() { _ = c.addConnection(false) }()
 	}
 
-	// Synchronize with Close() to prevent send-on-closed-channel
-	c.closeMu.Lock()
-	defer c.closeMu.Unlock()
+	// Track this send operation so Close() can wait for us
+	c.sendWg.Add(1)
+	defer c.sendWg.Done()
 
+	// Re-check closed after adding to wait group
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
 	}
+
+	timeout := time.NewTimer(sendRequestTimeout)
+	defer timeout.Stop()
+
+	// Get current deadCh - used to detect when all connections die while we're waiting
+	c.deadChMu.Lock()
+	deadCh := c.deadCh
+	c.deadChMu.Unlock()
 
 	select {
 	case <-c.ctx.Done():
-		return closeAndReturn()
+		return closeWithError(c.ctx.Err())
 	case <-req.Ctx.Done():
-		return closeAndReturn()
+		return closeWithError(req.Ctx.Err())
+	case <-deadCh:
+		// Provider became unavailable while we were waiting (all connections died)
+		return closeWithError(ErrProviderUnavailable)
 	case c.reqCh <- req:
+		// Request is now in the channel, waiting to be processed
 		return req.RespCh
+	case <-timeout.C:
+		return closeWithError(fmt.Errorf("send request timeout after %v", sendRequestTimeout))
 	}
 }

@@ -14,6 +14,8 @@ import (
 	"github.com/mnightingale/rapidyenc"
 )
 
+const addProviderTimeout = 20 * time.Second
+
 type Client struct {
 	primaries   atomic.Value // []*Provider
 	backups     atomic.Value // []*Provider
@@ -46,9 +48,17 @@ func NewClient(maxInflight int) *Client {
 	return c
 }
 
-func (c *Client) AddProvider(provider *Provider, tier ProviderType) {
+func (c *Client) AddProvider(provider *Provider, tier ProviderType) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), addProviderTimeout)
+	defer cancel()
+
+	err := provider.Date(ctx)
+	if err != nil {
+		return err
+	}
 
 	if tier == ProviderPrimary {
 		current := c.primaries.Load().([]*Provider)
@@ -63,9 +73,11 @@ func (c *Client) AddProvider(provider *Provider, tier ProviderType) {
 		newlist[len(current)] = provider
 		c.backups.Store(newlist)
 	}
+
+	return nil
 }
 
-func (c *Client) RemoveProvider(provider *Provider) {
+func (c *Client) RemoveProvider(provider *Provider) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -114,8 +126,13 @@ func (c *Client) RemoveProvider(provider *Provider) {
 	}
 
 	if found {
-		_ = provider.Close()
+		err := provider.Close()
+		if err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
 func (c *Client) Close() {
@@ -359,7 +376,20 @@ func (c *Client) sendRequest(req *Request) {
 			}
 
 			ch := p.SendRequest(subReq)
-			resp, ok := <-ch
+
+			// Wait for response with context awareness to prevent indefinite blocking
+			var resp Response
+			var ok bool
+			select {
+			case resp, ok = <-ch:
+				// Got response from provider
+			case <-req.Ctx.Done():
+				// Context cancelled while waiting for response
+				// The request is already sent to provider, but we should not block indefinitely
+				lastErr = req.Ctx.Err()
+				continue
+			}
+
 			if !ok {
 				lastErr = fmt.Errorf("provider %s closed unexpectedly", p.Host)
 				continue

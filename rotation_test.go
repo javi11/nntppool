@@ -38,7 +38,21 @@ func TestClientConnectionRotation(t *testing.T) {
 				_, _ = c.Write([]byte("200 Service Ready\r\n"))
 				buf := make([]byte, 1024)
 				for {
-					if _, err := c.Read(buf); err != nil {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+
+					var response string
+					if cmd == "DATE\r\n" {
+						response = "111 20240101000000\r\n"
+					} else {
+						response = "500 Unknown Command\r\n"
+					}
+
+					_, err = c.Write([]byte(response))
+					if err != nil {
 						return
 					}
 				}
@@ -64,7 +78,10 @@ func TestClientConnectionRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	// Wait enough time for at least 2 rotations
 	time.Sleep(600 * time.Millisecond)
