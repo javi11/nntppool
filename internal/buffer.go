@@ -16,6 +16,11 @@ const (
 	// DefaultReadTimeout is used when no context deadline is set.
 	// Prevents indefinite hangs on stalled connections (e.g., after laptop sleep).
 	DefaultReadTimeout = 60 * time.Second
+
+	// DefaultResponseTimeout is the maximum time for a complete response.
+	// Prevents slow-drip attacks where server sends minimal data to stay alive.
+	// This deadline is calculated once at the start and does not reset on data received.
+	DefaultResponseTimeout = 60 * time.Second
 )
 
 type ReadBuffer struct {
@@ -113,14 +118,29 @@ func (rb *ReadBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bo
 func (rb *ReadBuffer) FeedUntilDone(conn net.Conn, feeder StreamFeeder, out io.Writer, deadline func() (time.Time, bool)) error {
 	rb.Init()
 
-	// Helper to get deadline, using default timeout if none provided
+	// Calculate response deadline ONCE at start (prevents slow-drip resets).
+	// This ensures a maximum total time for the response, regardless of how
+	// much data trickles in.
+	responseDeadline := time.Now().Add(DefaultResponseTimeout)
+
+	// Helper to get the earliest applicable deadline
 	getDeadline := func() (time.Time, bool) {
-		dl, ok := deadline()
-		if ok {
-			return dl, true
+		// Per-read deadline (detects completely stalled connections)
+		perReadDeadline := time.Now().Add(DefaultReadTimeout)
+
+		// Context deadline from caller
+		contextDeadline, hasContext := deadline()
+
+		// Use the earliest applicable deadline
+		earliest := responseDeadline
+		if perReadDeadline.Before(earliest) {
+			earliest = perReadDeadline
 		}
-		// No context deadline - use default timeout to prevent indefinite hangs
-		return time.Now().Add(DefaultReadTimeout), true
+		if hasContext && contextDeadline.Before(earliest) {
+			earliest = contextDeadline
+		}
+
+		return earliest, true
 	}
 
 	for {
