@@ -168,8 +168,11 @@ func (c *NNTPConnection) drainPending() {
 }
 
 func (c *NNTPConnection) failOutstanding() {
-	// Note: This can be called multiple times (from readerLoop and from Run).
-	// Each call drains whatever is currently in pending.
+	// This can be called multiple times (from readerLoop and from Run).
+	// Each call drains whatever is currently in pending at that moment.
+	// The semaphore release uses select{default:} to avoid blocking if
+	// the semaphore is already drained or if the reader already released
+	// the slot for this request.
 	for {
 		select {
 		case req := <-c.pending:
@@ -182,7 +185,10 @@ func (c *NNTPConnection) failOutstanding() {
 			default:
 			}
 			internal.SafeClose(req.RespCh)
-			// Best-effort inflight release (not strictly needed once we're shutting down).
+			// Release the inflight slot for this request (best-effort).
+			// Uses select{default:} because:
+			// 1. The reader may have already picked this request and released the slot
+			// 2. Multiple calls to failOutstanding may race
 			select {
 			case <-c.inflightSem:
 			default:
@@ -332,10 +338,11 @@ func (c *NNTPConnection) Run() {
 
 		// pipeline write
 		if _, err := c.conn.Write(req.Payload); err != nil {
-			<-c.inflightSem
-			// We don't close req.RespCh here because it might have been picked up by readerLoop
-			// (since we pushed to pending above).
-			// Closing connection below will cause readerLoop to error and handle req.RespCh.
+			// DON'T release inflightSem here - the request is already in pending.
+			// failOutstanding() will handle releasing the slot when draining pending.
+			// If the reader already picked it up, the reader will release it at line 440.
+			// Releasing here would cause double-release when reader finishes normally,
+			// which blocks the reader forever trying to release from an empty semaphore.
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return

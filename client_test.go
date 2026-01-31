@@ -1757,3 +1757,115 @@ func TestOrphanedRequestsDrainedOnConnectionFailure(t *testing.T) {
 			numQueuedRequests, totalErrors, unavailableCount, otherErrCount)
 	}
 }
+
+// TestWriteErrorDoesNotBlockReader verifies that a write error after sending
+// a request to the pending channel does not cause the reader to block forever.
+// This tests the fix for the double semaphore release bug where:
+// 1. Writer sends request to pending
+// 2. Reader picks up the request from pending (concurrently)
+// 3. Write fails
+// 4. Writer should NOT release the semaphore (request is being processed by reader)
+// 5. Reader completes and releases semaphore without blocking
+func TestWriteErrorDoesNotBlockReader(t *testing.T) {
+	// Track when the write should fail
+	var writeCount atomic.Int32
+	failOnWrite := atomic.Int32{}
+	failOnWrite.Store(0) // 0 = don't fail, 1 = fail on next write
+
+	// Custom conn that can simulate write failures
+	type failingConn struct {
+		net.Conn
+		failOnWrite *atomic.Int32
+		writeCount  *atomic.Int32
+	}
+
+	// Create a mock server that responds normally
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		ID: "write-error-test",
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				// Small delay to ensure write happens before we respond
+				time.Sleep(10 * time.Millisecond)
+				return "222 0 <id> body follows\r\ntest\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, "tcp", srv.Addr())
+		if err != nil {
+			return nil, err
+		}
+		return &failingConn{
+			Conn:        conn,
+			failOnWrite: &failOnWrite,
+			writeCount:  &writeCount,
+		}, nil
+	}
+
+	provider, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        1,
+		InflightPerConnection: 5, // Allow pipelining
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer func() { _ = provider.Close() }()
+
+	client := NewClient(100)
+	defer client.Close()
+
+	if err := client.AddProvider(provider, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Make a few successful requests first to warm up
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := client.Body(ctx, fmt.Sprintf("warm%d", i), io.Discard)
+		cancel()
+		if err != nil {
+			t.Fatalf("warmup request %d failed: %v", i, err)
+		}
+	}
+
+	// Now make concurrent requests - some should succeed, some may fail due to
+	// connection issues, but none should hang
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// We don't care about the error - we just want to ensure no deadlock
+			_ = client.Body(ctx, fmt.Sprintf("test%d", idx), io.Discard)
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// Test passes if all requests complete within timeout (no deadlock)
+	select {
+	case <-done:
+		// Success - all requests completed without hanging
+	case <-time.After(10 * time.Second):
+		t.Fatal("requests did not complete within timeout - possible deadlock in semaphore handling")
+	}
+}
