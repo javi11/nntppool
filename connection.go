@@ -15,6 +15,10 @@ import (
 	"github.com/javi11/nntppool/v3/internal"
 )
 
+// handshakeTimeout is the maximum time to wait for greeting and authentication responses.
+// This is shorter than the general response timeout since handshake messages are small.
+const handshakeTimeout = 30 * time.Second
+
 type NNTPConnection struct {
 	conn net.Conn
 
@@ -75,7 +79,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 
 	// Server greeting is sent immediately upon connect.
-	greeting, err := c.readOneResponse(io.Discard)
+	greeting, err := c.readOneResponse(io.Discard, handshakeTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("nntp greeting: %w", err)
 	}
@@ -117,7 +121,7 @@ func (c *NNTPConnection) auth(auth Auth) error {
 	if _, err := fmt.Fprintf(c.conn, "AUTHINFO USER %s\r\n", auth.Username); err != nil {
 		return fmt.Errorf("authinfo user: %w", err)
 	}
-	resp, err := c.readOneResponse(io.Discard)
+	resp, err := c.readOneResponse(io.Discard, handshakeTimeout)
 	if err != nil {
 		return fmt.Errorf("authinfo user response: %w", err)
 	}
@@ -135,7 +139,7 @@ func (c *NNTPConnection) auth(auth Auth) error {
 	if _, err := fmt.Fprintf(c.conn, "AUTHINFO PASS %s\r\n", auth.Password); err != nil {
 		return fmt.Errorf("authinfo pass: %w", err)
 	}
-	resp, err = c.readOneResponse(io.Discard)
+	resp, err = c.readOneResponse(io.Discard, handshakeTimeout)
 	if err != nil {
 		return fmt.Errorf("authinfo pass response: %w", err)
 	}
@@ -463,9 +467,20 @@ func (c *NNTPConnection) readerLoop() {
 
 // readOneResponse reads a complete NNTP response from the stream.
 // Any unread bytes remain buffered in c.rbuf[c.rstart:c.rend] for subsequent reads.
-func (c *NNTPConnection) readOneResponse(out io.Writer) (NNTPResponse, error) {
+// If timeout > 0, a deadline is applied to prevent indefinite hangs.
+func (c *NNTPConnection) readOneResponse(out io.Writer, timeout time.Duration) (NNTPResponse, error) {
 	resp := NNTPResponse{}
-	if err := c.rb.FeedUntilDone(c.conn, &resp, out, func() (time.Time, bool) { return time.Time{}, false }); err != nil {
+
+	var deadline time.Time
+	hasDeadline := false
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+		hasDeadline = true
+	}
+
+	if err := c.rb.FeedUntilDone(c.conn, &resp, out, func() (time.Time, bool) {
+		return deadline, hasDeadline
+	}); err != nil {
 		return resp, err
 	}
 	return resp, nil

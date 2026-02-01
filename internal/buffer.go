@@ -20,7 +20,7 @@ const (
 	// DefaultResponseTimeout is the maximum time for a complete response.
 	// Prevents slow-drip attacks where server sends minimal data to stay alive.
 	// This deadline is calculated once at the start and does not reset on data received.
-	DefaultResponseTimeout = 60 * time.Second
+	DefaultResponseTimeout = 30 * time.Second
 )
 
 type ReadBuffer struct {
