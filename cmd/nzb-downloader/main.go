@@ -87,7 +87,7 @@ func main() {
 		log.Fatalf("Failed to create provider: %v", err)
 	}
 
-	client := nntppool.NewClient(connections * 2)
+	client := nntppool.NewClient()
 	err = client.AddProvider(provider, nntppool.ProviderPrimary)
 	if err != nil {
 		log.Fatalf("Failed to add provider: %v", err)

@@ -65,7 +65,7 @@ func main() {
 	}()
 
 	// Use the provider with a client
-	client := nntppool.NewClient(20)
+	client := nntppool.NewClient()
 	defer client.Close()
 
 	err = client.AddProvider(provider1, nntppool.ProviderPrimary)

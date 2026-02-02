@@ -17,10 +17,8 @@ import (
 const addProviderTimeout = 20 * time.Second
 
 type Client struct {
-	primaries   atomic.Value // []*Provider
-	backups     atomic.Value // []*Provider
-	maxInflight int
-	sem         chan struct{}
+	primaries atomic.Value // []*Provider
+	backups   atomic.Value // []*Provider
 
 	mu            sync.Mutex // Protects updates to atomic values and dead lists
 	deadPrimaries []*Provider
@@ -31,17 +29,12 @@ type Client struct {
 // Compile-time check that Client implements NNTPClient interface
 var _ NNTPClient = (*Client)(nil)
 
-func NewClient(maxInflight int) *Client {
+func NewClient() *Client {
 	c := &Client{
-		maxInflight: maxInflight,
-		closeCh:     make(chan struct{}),
+		closeCh: make(chan struct{}),
 	}
 	c.primaries.Store(make([]*Provider, 0))
 	c.backups.Store(make([]*Provider, 0))
-
-	if maxInflight > 0 {
-		c.sem = make(chan struct{}, maxInflight)
-	}
 
 	go c.healthCheckLoop()
 
@@ -331,17 +324,6 @@ func (c *Client) Date(ctx context.Context) error {
 
 func (c *Client) sendRequest(req *Request) {
 	defer close(req.RespCh)
-
-	// Acquire global capacity
-	if c.sem != nil {
-		select {
-		case c.sem <- struct{}{}:
-			defer func() { <-c.sem }()
-		case <-req.Ctx.Done():
-			req.RespCh <- Response{Err: req.Ctx.Err()}
-			return
-		}
-	}
 
 	var visitedHosts []string
 	var lastErr error

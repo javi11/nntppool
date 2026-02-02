@@ -17,7 +17,7 @@ import (
 )
 
 func TestClientHotswapProviders(t *testing.T) {
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	// 1. Add Provider A
@@ -187,7 +187,7 @@ func TestClientHealthCheck(t *testing.T) {
 		},
 	})
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
@@ -255,7 +255,7 @@ func TestClientRemoveProvider(t *testing.T) {
 		},
 	})
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	// Create two providers
@@ -370,7 +370,7 @@ func TestClientBodyAt(t *testing.T) {
 	})
 	defer cleanup()
 
-	client := NewClient(1)
+	client := NewClient()
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
@@ -418,7 +418,7 @@ func TestClientSpeedTest(t *testing.T) {
 	defer cleanup()
 
 	// 2. Setup Client
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
@@ -472,7 +472,7 @@ func TestClientBodyReader(t *testing.T) {
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -545,7 +545,7 @@ func TestClientBodyReader(t *testing.T) {
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -662,7 +662,7 @@ func TestClientBodyReader(t *testing.T) {
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -722,7 +722,7 @@ func TestClientBodyReader(t *testing.T) {
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -803,7 +803,7 @@ func setupPostClient(t *testing.T, id string, onArticle func(string)) (*Client, 
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client := NewClient(10)
+	client := NewClient()
 	err = client.AddProvider(p, ProviderPrimary)
 	if err != nil {
 		t.Fatalf("failed to add provider: %v", err)
@@ -955,7 +955,7 @@ func TestPostYenc(t *testing.T) {
 	})
 
 	t.Run("invalid options", func(t *testing.T) {
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		headers := map[string]string{"From": "test@example.com", "Subject": "Test"}
@@ -1041,7 +1041,7 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client := NewClient(10)
+	client := NewClient()
 	err = client.AddProvider(p, ProviderPrimary)
 	if err != nil {
 		t.Fatalf("failed to add provider: %v", err)
@@ -1053,9 +1053,9 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 	}
 }
 
-func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
-	// This test reproduces the "response channel closed unexpectedly" error
-	// that occurs when a context times out while waiting to acquire the semaphore
+func TestClientContextTimeoutWhileProviderBusy(t *testing.T) {
+	// This test verifies context timeout handling when the provider is busy
+	// processing other requests (provider-level concurrency control).
 
 	var requestReceived atomic.Bool
 	requestReceived.Store(false)
@@ -1077,8 +1077,8 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		},
 	})
 
-	// Create client with maxInflight=1 so only one request can be in-flight
-	client := NewClient(1)
+	// Create client - concurrency is controlled at provider level via MaxConnections/InflightPerConnection
+	client := NewClient()
 	defer client.Close()
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
@@ -1096,7 +1096,7 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		t.Fatalf("failed to add provider: %v", err)
 	}
 
-	// Start a slow request to fill the semaphore
+	// Start a slow request to keep the single connection busy
 	slowDone := make(chan struct{})
 	go func() {
 		defer close(slowDone)
@@ -1104,7 +1104,7 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		_ = client.Body(ctx, "slow", io.Discard)
 	}()
 
-	// Wait for the slow request to be received and hold the semaphore
+	// Wait for the slow request to be received (connection now busy)
 	timeout := time.After(5 * time.Second)
 	for !requestReceived.Load() {
 		select {
@@ -1116,11 +1116,11 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		}
 	}
 
-	// Give it a bit more time to ensure semaphore is acquired
+	// Give it a bit more time to ensure connection is busy
 	time.Sleep(50 * time.Millisecond)
 
-	// Now try Date() with a short timeout while semaphore is full
-	// This should timeout while waiting for semaphore acquisition
+	// Now try Date() with a short timeout while provider is busy
+	// This should timeout while waiting for provider capacity
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -1252,7 +1252,7 @@ func TestWriterClosedEarlyConnectionReused(t *testing.T) {
 	defer cleanup()
 
 	// Setup client with single connection to verify reuse
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
@@ -1333,7 +1333,7 @@ func TestClientResponseTimeoutDoesNotHang(t *testing.T) {
 		},
 	})
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
@@ -1431,7 +1431,7 @@ func TestClientFallbackWhenPrimarySlowToRespond(t *testing.T) {
 		},
 	})
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	primary, err := NewProvider(context.Background(), ProviderConfig{
@@ -1506,10 +1506,10 @@ func TestClientFallbackWhenPrimarySlowToRespond(t *testing.T) {
 	close(primarySlowResponseCh)
 }
 
-// TestSemaphoreReleasedOnContextCancellation verifies that the semaphore is properly
-// released when a context is cancelled while waiting for a provider response.
-// This prevents semaphore exhaustion and ensures subsequent requests can proceed.
-func TestSemaphoreReleasedOnContextCancellation(t *testing.T) {
+// TestProviderCapacityReleasedOnContextCancellation verifies that provider connections
+// are properly released when a context is cancelled while waiting for a provider response.
+// This ensures subsequent requests can proceed without hanging.
+func TestProviderCapacityReleasedOnContextCancellation(t *testing.T) {
 	// Create a provider that will be slow to respond
 	slowResponseCh := make(chan struct{})
 	var requestsStarted atomic.Int32
@@ -1528,8 +1528,8 @@ func TestSemaphoreReleasedOnContextCancellation(t *testing.T) {
 		},
 	})
 
-	// Create client with maxInflight=2
-	client := NewClient(2)
+	// Create client - concurrency controlled at provider level
+	client := NewClient()
 	defer client.Close()
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
@@ -1547,7 +1547,7 @@ func TestSemaphoreReleasedOnContextCancellation(t *testing.T) {
 		t.Fatalf("failed to add provider: %v", err)
 	}
 
-	// Start two requests that will use up the semaphore
+	// Start two requests that will use up the provider's connection capacity
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel1()
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -1589,8 +1589,8 @@ func TestSemaphoreReleasedOnContextCancellation(t *testing.T) {
 		t.Fatal("second request did not complete after context timeout")
 	}
 
-	// Now try a third request - the semaphore should have been released
-	// If semaphore was NOT released, this would hang
+	// Now try a third request - the provider capacity should have been released
+	// If connections were NOT released, this would hang
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel3()
 
@@ -1603,14 +1603,14 @@ func TestSemaphoreReleasedOnContextCancellation(t *testing.T) {
 	select {
 	case err := <-done3:
 		// We expect this to also timeout (since server is still slow)
-		// but the important thing is it didn't hang waiting for semaphore
+		// but the important thing is it didn't hang waiting for provider capacity
 		if errors.Is(err, context.DeadlineExceeded) {
-			t.Log("third request completed with context timeout - semaphore was properly released")
+			t.Log("third request completed with context timeout - provider capacity was properly released")
 		} else if err != nil {
 			t.Logf("third request completed with error: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("third request hung - semaphore may not have been released")
+		t.Fatal("third request hung - provider capacity may not have been released")
 	}
 
 	// Cleanup
@@ -1675,7 +1675,7 @@ func TestOrphanedRequestsDrainedOnConnectionFailure(t *testing.T) {
 	}
 	defer func() { _ = provider.Close() }()
 
-	client := NewClient(100)
+	client := NewClient()
 	defer client.Close()
 
 	if err := client.AddProvider(provider, ProviderPrimary); err != nil {
@@ -1823,7 +1823,7 @@ func TestWriteErrorDoesNotBlockReader(t *testing.T) {
 	}
 	defer func() { _ = provider.Close() }()
 
-	client := NewClient(100)
+	client := NewClient()
 	defer client.Close()
 
 	if err := client.AddProvider(provider, ProviderPrimary); err != nil {

@@ -57,7 +57,7 @@ func main() {
     defer provider.Close()
 
     // Create client (implements NNTPClient interface)
-    client := nntppool.NewClient(100) // Max 100 concurrent requests
+    client := nntppool.NewClient()
     err = client.AddProvider(provider, nntppool.ProviderPrimary)
     if err != nil {
         panic(err)
@@ -142,7 +142,7 @@ backupProvider, _ := nntppool.NewProvider(ctx, nntppool.ProviderConfig{
 })
 
 // Add to client with tier priority
-client := nntppool.NewClient(100)
+client := nntppool.NewClient()
 err = client.AddProvider(primaryProvider, nntppool.ProviderPrimary)
 if err != nil {
     panic(err)
@@ -280,7 +280,7 @@ The library includes several automatic features that require no configuration:
 
 - **Connection Pooling**: Each provider maintains an independent connection pool. Connections are created lazily up to `MaxConnections` and reused across requests.
 
-- **Concurrency Control**: Use `maxInflight` parameter in `NewClient(maxInflight)` to limit memory usage with many concurrent requests. Set to `0` for unlimited concurrency.
+- **Concurrency Control**: Callers control concurrency externally using mechanisms like `errgroup.SetLimit()`, worker pools, or semaphores. Provider-level connection limits handle internal throttling via `MaxConnections` and `InflightPerConnection` settings.
 
 - **Streaming**: Use `BodyReader()` or `BodyAt()` to avoid buffering large articles in memory. The streaming API decodes yEnc on-the-fly and writes directly to the destination.
 

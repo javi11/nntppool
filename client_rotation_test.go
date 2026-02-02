@@ -12,7 +12,7 @@ import (
 func TestClientRotation_ArticleNotFound(t *testing.T) {
 	// Scenario: Primary returns 430, Backup returns 200 (Success)
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	// Add Primary (Failing)
@@ -54,7 +54,7 @@ func TestClientRotation_ArticleNotFound(t *testing.T) {
 func TestClientRotation_OnlyBackups(t *testing.T) {
 	// Scenario: No primaries, only Backup returns 200
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	// Add Backup
@@ -78,7 +78,7 @@ func TestClientRotation_OnlyBackups(t *testing.T) {
 func TestClientRotation_AllFail(t *testing.T) {
 	// Scenario: Primary returns 430, Backup returns 430
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	// Add Primary

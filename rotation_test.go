@@ -60,7 +60,7 @@ func TestClientConnectionRotation(t *testing.T) {
 		}
 	}()
 
-	client := NewClient(1)
+	client := NewClient()
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
