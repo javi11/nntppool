@@ -191,6 +191,13 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 		}
 	}
 
+	// If no connections (InitialConnections was 0), ensure deadCh is closed.
+	// This ensures signalAlive() will properly create a new open channel
+	// when the first connection is established.
+	if len(c.conns) == 0 {
+		close(c.deadCh)
+	}
+
 	return c, nil
 }
 

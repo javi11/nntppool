@@ -1869,3 +1869,68 @@ func TestWriteErrorDoesNotBlockReader(t *testing.T) {
 		t.Fatal("requests did not complete within timeout - possible deadlock in semaphore handling")
 	}
 }
+
+// TestProviderLazyConnectionFirstRequest tests that the first request works
+// immediately when InitialConnections=0 (lazy connection mode).
+// This was a bug where deadCh was left open with no connections, causing
+// signalAlive() to not properly create a new open channel when the first
+// connection was established.
+func TestProviderLazyConnectionFirstRequest(t *testing.T) {
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with InitialConnections=0 (lazy mode)
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:            srv.Addr(),
+		MaxConnections:     2,
+		InitialConnections: 0, // Lazy mode - no connections on startup
+		ConnFactory:        dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer p.Close()
+
+	// Verify no connections initially
+	if got := atomic.LoadInt32(&p.connCount); got != 0 {
+		t.Fatalf("expected 0 connections initially, got %d", got)
+	}
+
+	// First request should work immediately without needing cancel/retry
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = p.Date(ctx)
+	if err != nil {
+		t.Fatalf("first request failed (should work immediately): %v", err)
+	}
+
+	// Verify connection was created
+	if got := atomic.LoadInt32(&p.connCount); got == 0 {
+		t.Fatal("expected at least 1 connection after first request")
+	}
+
+	// Second request should also work
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+
+	err = p.Date(ctx2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+}
