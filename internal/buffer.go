@@ -26,10 +26,6 @@ const (
 type ReadBuffer struct {
 	buf        []byte
 	start, end int
-
-	// Deadline caching to avoid redundant SetReadDeadline syscalls
-	lastDeadline time.Time
-	deadlineSet  bool
 }
 
 func (rb *ReadBuffer) Init() {
@@ -94,16 +90,13 @@ func (rb *ReadBuffer) ensureWriteSpace() error {
 }
 
 func (rb *ReadBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bool) (int, error) {
-	// Only call SetReadDeadline if the deadline actually changed
+	// Always set deadline to ensure timeout is enforced.
+	// Previous caching optimization could leave stale deadlines when the same
+	// deadline value was reused across iterations, causing reads to hang indefinitely.
 	if hasDeadline {
-		if !rb.deadlineSet || !deadline.Equal(rb.lastDeadline) {
-			_ = conn.SetReadDeadline(deadline)
-			rb.lastDeadline = deadline
-			rb.deadlineSet = true
-		}
-	} else if rb.deadlineSet {
+		_ = conn.SetReadDeadline(deadline)
+	} else {
 		_ = conn.SetReadDeadline(time.Time{})
-		rb.deadlineSet = false
 	}
 	if err := rb.ensureWriteSpace(); err != nil {
 		return 0, err
