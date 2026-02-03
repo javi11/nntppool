@@ -39,7 +39,8 @@ type NNTPConnection struct {
 
 	// ready is closed when Run() is ready to receive from reqCh.
 	// This signals that the connection is fully initialized and consuming requests.
-	ready chan struct{}
+	ready     chan struct{}
+	readyOnce sync.Once
 
 	maxIdleTime  time.Duration
 	lastActivity int64
@@ -161,6 +162,12 @@ func (c *NNTPConnection) closeDone() {
 	c.doneMu.Do(func() { close(c.done) })
 }
 
+// signalReady closes the ready channel to signal that Run() is ready to receive
+// from reqCh. This is safe to call multiple times - only the first call has effect.
+func (c *NNTPConnection) signalReady() {
+	c.readyOnce.Do(func() { close(c.ready) })
+}
+
 // drainPending waits for all in-flight requests to complete before returning.
 // This is used during graceful shutdown when connection lifetime expires,
 // ensuring pending requests get their responses before the connection closes.
@@ -230,11 +237,6 @@ func (c *NNTPConnection) Run() {
 		c.cancel()
 	}()
 
-	// Signal that we're ready to receive requests from reqCh.
-	// This must happen before entering the loop so callers waiting on Ready()
-	// know the connection is actively consuming from reqCh.
-	close(c.ready)
-
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -248,6 +250,11 @@ func (c *NNTPConnection) Run() {
 		case <-c.ctx.Done():
 			return
 		}
+
+		// Signal ready AFTER acquiring inflight slot, BEFORE waiting for request.
+		// This ensures we're actually about to consume from reqCh. The signalReady
+		// method is safe to call multiple times - only the first call has effect.
+		c.signalReady()
 
 		// pull next request
 		var req *Request
