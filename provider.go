@@ -73,6 +73,11 @@ type Provider struct {
 	deadCh   chan struct{}
 	deadChMu sync.Mutex
 
+	// activeConsumers tracks connections actively waiting for requests from reqCh.
+	// Unlike connCount (which includes dying connections), this accurately reflects
+	// how many goroutines are actually ready to consume from reqCh.
+	activeConsumers int32
+
 	// Metrics
 	bytesRead    uint64
 	bytesWritten uint64
@@ -268,7 +273,7 @@ func (c *Provider) addConnection(syncMode bool) error {
 		BytesWritten: &c.bytesWritten,
 	}
 
-	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth, c.config.MaxConnIdleTime, c.config.MaxConnLifetime)
+	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth, c.config.MaxConnIdleTime, c.config.MaxConnLifetime, c)
 	if err != nil {
 		_ = conn.Close()
 		atomic.AddInt32(&c.connCount, -1)
@@ -478,17 +483,33 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		return closeWithError(ErrProviderClosed)
 	}
 
-	// If provider has no connections, try to add one synchronously.
-	// This handles recovery from a dead state (all connections died).
-	if atomic.LoadInt32(&c.connCount) == 0 {
-		// Try to add a connection synchronously - this will call signalAlive() on success
+	// Check activeConsumers to decide if we need a new connection.
+	// activeConsumers tracks connections actually waiting in the select for requests.
+	// connCount can be misleading because connections that hit idle/lifetime timeout
+	// stop consuming from reqCh immediately but connCount isn't decremented until
+	// their goroutine fully exits.
+	//
+	// If activeConsumers == 0, we need to add a connection. This happens when:
+	// - No connections exist (connCount == 0)
+	// - All connections are dying (hit timeout, stopped consuming, but connCount > 0)
+	// - All connections are busy processing requests (not waiting for new ones)
+	//
+	// For the "busy" case, addConnection will fail to add if we're at max connections,
+	// which is fine - we proceed to send and the request will be picked up when a
+	// connection finishes its current work. The key is to not *fail* in this case.
+	if atomic.LoadInt32(&c.activeConsumers) == 0 {
+		// Try to add a connection synchronously
 		if err := c.addConnection(false); err != nil {
-			// Connection failed - provider is truly unavailable
+			// Connection failed to establish - provider is truly unavailable
 			return closeWithError(ErrProviderUnavailable)
 		}
-		// After addConnection returns nil, another goroutine may have created the connection.
-		// If connCount is still 0, we couldn't create a connection and provider is unavailable.
-		if atomic.LoadInt32(&c.connCount) == 0 {
+		// addConnection(false) returns nil if we're at max connections or if it succeeded.
+		// If it succeeded, activeConsumers > 0. If we're at max, activeConsumers may still
+		// be 0 (connections are busy) or > 0 (a connection finished and is waiting).
+		//
+		// Only fail if we have NO connections at all. If connCount > 0 but
+		// activeConsumers == 0, connections are just busy and will eventually pick up requests.
+		if atomic.LoadInt32(&c.activeConsumers) == 0 && atomic.LoadInt32(&c.connCount) == 0 {
 			return closeWithError(ErrProviderUnavailable)
 		}
 	}
@@ -497,9 +518,9 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	c.sendWg.Add(1)
 	defer c.sendWg.Done()
 
-	// If we have some connections but not at max, grow asynchronously.
+	// If we have active consumers but not at max connections, grow asynchronously.
 	// This is done after sendWg.Add to ensure the goroutine completes before Close().
-	if atomic.LoadInt32(&c.connCount) > 0 && atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+	if atomic.LoadInt32(&c.activeConsumers) > 0 && atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
 		c.sendWg.Add(1)
 		go func() {
 			defer c.sendWg.Done()

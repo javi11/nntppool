@@ -46,9 +46,12 @@ type NNTPConnection struct {
 	lastActivity int64
 	maxLifeTime  time.Duration
 	createdAt    time.Time
+
+	// provider is a reference back to the Provider for updating activeConsumers.
+	provider *Provider
 }
 
-func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth, maxIdleTime time.Duration, maxLifeTime time.Duration) (*NNTPConnection, error) {
+func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth, maxIdleTime time.Duration, maxLifeTime time.Duration, provider *Provider) (*NNTPConnection, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -78,6 +81,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		lastActivity: time.Now().Unix(),
 		maxLifeTime:  maxLifeTime,
 		createdAt:    createdAt,
+		provider:     provider,
 	}
 
 	if mc, ok := conn.(*internal.MeteredConn); ok {
@@ -114,7 +118,7 @@ func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, 
 		return nil, err
 	}
 
-	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, auth, maxIdleTime, maxLifeTime)
+	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, auth, maxIdleTime, maxLifeTime, nil)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -251,11 +255,6 @@ func (c *NNTPConnection) Run() {
 			return
 		}
 
-		// Signal ready AFTER acquiring inflight slot, BEFORE waiting for request.
-		// This ensures we're actually about to consume from reqCh. The signalReady
-		// method is safe to call multiple times - only the first call has effect.
-		c.signalReady()
-
 		// pull next request
 		var req *Request
 		var ok bool
@@ -295,8 +294,22 @@ func (c *NNTPConnection) Run() {
 			lifeTimeout = lifeTimer.C
 		}
 
+		// Signal that we're actively waiting for a request.
+		// This must happen AFTER timers are set up, right before the select.
+		if c.provider != nil {
+			atomic.AddInt32(&c.provider.activeConsumers, 1)
+		}
+
+		// Signal ready AFTER incrementing activeConsumers.
+		// This ensures addConnection() doesn't return until we're actually
+		// counted as an active consumer ready to receive from reqCh.
+		c.signalReady()
+
 		select {
 		case req, ok = <-c.reqCh:
+			if c.provider != nil {
+				atomic.AddInt32(&c.provider.activeConsumers, -1)
+			}
 			if timer != nil {
 				timer.Stop()
 			}
@@ -304,6 +317,9 @@ func (c *NNTPConnection) Run() {
 				lifeTimer.Stop()
 			}
 		case <-c.ctx.Done():
+			if c.provider != nil {
+				atomic.AddInt32(&c.provider.activeConsumers, -1)
+			}
 			if timer != nil {
 				timer.Stop()
 			}
@@ -313,12 +329,18 @@ func (c *NNTPConnection) Run() {
 			<-c.inflightSem
 			return
 		case <-timeout:
+			if c.provider != nil {
+				atomic.AddInt32(&c.provider.activeConsumers, -1)
+			}
 			if lifeTimer != nil {
 				lifeTimer.Stop()
 			}
 			<-c.inflightSem
 			return
 		case <-lifeTimeout:
+			if c.provider != nil {
+				atomic.AddInt32(&c.provider.activeConsumers, -1)
+			}
 			if timer != nil {
 				timer.Stop()
 			}
