@@ -40,9 +40,13 @@ type ProviderConfig struct {
 	InflightPerConnection int
 	MaxConnIdleTime       time.Duration
 	MaxConnLifetime       time.Duration
-	Auth                  Auth
-	TLSConfig             *tls.Config
-	ConnFactory           ConnFactory
+	// HealthCheckPeriod is how often the centralized health monitor scans connections
+	// for idle/lifetime expiration. Default: 1s. Set to 0 to disable health checks
+	// (connections will then manage their own timeouts via timers).
+	HealthCheckPeriod time.Duration
+	Auth              Auth
+	TLSConfig         *tls.Config
+	ConnFactory       ConnFactory
 	// ProxyURL configures SOCKS proxy connection (e.g., "socks5://host:port" or "socks5://user:pass@host:port").
 	// Supports socks4, socks4a, and socks5 protocols.
 	// Only used when ConnFactory is nil.
@@ -72,11 +76,6 @@ type Provider struct {
 	// This allows SendRequest to immediately fail when provider is unavailable.
 	deadCh   chan struct{}
 	deadChMu sync.Mutex
-
-	// activeConsumers tracks connections actively waiting for requests from reqCh.
-	// Unlike connCount (which includes dying connections), this accurately reflects
-	// how many goroutines are actually ready to consume from reqCh.
-	activeConsumers int32
 
 	// Metrics
 	bytesRead    uint64
@@ -162,6 +161,12 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 		config.InflightPerConnection = 1
 	}
 
+	// Default health check period of 1 second if idle/lifetime timeouts are configured.
+	// A value of -1 explicitly disables health checks.
+	if config.HealthCheckPeriod == 0 && (config.MaxConnIdleTime > 0 || config.MaxConnLifetime > 0) {
+		config.HealthCheckPeriod = 5 * time.Second
+	}
+
 	// Extract host from address for deduplication
 	host, _, err := net.SplitHostPort(config.Address)
 	if err != nil {
@@ -185,6 +190,11 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 
 	// Start metrics monitor
 	go c.monitorSpeed()
+
+	// Start centralized health check goroutine if enabled
+	if config.HealthCheckPeriod > 0 {
+		go c.healthCheckLoop()
+	}
 
 	for i := 0; i < config.InitialConnections; i++ {
 		if err := c.addConnection(true); err != nil {
@@ -221,6 +231,50 @@ func (c *Provider) monitorSpeed() {
 			diff := current - lastBytesRead
 			lastBytesRead = current
 			atomic.StoreUint64(&c.currentSpeed, diff)
+		}
+	}
+}
+
+// healthCheckLoop periodically scans all connections for idle/lifetime expiration.
+// This centralizes timeout detection, eliminating per-connection timer allocations.
+func (c *Provider) healthCheckLoop() {
+	ticker := time.NewTicker(c.config.HealthCheckPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.performHealthCheck()
+		}
+	}
+}
+
+// performHealthCheck scans all connections and requests graceful shutdown for those
+// that have exceeded their idle or lifetime limits.
+func (c *Provider) performHealthCheck() {
+	now := time.Now()
+
+	// Take a snapshot of connections under read lock
+	c.connsMu.RLock()
+	conns := make([]*NNTPConnection, len(c.conns))
+	copy(conns, c.conns)
+	c.connsMu.RUnlock()
+
+	for _, conn := range conns {
+		// Check lifetime expiration first (takes precedence)
+		if c.config.MaxConnLifetime > 0 && now.Sub(conn.createdAt) > c.config.MaxConnLifetime {
+			conn.requestClose()
+			continue
+		}
+
+		// Check idle expiration
+		if c.config.MaxConnIdleTime > 0 {
+			lastActivity := time.Unix(atomic.LoadInt64(&conn.lastActivity), 0)
+			if now.Sub(lastActivity) > c.config.MaxConnIdleTime {
+				conn.requestClose()
+			}
 		}
 	}
 }
@@ -483,33 +537,20 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 		return closeWithError(ErrProviderClosed)
 	}
 
-	// Check activeConsumers to decide if we need a new connection.
-	// activeConsumers tracks connections actually waiting in the select for requests.
-	// connCount can be misleading because connections that hit idle/lifetime timeout
-	// stop consuming from reqCh immediately but connCount isn't decremented until
-	// their goroutine fully exits.
+	// Connection scaling logic using channel backpressure instead of activeConsumers.
+	// This eliminates 2 atomic operations per request cycle in the connection Run() loop.
 	//
-	// If activeConsumers == 0, we need to add a connection. This happens when:
-	// - No connections exist (connCount == 0)
-	// - All connections are dying (hit timeout, stopped consuming, but connCount > 0)
-	// - All connections are busy processing requests (not waiting for new ones)
-	//
-	// For the "busy" case, addConnection will fail to add if we're at max connections,
-	// which is fine - we proceed to send and the request will be picked up when a
-	// connection finishes its current work. The key is to not *fail* in this case.
-	if atomic.LoadInt32(&c.activeConsumers) == 0 {
-		// Try to add a connection synchronously
+	// Decision matrix:
+	// - connCount == 0: Must add a connection synchronously (provider was idle)
+	// - connCount > 0 && connCount < max: Opportunistically scale up to handle concurrent load
+	connCount := atomic.LoadInt32(&c.connCount)
+	if connCount == 0 {
+		// No connections - must add one synchronously
 		if err := c.addConnection(false); err != nil {
-			// Connection failed to establish - provider is truly unavailable
 			return closeWithError(ErrProviderUnavailable)
 		}
-		// addConnection(false) returns nil if we're at max connections or if it succeeded.
-		// If it succeeded, activeConsumers > 0. If we're at max, activeConsumers may still
-		// be 0 (connections are busy) or > 0 (a connection finished and is waiting).
-		//
-		// Only fail if we have NO connections at all. If connCount > 0 but
-		// activeConsumers == 0, connections are just busy and will eventually pick up requests.
-		if atomic.LoadInt32(&c.activeConsumers) == 0 && atomic.LoadInt32(&c.connCount) == 0 {
+		// Re-check in case addConnection succeeded
+		if atomic.LoadInt32(&c.connCount) == 0 {
 			return closeWithError(ErrProviderUnavailable)
 		}
 	}
@@ -518,9 +559,10 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	c.sendWg.Add(1)
 	defer c.sendWg.Done()
 
-	// If we have active consumers but not at max connections, grow asynchronously.
-	// This is done after sendWg.Add to ensure the goroutine completes before Close().
-	if atomic.LoadInt32(&c.activeConsumers) > 0 && atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+	// Opportunistically scale up when under max connections.
+	// This ensures we grow capacity to handle concurrent requests.
+	// addConnection(false) will no-op if we're already at max.
+	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
 		c.sendWg.Add(1)
 		go func() {
 			defer c.sendWg.Done()

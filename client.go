@@ -325,16 +325,18 @@ func (c *Client) Date(ctx context.Context) error {
 func (c *Client) sendRequest(req *Request) {
 	defer close(req.RespCh)
 
-	var visitedHosts []string
-	var lastErr error
-	var lastResp Response
-	var attempted bool
-
+	var (
+		visitedHosts []string
+		lastErr      error
+		lastResp     Response
+		attempted    bool
+		tracker      *trackingWriter
+	)
 	// Track if any bytes were written to BodyWriter.
 	// If provider1 partially writes then fails, we can't retry with provider2
 	// as that would corrupt the output (appending to partially written data).
-	var bodyWriter io.Writer = req.BodyWriter
-	var tracker *trackingWriter
+	bodyWriter := req.BodyWriter
+
 	if req.BodyWriter != nil {
 		tracker = &trackingWriter{w: req.BodyWriter}
 		// If the underlying writer supports WriteAt, wrap appropriately

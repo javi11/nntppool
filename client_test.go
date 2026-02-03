@@ -1666,8 +1666,8 @@ func TestOrphanedRequestsDrainedOnConnectionFailure(t *testing.T) {
 	// But ConnFactory limits actual connections to 1
 	provider, err := NewProvider(context.Background(), ProviderConfig{
 		Address:            srv.Addr(),
-		MaxConnections:     5,  // reqCh buffer size
-		InitialConnections: 1,  // Only 1 actual connection (ConnFactory blocks more)
+		MaxConnections:     5, // reqCh buffer size
+		InitialConnections: 1, // Only 1 actual connection (ConnFactory blocks more)
 		ConnFactory:        dial,
 	})
 	if err != nil {
@@ -1904,7 +1904,7 @@ func TestProviderLazyConnectionFirstRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Verify no connections initially
 	if got := atomic.LoadInt32(&p.connCount); got != 0 {
@@ -1974,7 +1974,7 @@ func TestProviderConcurrentRequestsWhenDead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Verify no connections initially
 	if got := atomic.LoadInt32(&p.connCount); got != 0 {
@@ -2067,14 +2067,14 @@ func TestProviderConcurrentRequestsWithPipelining(t *testing.T) {
 	p, err := NewProvider(context.Background(), ProviderConfig{
 		Address:               srv.Addr(),
 		MaxConnections:        1,
-		InitialConnections:    0,  // No connections at startup
-		InflightPerConnection: 5,  // Enable pipelining
+		InitialConnections:    0, // No connections at startup
+		InflightPerConnection: 5, // Enable pipelining
 		ConnFactory:           dial,
 	})
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// Verify no connections initially
 	if got := atomic.LoadInt32(&p.connCount); got != 0 {

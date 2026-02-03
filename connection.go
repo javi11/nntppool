@@ -9,7 +9,6 @@ import (
 	"math/rand"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/javi11/nntppool/v3/internal"
@@ -47,7 +46,12 @@ type NNTPConnection struct {
 	maxLifeTime  time.Duration
 	createdAt    time.Time
 
-	// provider is a reference back to the Provider for updating activeConsumers.
+	// closeRequested is closed by the health monitor to signal graceful shutdown.
+	// The connection checks this in its Run() select loop.
+	closeRequested     chan struct{}
+	closeRequestedOnce sync.Once
+
+	// provider is a reference back to the Provider.
 	provider *Provider
 }
 
@@ -68,20 +72,21 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 
 	c := &NNTPConnection{
-		conn:         conn,
-		ctx:          cctx,
-		cancel:       cancel,
-		reqCh:        reqCh,
-		pending:      make(chan *Request, inflightLimit),
-		inflightSem:  make(chan struct{}, inflightLimit),
-		rb:           internal.ReadBuffer{},
-		done:         make(chan struct{}),
-		ready:        make(chan struct{}),
-		maxIdleTime:  maxIdleTime,
-		lastActivity: time.Now().Unix(),
-		maxLifeTime:  maxLifeTime,
-		createdAt:    createdAt,
-		provider:     provider,
+		conn:           conn,
+		ctx:            cctx,
+		cancel:         cancel,
+		reqCh:          reqCh,
+		pending:        make(chan *Request, inflightLimit),
+		inflightSem:    make(chan struct{}, inflightLimit),
+		rb:             internal.ReadBuffer{},
+		done:           make(chan struct{}),
+		ready:          make(chan struct{}),
+		maxIdleTime:    maxIdleTime,
+		lastActivity:   time.Now().Unix(),
+		maxLifeTime:    maxLifeTime,
+		createdAt:      createdAt,
+		closeRequested: make(chan struct{}),
+		provider:       provider,
 	}
 
 	if mc, ok := conn.(*internal.MeteredConn); ok {
@@ -170,6 +175,13 @@ func (c *NNTPConnection) closeDone() {
 // from reqCh. This is safe to call multiple times - only the first call has effect.
 func (c *NNTPConnection) signalReady() {
 	c.readyOnce.Do(func() { close(c.ready) })
+}
+
+// requestClose signals the connection to gracefully shut down.
+// Called by the centralized health monitor when the connection exceeds
+// its idle or lifetime limits. Safe to call multiple times.
+func (c *NNTPConnection) requestClose() {
+	c.closeRequestedOnce.Do(func() { close(c.closeRequested) })
 }
 
 // drainPendingTimeout is the maximum time to wait for in-flight requests
@@ -270,91 +282,17 @@ func (c *NNTPConnection) Run() {
 		var req *Request
 		var ok bool
 
-		var timer *time.Timer
-		var timeout <-chan time.Time
-
-		if c.maxIdleTime > 0 {
-			last := atomic.LoadInt64(&c.lastActivity)
-			if last == 0 {
-				last = time.Now().Unix()
-			}
-			elapsed := time.Since(time.Unix(last, 0))
-			remaining := c.maxIdleTime - elapsed
-			if remaining <= 0 {
-				<-c.inflightSem
-				return
-			}
-			timer = time.NewTimer(remaining)
-			timeout = timer.C
-		}
-
-		var lifeTimer *time.Timer
-		var lifeTimeout <-chan time.Time
-
-		if c.maxLifeTime > 0 {
-			remaining := c.maxLifeTime - time.Since(c.createdAt)
-			if remaining <= 0 {
-				if timer != nil {
-					timer.Stop()
-				}
-				<-c.inflightSem
-				c.drainPending()
-				return
-			}
-			lifeTimer = time.NewTimer(remaining)
-			lifeTimeout = lifeTimer.C
-		}
-
-		// Signal that we're actively waiting for a request.
-		// This must happen AFTER timers are set up, right before the select.
-		if c.provider != nil {
-			atomic.AddInt32(&c.provider.activeConsumers, 1)
-		}
-
-		// Signal ready AFTER incrementing activeConsumers.
-		// This ensures addConnection() doesn't return until we're actually
-		// counted as an active consumer ready to receive from reqCh.
+		// Signal ready - connection is now consuming from reqCh.
 		c.signalReady()
 
 		select {
 		case req, ok = <-c.reqCh:
-			if c.provider != nil {
-				atomic.AddInt32(&c.provider.activeConsumers, -1)
-			}
-			if timer != nil {
-				timer.Stop()
-			}
-			if lifeTimer != nil {
-				lifeTimer.Stop()
-			}
+			// Got a request
 		case <-c.ctx.Done():
-			if c.provider != nil {
-				atomic.AddInt32(&c.provider.activeConsumers, -1)
-			}
-			if timer != nil {
-				timer.Stop()
-			}
-			if lifeTimer != nil {
-				lifeTimer.Stop()
-			}
 			<-c.inflightSem
 			return
-		case <-timeout:
-			if c.provider != nil {
-				atomic.AddInt32(&c.provider.activeConsumers, -1)
-			}
-			if lifeTimer != nil {
-				lifeTimer.Stop()
-			}
-			<-c.inflightSem
-			return
-		case <-lifeTimeout:
-			if c.provider != nil {
-				atomic.AddInt32(&c.provider.activeConsumers, -1)
-			}
-			if timer != nil {
-				timer.Stop()
-			}
+		case <-c.closeRequested:
+			// Graceful shutdown requested by health monitor (idle/lifetime expired)
 			<-c.inflightSem
 			c.drainPending()
 			return
