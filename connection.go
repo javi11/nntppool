@@ -37,6 +37,10 @@ type NNTPConnection struct {
 	done   chan struct{}
 	doneMu sync.Once
 
+	// ready is closed when Run() is ready to receive from reqCh.
+	// This signals that the connection is fully initialized and consuming requests.
+	ready chan struct{}
+
 	maxIdleTime  time.Duration
 	lastActivity int64
 	maxLifeTime  time.Duration
@@ -60,18 +64,19 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 
 	c := &NNTPConnection{
-		conn:        conn,
-		ctx:         cctx,
-		cancel:      cancel,
-		reqCh:       reqCh,
-		pending:     make(chan *Request, inflightLimit),
-		inflightSem: make(chan struct{}, inflightLimit),
-		rb:          internal.ReadBuffer{},
-		done:        make(chan struct{}),
-		maxIdleTime: maxIdleTime,
+		conn:         conn,
+		ctx:          cctx,
+		cancel:       cancel,
+		reqCh:        reqCh,
+		pending:      make(chan *Request, inflightLimit),
+		inflightSem:  make(chan struct{}, inflightLimit),
+		rb:           internal.ReadBuffer{},
+		done:         make(chan struct{}),
+		ready:        make(chan struct{}),
+		maxIdleTime:  maxIdleTime,
 		lastActivity: time.Now().Unix(),
-		maxLifeTime: maxLifeTime,
-		createdAt:   createdAt,
+		maxLifeTime:  maxLifeTime,
+		createdAt:    createdAt,
 	}
 
 	if mc, ok := conn.(*internal.MeteredConn); ok {
@@ -149,7 +154,8 @@ func (c *NNTPConnection) auth(auth Auth) error {
 	return nil
 }
 
-func (c *NNTPConnection) Done() <-chan struct{} { return c.done }
+func (c *NNTPConnection) Done() <-chan struct{}  { return c.done }
+func (c *NNTPConnection) Ready() <-chan struct{} { return c.ready }
 
 func (c *NNTPConnection) closeDone() {
 	c.doneMu.Do(func() { close(c.done) })
@@ -223,6 +229,11 @@ func (c *NNTPConnection) Run() {
 		// ensure writer exits too
 		c.cancel()
 	}()
+
+	// Signal that we're ready to receive requests from reqCh.
+	// This must happen before entering the loop so callers waiting on Ready()
+	// know the connection is actively consuming from reqCh.
+	close(c.ready)
 
 	for {
 		select {

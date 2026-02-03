@@ -1934,3 +1934,183 @@ func TestProviderLazyConnectionFirstRequest(t *testing.T) {
 		t.Fatalf("second request failed: %v", err)
 	}
 }
+
+// TestProviderConcurrentRequestsWhenDead tests that many concurrent requests
+// all succeed when fired against a provider with no active connections.
+// This was a race condition where addConnection() returned before Run() started
+// consuming from reqCh, causing requests to pile up and timeout.
+func TestProviderConcurrentRequestsWhenDead(t *testing.T) {
+	const numRequests = 20
+
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with InitialConnections=0 to test lazy connection mode
+	// where connections are created on first request.
+	// Use InflightPerConnection=1 to avoid pipelining (mock server doesn't handle it)
+	// and MaxConnections=2 to allow some parallelism.
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        2,
+		InitialConnections:    0, // No connections at startup
+		InflightPerConnection: 1, // No pipelining (mock server limitation)
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer p.Close()
+
+	// Verify no connections initially
+	if got := atomic.LoadInt32(&p.connCount); got != 0 {
+		t.Fatalf("expected 0 connections initially, got %d", got)
+	}
+
+	// Fire many concurrent requests - all should complete without timeout
+	var wg sync.WaitGroup
+	errors := make(chan error, numRequests)
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			err := p.Date(ctx)
+			if err != nil {
+				errors <- fmt.Errorf("request %d failed: %v", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Collect all errors
+	var errs []error
+	for err := range errors {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		t.Fatalf("concurrent requests failed (%d/%d): %v", len(errs), numRequests, errs[0])
+	}
+
+	t.Logf("all %d concurrent requests succeeded", numRequests)
+}
+
+// TestProviderConcurrentRequestsWithPipelining tests concurrent requests with
+// InflightPerConnection > 1, which enables pipelining. This tests that the
+// ready channel synchronization works properly when Run() needs to start
+// consuming requests immediately.
+func TestProviderConcurrentRequestsWithPipelining(t *testing.T) {
+	const numRequests = 10
+
+	// Create a mock server that handles pipelined DATE commands
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			// Handle potentially pipelined commands by responding to each
+			// DATE\r\n in the input
+			var response string
+			remaining := cmd
+			for len(remaining) > 0 {
+				if len(remaining) >= 6 && remaining[:6] == "DATE\r\n" {
+					response += "111 20240101000000\r\n"
+					remaining = remaining[6:]
+				} else if len(remaining) >= 6 && remaining[:6] == "QUIT\r\n" {
+					response += "205 Bye\r\n"
+					remaining = remaining[6:]
+				} else {
+					// Unknown command - find next \r\n
+					idx := 0
+					for i := 0; i < len(remaining)-1; i++ {
+						if remaining[i] == '\r' && remaining[i+1] == '\n' {
+							idx = i + 2
+							break
+						}
+					}
+					if idx == 0 {
+						idx = len(remaining)
+					}
+					response += "500 Unknown Command\r\n"
+					remaining = remaining[idx:]
+				}
+			}
+			return response, nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with InitialConnections=0 and InflightPerConnection > 1
+	// This is the configuration that triggers the original race condition
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        1,
+		InitialConnections:    0,  // No connections at startup
+		InflightPerConnection: 5,  // Enable pipelining
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer p.Close()
+
+	// Verify no connections initially
+	if got := atomic.LoadInt32(&p.connCount); got != 0 {
+		t.Fatalf("expected 0 connections initially, got %d", got)
+	}
+
+	// Fire concurrent requests - all should complete without timeout
+	var wg sync.WaitGroup
+	errors := make(chan error, numRequests)
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			err := p.Date(ctx)
+			if err != nil {
+				errors <- fmt.Errorf("request %d failed: %v", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Collect all errors
+	var errs []error
+	for err := range errors {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		t.Fatalf("concurrent requests failed (%d/%d): %v", len(errs), numRequests, errs[0])
+	}
+
+	t.Logf("all %d concurrent requests with pipelining succeeded", numRequests)
+}

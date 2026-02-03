@@ -294,6 +294,16 @@ func (c *Provider) addConnection(syncMode bool) error {
 		c.removeConnection(w)
 	}()
 
+	// Wait for the connection to be ready to receive requests.
+	// This prevents a race where addConnection returns before Run() starts
+	// consuming from reqCh, causing concurrent requests to pile up and timeout.
+	select {
+	case <-w.Ready():
+		// Connection is ready to receive requests
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+
 	return nil
 }
 
@@ -476,14 +486,26 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 			// Connection failed - provider is truly unavailable
 			return closeWithError(ErrProviderUnavailable)
 		}
-	} else if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
-		// Have some connections but not at max - grow asynchronously
-		go func() { _ = c.addConnection(false) }()
+		// After addConnection returns nil, another goroutine may have created the connection.
+		// If connCount is still 0, we couldn't create a connection and provider is unavailable.
+		if atomic.LoadInt32(&c.connCount) == 0 {
+			return closeWithError(ErrProviderUnavailable)
+		}
 	}
 
 	// Track this send operation so Close() can wait for us
 	c.sendWg.Add(1)
 	defer c.sendWg.Done()
+
+	// If we have some connections but not at max, grow asynchronously.
+	// This is done after sendWg.Add to ensure the goroutine completes before Close().
+	if atomic.LoadInt32(&c.connCount) > 0 && atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+		c.sendWg.Add(1)
+		go func() {
+			defer c.sendWg.Done()
+			_ = c.addConnection(false)
+		}()
+	}
 
 	// Re-check closed after adding to wait group
 	if c.closed.Load() {
@@ -493,10 +515,44 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	timeout := time.NewTimer(sendRequestTimeout)
 	defer timeout.Stop()
 
-	// Get current deadCh - used to detect when all connections die while we're waiting
+	// Get current deadCh - used to detect when all connections die while we're waiting.
+	// This MUST be grabbed after addConnection to get the fresh channel if signalAlive was called.
 	c.deadChMu.Lock()
 	deadCh := c.deadCh
 	c.deadChMu.Unlock()
+
+	// Check if deadCh is already closed (stale reference from concurrent addConnection race).
+	// If so, but we have connections (connCount > 0), skip deadCh monitoring and just try
+	// to send - the connection is being initialized and will start consuming shortly.
+	skipDeadCh := false
+	select {
+	case <-deadCh:
+		// deadCh is closed - check if we actually have connections
+		if atomic.LoadInt32(&c.connCount) > 0 {
+			// Connection exists but deadCh is stale (signalAlive racing with us).
+			// Don't fail on deadCh - proceed to send.
+			skipDeadCh = true
+		} else {
+			// No connections and deadCh closed - truly unavailable
+			return closeWithError(ErrProviderUnavailable)
+		}
+	default:
+		// deadCh is open, normal path
+	}
+
+	if skipDeadCh {
+		// Don't monitor deadCh - just try to send with timeout
+		select {
+		case <-c.ctx.Done():
+			return closeWithError(c.ctx.Err())
+		case <-req.Ctx.Done():
+			return closeWithError(req.Ctx.Err())
+		case c.reqCh <- req:
+			return req.RespCh
+		case <-timeout.C:
+			return closeWithError(fmt.Errorf("send request timeout after %v", sendRequestTimeout))
+		}
+	}
 
 	select {
 	case <-c.ctx.Done():
