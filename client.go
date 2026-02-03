@@ -330,9 +330,33 @@ func (c *Client) sendRequest(req *Request) {
 	var lastResp Response
 	var attempted bool
 
+	// Track if any bytes were written to BodyWriter.
+	// If provider1 partially writes then fails, we can't retry with provider2
+	// as that would corrupt the output (appending to partially written data).
+	var bodyWriter io.Writer = req.BodyWriter
+	var tracker *trackingWriter
+	if req.BodyWriter != nil {
+		tracker = &trackingWriter{w: req.BodyWriter}
+		// If the underlying writer supports WriteAt, wrap appropriately
+		// so the decoder can use WriteAt for parallel writes.
+		if wa, ok := req.BodyWriter.(io.WriterAt); ok {
+			bodyWriter = &trackingWriterAt{trackingWriter: tracker, wa: wa}
+		} else {
+			bodyWriter = tracker
+		}
+	}
+
 	// Helper to try a list of providers
 	tryProviders := func(providers []*Provider) bool { // returns true if successful
 		for _, p := range providers {
+			// Check if context is cancelled - don't try other providers
+			select {
+			case <-req.Ctx.Done():
+				lastErr = req.Ctx.Err()
+				return false
+			default:
+			}
+
 			// Check if visited
 			var visited bool
 			for _, h := range visitedHosts {
@@ -352,7 +376,7 @@ func (c *Client) sendRequest(req *Request) {
 			subReq := &Request{
 				Ctx:          req.Ctx,
 				Payload:      req.Payload,
-				BodyWriter:   req.BodyWriter,
+				BodyWriter:   bodyWriter,
 				RespCh:       attemptCh,
 				OnYencHeader: req.OnYencHeader,
 			}
@@ -369,11 +393,16 @@ func (c *Client) sendRequest(req *Request) {
 				// Context cancelled while waiting for response
 				// The request is already sent to provider, but we should not block indefinitely
 				lastErr = req.Ctx.Err()
-				continue
+				// Don't continue to next provider - context is cancelled
+				return false
 			}
 
 			if !ok {
 				lastErr = fmt.Errorf("provider %s closed unexpectedly", p.Host)
+				// If bytes were written, can't retry - would corrupt output
+				if tracker != nil && tracker.written > 0 {
+					return false
+				}
 				continue
 			}
 
@@ -384,6 +413,12 @@ func (c *Client) sendRequest(req *Request) {
 			if resp.Err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				req.RespCh <- resp
 				return true
+			}
+
+			// If bytes were written to BodyWriter but we got an error,
+			// can't retry with another provider - would corrupt output
+			if tracker != nil && tracker.written > 0 {
+				return false
 			}
 
 			// If 430 (Article Not Found) or error, we continue to next provider.
@@ -603,6 +638,36 @@ type countingDiscard struct {
 func (c *countingDiscard) Write(p []byte) (int, error) {
 	atomic.AddInt64(&c.n, int64(len(p)))
 	return len(p), nil
+}
+
+// trackingWriter wraps a writer to track if any bytes were written.
+// Used to detect partial writes during failover - if bytes were written
+// to the original writer, we can't retry with another provider.
+type trackingWriter struct {
+	w       io.Writer
+	written int64
+}
+
+func (t *trackingWriter) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if n > 0 {
+		atomic.AddInt64(&t.written, int64(n))
+	}
+	return n, err
+}
+
+// trackingWriterAt wraps a WriterAt to track if any bytes were written.
+type trackingWriterAt struct {
+	*trackingWriter
+	wa io.WriterAt
+}
+
+func (t *trackingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := t.wa.WriteAt(p, off)
+	if n > 0 {
+		atomic.AddInt64(&t.written, int64(n))
+	}
+	return n, err
 }
 
 // Post posts an article to the NNTP server with the given headers and body.

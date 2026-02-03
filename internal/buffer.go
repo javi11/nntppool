@@ -20,7 +20,8 @@ const (
 	// DefaultResponseTimeout is the maximum time for a complete response.
 	// Prevents slow-drip attacks where server sends minimal data to stay alive.
 	// This deadline is calculated once at the start and does not reset on data received.
-	DefaultResponseTimeout = 30 * time.Second
+	// Set to 5 minutes to accommodate large articles and slow connections.
+	DefaultResponseTimeout = 5 * time.Minute
 )
 
 type ReadBuffer struct {
@@ -114,14 +115,18 @@ func (rb *ReadBuffer) FeedUntilDone(conn net.Conn, feeder StreamFeeder, out io.W
 	// Calculate response deadline ONCE at start (prevents slow-drip resets).
 	// This ensures a maximum total time for the response, regardless of how
 	// much data trickles in.
+	// If caller provides a context deadline, use the minimum of (caller deadline, now+5min).
 	responseDeadline := time.Now().Add(DefaultResponseTimeout)
+	if contextDeadline, hasContext := deadline(); hasContext && contextDeadline.Before(responseDeadline) {
+		responseDeadline = contextDeadline
+	}
 
 	// Helper to get the earliest applicable deadline
 	getDeadline := func() (time.Time, bool) {
 		// Per-read deadline (detects completely stalled connections)
 		perReadDeadline := time.Now().Add(DefaultReadTimeout)
 
-		// Context deadline from caller
+		// Context deadline from caller (may have changed since start)
 		contextDeadline, hasContext := deadline()
 
 		// Use the earliest applicable deadline

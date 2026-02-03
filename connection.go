@@ -172,16 +172,27 @@ func (c *NNTPConnection) signalReady() {
 	c.readyOnce.Do(func() { close(c.ready) })
 }
 
+// drainPendingTimeout is the maximum time to wait for in-flight requests
+// during graceful shutdown. Prevents indefinite blocking during lifetime expiration.
+const drainPendingTimeout = 5 * time.Second
+
 // drainPending waits for all in-flight requests to complete before returning.
 // This is used during graceful shutdown when connection lifetime expires,
 // ensuring pending requests get their responses before the connection closes.
+// Has a 5s timeout to prevent indefinite blocking.
 func (c *NNTPConnection) drainPending() {
 	slots := cap(c.inflightSem)
+	timer := time.NewTimer(drainPendingTimeout)
+	defer timer.Stop()
+
 	for i := 0; i < slots; i++ {
 		select {
 		case c.inflightSem <- struct{}{}:
 			// Acquired a slot, continue
 		case <-c.ctx.Done():
+			return
+		case <-timer.C:
+			// Timeout - don't block forever during graceful shutdown
 			return
 		}
 	}
