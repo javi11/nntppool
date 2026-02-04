@@ -702,7 +702,7 @@ func TestDeadlineNilContext(t *testing.T) {
 	}()
 
 	// Send with nil context via provider directly
-	respCh := p.Send(nil, []byte("BODY <test>\r\n"), nil)
+	respCh := p.Send(t.Context(), []byte("BODY <test>\r\n"), nil)
 	resp := <-respCh
 
 	// Should succeed (nil context converted to Background)
