@@ -68,12 +68,13 @@ func TestClientConnectionRotation(t *testing.T) {
 		return d.DialContext(ctx, "tcp", l.Addr().String())
 	}
 
-	// Provider with very short lifetime
+	// Provider with very short lifetime and health check period
 	p, err := NewProvider(context.Background(), ProviderConfig{
-		Address:         l.Addr().String(),
-		MaxConnections:  1,
-		MaxConnLifetime: 200 * time.Millisecond,
-		ConnFactory:     dial,
+		Address:           l.Addr().String(),
+		MaxConnections:    1,
+		MaxConnLifetime:   200 * time.Millisecond,
+		HealthCheckPeriod: 100 * time.Millisecond, // Check frequently to trigger rotation
+		ConnFactory:       dial,
 	})
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)

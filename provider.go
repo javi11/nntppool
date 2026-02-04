@@ -357,9 +357,11 @@ func (c *Provider) addConnection(syncMode bool) error {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		defer atomic.AddInt32(&c.connCount, -1)
 		w.Run()
-		// Remove connection from slice after it exits
+		// Remove connection from slice after it exits.
+		// Note: connCount is decremented inside removeConnection() to ensure
+		// it happens atomically with signalDead(), preventing a race where
+		// connCount > 0 but no connections are actually consuming from reqCh.
 		c.removeConnection(w)
 	}()
 
@@ -384,23 +386,38 @@ func (c *Provider) removeConnection(conn *NNTPConnection) {
 		mc.Flush()
 	}
 
+	shouldDrain := false
 	c.connsMu.Lock()
-	defer c.connsMu.Unlock()
-
+	found := false
 	for i, cc := range c.conns {
 		if cc == conn {
 			// Remove by swapping with last element and truncating
 			c.conns[i] = c.conns[len(c.conns)-1]
 			c.conns[len(c.conns)-1] = nil // Clear reference for GC
 			c.conns = c.conns[:len(c.conns)-1]
+			found = true
 			break
 		}
 	}
 
-	// Check if this was the last connection - signal unavailability and drain
+	// Decrement connCount BEFORE signalDead() to prevent race condition where
+	// SendRequest sees connCount > 0 but no connections are consuming from reqCh.
+	// Only decrement if we actually found and removed the connection.
+	if found {
+		atomic.AddInt32(&c.connCount, -1)
+	}
+
+	// Check if this was the last connection - signal unavailability
 	// so callers can retry with other providers or wait for reconnect
 	if len(c.conns) == 0 && !c.closed.Load() {
 		c.signalDead()
+		shouldDrain = true
+	}
+	c.connsMu.Unlock()
+
+	// Drain orphaned requests AFTER releasing lock to avoid deadlock.
+	// drainOrphanedRequests only accesses channels, not protected state.
+	if shouldDrain {
 		c.drainOrphanedRequests()
 	}
 }
@@ -512,7 +529,11 @@ func (c *Provider) Close() error {
 		return nil
 	}
 
-	slog.Info("provider closing", "host", c.Host, "active_connections", len(c.conns))
+	c.connsMu.Lock()
+	activeConns := len(c.conns)
+	c.connsMu.Unlock()
+
+	slog.Info("provider closing", "host", c.Host, "active_connections", activeConns)
 
 	c.cancel()
 
