@@ -286,6 +286,18 @@ The library includes several automatic features that require no configuration:
 
 - **TCP Buffers**: All connections are automatically optimized with 8MB read buffers and 1MB write buffers for high-speed downloads.
 
+- **Sequential Readers with io.Pipe**: When implementing a sequential reader (`io.Reader` that must consume segments in order) using `io.Pipe`, download segment data to a buffer first, then copy to the pipe. Direct pipe writes can cause connection deadlock:
+  1. Workers hold connections while blocked on pipe writes (pipes are synchronous)
+  2. Pipe writes block until the reader consumes them sequentially
+  3. Reader can't reach later pipes because connections are held by workers blocked on earlier pipes
+
+  **Solution**: Download to buffer first, then write to pipe:
+  ```go
+  var buf bytes.Buffer
+  client.Body(ctx, id, &buf)  // Connection released here
+  io.Copy(pipeWriter, &buf)   // May block, but connection is free
+  ```
+
 - **Health Checks**: Provider health checks run every 60 seconds with minimal overhead (single `DATE` command per provider).
 
 ## Examples

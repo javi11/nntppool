@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"sync"
@@ -398,29 +399,41 @@ func (c *Provider) removeConnection(conn *NNTPConnection) {
 // signalDead closes deadCh to signal that provider is unavailable.
 // This unblocks any SendRequest calls waiting to send to reqCh.
 func (c *Provider) signalDead() {
+	var shouldLog bool
 	c.deadChMu.Lock()
-	defer c.deadChMu.Unlock()
 	// Only close if not already closed (check by trying to receive)
 	select {
 	case <-c.deadCh:
 		// Already closed
 	default:
 		close(c.deadCh)
+		shouldLog = true
+	}
+	c.deadChMu.Unlock()
+
+	if shouldLog {
+		slog.Info("provider offline", "host", c.Host)
 	}
 }
 
 // signalAlive creates a new deadCh to allow SendRequest calls to proceed.
 // Called when a new connection is established after provider was dead.
 func (c *Provider) signalAlive() {
+	var shouldLog bool
 	c.deadChMu.Lock()
-	defer c.deadChMu.Unlock()
 	// Only recreate if currently closed
 	select {
 	case <-c.deadCh:
 		// Was closed, recreate
 		c.deadCh = make(chan struct{})
+		shouldLog = true
 	default:
 		// Still open, nothing to do
+	}
+	c.deadChMu.Unlock()
+
+	if shouldLog {
+		slog.Info("provider online", "host", c.Host)
 	}
 }
 
@@ -452,6 +465,8 @@ func (c *Provider) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+
+	slog.Info("provider closing", "host", c.Host, "active_connections", len(c.conns))
 
 	c.cancel()
 

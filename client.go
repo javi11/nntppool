@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -132,11 +133,12 @@ func (c *Client) Close() {
 	close(c.closeCh)
 
 	primaries := c.primaries.Load().([]*Provider)
+	backups := c.backups.Load().([]*Provider)
+	slog.Info("client closing", "primary_providers", len(primaries), "backup_providers", len(backups))
 	for _, p := range primaries {
 		_ = p.Close()
 	}
 
-	backups := c.backups.Load().([]*Provider)
 	for _, p := range backups {
 		_ = p.Close()
 	}

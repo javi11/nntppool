@@ -2114,3 +2114,242 @@ func TestProviderConcurrentRequestsWithPipelining(t *testing.T) {
 
 	t.Logf("all %d concurrent requests with pipelining succeeded", numRequests)
 }
+
+// TestSequentialReaderWithPipeDeadlock demonstrates the connection deadlock issue
+// when implementing a sequential reader using io.Pipe with direct writes.
+//
+// The deadlock scenario:
+//  1. Workers hold connections while blocked on pipe writes (pipes are synchronous)
+//  2. Pipe writes block until the reader consumes them sequentially
+//  3. Reader can't reach later pipes because connections are held by workers blocked on earlier pipes
+//
+// Solution: Download to buffer first, then copy to pipe (connection released before potential block).
+func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
+	// Test data - 3 segments that must be read in order
+	segments := [][]byte{
+		[]byte("segment-1-data"),
+		[]byte("segment-2-data"),
+		[]byte("segment-3-data"),
+	}
+
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if strings.HasPrefix(cmd, "BODY") {
+				parts := strings.Fields(cmd)
+				if len(parts) >= 2 {
+					id := strings.TrimRight(parts[1], "\r\n")
+					// Return segment based on ID
+					for i, seg := range segments {
+						if id == fmt.Sprintf("<%d>", i) {
+							yencBody := testutil.EncodeYenc(seg, fmt.Sprintf("seg%d.txt", i), 1, 1)
+							return fmt.Sprintf("222 0 %s body follows\r\n%s.\r\n", id, yencBody), nil
+						}
+					}
+				}
+				return "430 No such article\r\n", nil
+			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer cleanup()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	t.Run("deadlock_with_direct_pipe_writes", func(t *testing.T) {
+		// Setup client with limited connections (2 connections for 3 segments)
+		// This creates the deadlock condition when all connections are blocked on pipe writes
+		client := NewClient()
+		defer client.Close()
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:               srv.Addr(),
+			MaxConnections:        2, // Fewer connections than segments
+			InflightPerConnection: 1,
+			ConnFactory:           dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		if err := client.AddProvider(p, ProviderPrimary); err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
+
+		// Create pipes for each segment
+		pipes := make([]struct {
+			r *io.PipeReader
+			w *io.PipeWriter
+		}, len(segments))
+		for i := range pipes {
+			pipes[i].r, pipes[i].w = io.Pipe()
+		}
+
+		// Start workers that download directly to pipes (problematic pattern)
+		var wg sync.WaitGroup
+		downloadDone := make(chan struct{})
+		for i := range segments {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				defer cancel()
+				// Direct pipe write - will block until reader consumes
+				err := client.Body(ctx, fmt.Sprintf("<%d>", idx), pipes[idx].w)
+				if err != nil {
+					// Expected to timeout/fail due to deadlock
+					_ = pipes[idx].w.CloseWithError(err)
+				} else {
+					_ = pipes[idx].w.Close()
+				}
+			}(i)
+		}
+
+		go func() {
+			wg.Wait()
+			close(downloadDone)
+		}()
+
+		// Sequential reader - must read segment 0, then 1, then 2
+		// With direct pipe writes and limited connections, this will deadlock:
+		// - Workers for seg 1 and 2 hold the 2 connections
+		// - They block on pipe writes waiting for reader
+		// - Reader is waiting for seg 0 which can't start (no free connections)
+		var result bytes.Buffer
+		readDone := make(chan error, 1)
+		go func() {
+			for i := 0; i < len(segments); i++ {
+				_, err := io.Copy(&result, pipes[i].r)
+				if err != nil && err != io.EOF {
+					readDone <- err
+					return
+				}
+			}
+			readDone <- nil
+		}()
+
+		// With the deadlock pattern, we expect a timeout
+		select {
+		case err := <-readDone:
+			if err == nil && result.Len() == len(segments[0])+len(segments[1])+len(segments[2]) {
+				// If it succeeds, that's actually fine - the race condition didn't trigger
+				t.Log("direct pipe writes completed (race condition didn't trigger this time)")
+			}
+		case <-downloadDone:
+			// Downloads completed but reader may still be blocked
+			select {
+			case <-readDone:
+				// OK
+			case <-time.After(100 * time.Millisecond):
+				t.Log("reader blocked after downloads - demonstrating potential deadlock")
+			}
+		case <-time.After(1 * time.Second):
+			// Expected: timeout due to deadlock potential
+			t.Log("timeout detected - deadlock scenario demonstrated")
+		}
+
+		// Cleanup pipes
+		for i := range pipes {
+			_ = pipes[i].r.Close()
+			_ = pipes[i].w.Close()
+		}
+	})
+
+	t.Run("no_deadlock_with_buffered_writes", func(t *testing.T) {
+		// Setup client with same limited connections
+		client := NewClient()
+		defer client.Close()
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:               srv.Addr(),
+			MaxConnections:        2, // Same limited connections
+			InflightPerConnection: 1,
+			ConnFactory:           dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		if err := client.AddProvider(p, ProviderPrimary); err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
+
+		// Create pipes for each segment
+		pipes := make([]struct {
+			r *io.PipeReader
+			w *io.PipeWriter
+		}, len(segments))
+		for i := range pipes {
+			pipes[i].r, pipes[i].w = io.Pipe()
+		}
+
+		// Start workers that buffer first, then write to pipe (correct pattern)
+		var wg sync.WaitGroup
+		for i := range segments {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				// SOLUTION: Buffer first, then copy to pipe
+				var buf bytes.Buffer
+				err := client.Body(ctx, fmt.Sprintf("<%d>", idx), &buf) // Connection released here
+				if err != nil {
+					_ = pipes[idx].w.CloseWithError(err)
+					return
+				}
+				_, err = io.Copy(pipes[idx].w, &buf) // May block, but connection is free
+				if err != nil {
+					_ = pipes[idx].w.CloseWithError(err)
+				} else {
+					_ = pipes[idx].w.Close()
+				}
+			}(i)
+		}
+
+		// Sequential reader
+		var result bytes.Buffer
+		readDone := make(chan error, 1)
+		go func() {
+			for i := 0; i < len(segments); i++ {
+				_, err := io.Copy(&result, pipes[i].r)
+				if err != nil && err != io.EOF {
+					readDone <- err
+					return
+				}
+			}
+			readDone <- nil
+		}()
+
+		// With buffered pattern, should complete without deadlock
+		select {
+		case err := <-readDone:
+			if err != nil {
+				t.Fatalf("sequential read failed: %v", err)
+			}
+			// Verify all segments were read
+			expected := string(segments[0]) + string(segments[1]) + string(segments[2])
+			if result.String() != expected {
+				t.Errorf("data mismatch:\nexpected: %q\ngot: %q", expected, result.String())
+			}
+			t.Log("buffered writes completed successfully - no deadlock")
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout - unexpected deadlock with buffered pattern")
+		}
+
+		wg.Wait()
+
+		// Cleanup pipes
+		for i := range pipes {
+			_ = pipes[i].r.Close()
+			_ = pipes[i].w.Close()
+		}
+	})
+}
