@@ -57,8 +57,11 @@ func main() {
     defer provider.Close()
 
     // Create client (implements NNTPClient interface)
-    client := nntppool.NewClient(100) // Max 100 concurrent requests
-    client.AddProvider(provider, nntppool.ProviderPrimary)
+    client := nntppool.NewClient()
+    err = client.AddProvider(provider, nntppool.ProviderPrimary)
+    if err != nil {
+        panic(err)
+    }
     defer client.Close()
 
     // Download article body
@@ -139,9 +142,15 @@ backupProvider, _ := nntppool.NewProvider(ctx, nntppool.ProviderConfig{
 })
 
 // Add to client with tier priority
-client := nntppool.NewClient(100)
-client.AddProvider(primaryProvider, nntppool.ProviderPrimary)
-client.AddProvider(backupProvider, nntppool.ProviderBackup)
+client := nntppool.NewClient()
+err = client.AddProvider(primaryProvider, nntppool.ProviderPrimary)
+if err != nil {
+    panic(err)
+}
+err = client.AddProvider(backupProvider, nntppool.ProviderBackup)
+if err != nil {
+    panic(err)
+}
 
 // Client automatically tries primary first, falls back to backup on errors
 ```
@@ -271,11 +280,23 @@ The library includes several automatic features that require no configuration:
 
 - **Connection Pooling**: Each provider maintains an independent connection pool. Connections are created lazily up to `MaxConnections` and reused across requests.
 
-- **Concurrency Control**: Use `maxInflight` parameter in `NewClient(maxInflight)` to limit memory usage with many concurrent requests. Set to `0` for unlimited concurrency.
+- **Concurrency Control**: Callers control concurrency externally using mechanisms like `errgroup.SetLimit()`, worker pools, or semaphores. Provider-level connection limits handle internal throttling via `MaxConnections` and `InflightPerConnection` settings.
 
 - **Streaming**: Use `BodyReader()` or `BodyAt()` to avoid buffering large articles in memory. The streaming API decodes yEnc on-the-fly and writes directly to the destination.
 
 - **TCP Buffers**: All connections are automatically optimized with 8MB read buffers and 1MB write buffers for high-speed downloads.
+
+- **Sequential Readers with io.Pipe**: When implementing a sequential reader (`io.Reader` that must consume segments in order) using `io.Pipe`, download segment data to a buffer first, then copy to the pipe. Direct pipe writes can cause connection deadlock:
+  1. Workers hold connections while blocked on pipe writes (pipes are synchronous)
+  2. Pipe writes block until the reader consumes them sequentially
+  3. Reader can't reach later pipes because connections are held by workers blocked on earlier pipes
+
+  **Solution**: Download to buffer first, then write to pipe:
+  ```go
+  var buf bytes.Buffer
+  client.Body(ctx, id, &buf)  // Connection released here
+  io.Copy(pipeWriter, &buf)   // May block, but connection is free
+  ```
 
 - **Health Checks**: Provider health checks run every 60 seconds with minimal overhead (single `DATE` command per provider).
 

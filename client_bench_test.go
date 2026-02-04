@@ -21,7 +21,7 @@ func generateTestData(size int) []byte {
 }
 
 // setupBenchmarkClient creates a client with a mock provider for benchmarking.
-func setupBenchmarkClient(b *testing.B, payload []byte, maxInflight int, maxConnections int) *Client {
+func setupBenchmarkClient(b *testing.B, payload []byte, maxConnections int) *Client {
 	b.Helper()
 
 	// Create mock dialer with YEnc handler
@@ -30,7 +30,7 @@ func setupBenchmarkClient(b *testing.B, payload []byte, maxInflight int, maxConn
 	})
 
 	// Create client
-	client := NewClient(maxInflight)
+	client := NewClient()
 
 	// Create provider
 	provider, err := NewProvider(context.Background(), ProviderConfig{
@@ -43,16 +43,19 @@ func setupBenchmarkClient(b *testing.B, payload []byte, maxInflight int, maxConn
 		b.Fatalf("failed to create provider: %v", err)
 	}
 
-	client.AddProvider(provider, ProviderPrimary)
+	err = client.AddProvider(provider, ProviderPrimary)
+	if err != nil {
+		b.Fatalf("failed to add provider: %v", err)
+	}
 
 	return client
 }
 
 // setupMultiProviderClient creates a client with multiple providers for benchmarking.
-func setupMultiProviderClient(b *testing.B, payload []byte, maxInflight int) *Client {
+func setupMultiProviderClient(b *testing.B, payload []byte) *Client {
 	b.Helper()
 
-	client := NewClient(maxInflight)
+	client := NewClient()
 
 	// Add 2 primary providers
 	for i := 0; i < 2; i++ {
@@ -70,7 +73,10 @@ func setupMultiProviderClient(b *testing.B, payload []byte, maxInflight int) *Cl
 			b.Fatalf("failed to create primary provider %d: %v", i, err)
 		}
 
-		client.AddProvider(provider, ProviderPrimary)
+		err = client.AddProvider(provider, ProviderPrimary)
+		if err != nil {
+			b.Fatalf("failed to add provider: %v", err)
+		}
 	}
 
 	// Add 1 backup provider
@@ -88,7 +94,10 @@ func setupMultiProviderClient(b *testing.B, payload []byte, maxInflight int) *Cl
 		b.Fatalf("failed to create backup provider: %v", err)
 	}
 
-	client.AddProvider(provider, ProviderBackup)
+	err = client.AddProvider(provider, ProviderBackup)
+	if err != nil {
+		b.Fatalf("failed to add backup provider: %v", err)
+	}
 
 	return client
 }
@@ -97,7 +106,7 @@ func setupMultiProviderClient(b *testing.B, payload []byte, maxInflight int) *Cl
 // Tests baseline overhead and small data throughput.
 func BenchmarkClientBody_SmallPayload(b *testing.B) {
 	payload := generateTestData(1024) // 1 KB
-	client := setupBenchmarkClient(b, payload, 10, 2)
+	client := setupBenchmarkClient(b, payload, 2)
 	defer client.Close()
 
 	ctx := context.Background()
@@ -121,7 +130,7 @@ func BenchmarkClientBody_SmallPayload(b *testing.B) {
 // Tests typical text/article size performance.
 func BenchmarkClientBody_MediumPayload(b *testing.B) {
 	payload := generateTestData(100 * 1024) // 100 KB
-	client := setupBenchmarkClient(b, payload, 50, 5)
+	client := setupBenchmarkClient(b, payload, 5)
 	defer client.Close()
 
 	ctx := context.Background()
@@ -145,7 +154,7 @@ func BenchmarkClientBody_MediumPayload(b *testing.B) {
 // Tests binary file download performance with >100 MB/s target.
 func BenchmarkClientBody_LargePayload(b *testing.B) {
 	payload := generateTestData(10 * 1024 * 1024) // 10 MB
-	client := setupBenchmarkClient(b, payload, 100, 10)
+	client := setupBenchmarkClient(b, payload, 10)
 	defer client.Close()
 
 	ctx := context.Background()
@@ -173,7 +182,7 @@ func BenchmarkClientBody_LargePayload(b *testing.B) {
 // BenchmarkClientBody_Parallel_1KB benchmarks concurrent Body calls with 1KB payload.
 func BenchmarkClientBody_Parallel_1KB(b *testing.B) {
 	payload := generateTestData(1024) // 1 KB
-	client := setupBenchmarkClient(b, payload, 10, 2)
+	client := setupBenchmarkClient(b, payload, 2)
 	defer client.Close()
 
 	b.ResetTimer()
@@ -198,7 +207,7 @@ func BenchmarkClientBody_Parallel_1KB(b *testing.B) {
 // BenchmarkClientBody_Parallel_100KB benchmarks concurrent Body calls with 100KB payload.
 func BenchmarkClientBody_Parallel_100KB(b *testing.B) {
 	payload := generateTestData(100 * 1024) // 100 KB
-	client := setupBenchmarkClient(b, payload, 50, 5)
+	client := setupBenchmarkClient(b, payload, 5)
 	defer client.Close()
 
 	b.ResetTimer()
@@ -224,7 +233,7 @@ func BenchmarkClientBody_Parallel_100KB(b *testing.B) {
 // Tests concurrent large file downloads with >100 MB/s target.
 func BenchmarkClientBody_Parallel_10MB(b *testing.B) {
 	payload := generateTestData(10 * 1024 * 1024) // 10 MB
-	client := setupBenchmarkClient(b, payload, 100, 10)
+	client := setupBenchmarkClient(b, payload, 10)
 	defer client.Close()
 
 	b.ResetTimer()
@@ -255,7 +264,7 @@ func BenchmarkClientBody_Parallel_10MB(b *testing.B) {
 // Tests performance with primary + backup failover scenario.
 func BenchmarkClientBody_MultiProvider(b *testing.B) {
 	payload := generateTestData(1024 * 1024) // 1 MB
-	client := setupMultiProviderClient(b, payload, 50)
+	client := setupMultiProviderClient(b, payload)
 	defer client.Close()
 
 	ctx := context.Background()
@@ -279,7 +288,7 @@ func BenchmarkClientBody_MultiProvider(b *testing.B) {
 // Tests overhead of context deadline handling.
 func BenchmarkClientBody_WithTimeout(b *testing.B) {
 	payload := generateTestData(100 * 1024) // 100 KB
-	client := setupBenchmarkClient(b, payload, 50, 5)
+	client := setupBenchmarkClient(b, payload, 5)
 	defer client.Close()
 
 	b.ResetTimer()

@@ -65,10 +65,13 @@ func main() {
 	}()
 
 	// Use the provider with a client
-	client := nntppool.NewClient(20)
+	client := nntppool.NewClient()
 	defer client.Close()
 
-	client.AddProvider(provider1, nntppool.ProviderPrimary)
+	err = client.AddProvider(provider1, nntppool.ProviderPrimary)
+	if err != nil {
+		log.Fatalf("Failed to add provider: %v", err)
+	}
 
 	// Now all connections will go through the SOCKS proxy
 	ctx := context.Background()

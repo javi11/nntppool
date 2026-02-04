@@ -3,8 +3,10 @@ package nntppool
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"sync"
@@ -14,6 +16,19 @@ import (
 	"github.com/javi11/nntppool/v3/internal"
 	"golang.org/x/net/proxy"
 )
+
+const sendRequestTimeout = 5 * time.Second
+
+// connectionThrottleDuration is how long max connections throttling lasts after
+// receiving a "max connections exceeded" error from the server.
+const connectionThrottleDuration = 5 * time.Minute
+
+// ErrProviderClosed is returned when a request is made to a closed provider.
+var ErrProviderClosed = errors.New("provider closed")
+
+// ErrProviderUnavailable is returned when all connections to a provider have failed.
+// This error is retryable - the client should try other providers or retry later.
+var ErrProviderUnavailable = errors.New("provider unavailable: all connections failed")
 
 type ProviderMetrics struct {
 	Host              string
@@ -30,9 +45,13 @@ type ProviderConfig struct {
 	InflightPerConnection int
 	MaxConnIdleTime       time.Duration
 	MaxConnLifetime       time.Duration
-	Auth                  Auth
-	TLSConfig             *tls.Config
-	ConnFactory           ConnFactory
+	// HealthCheckPeriod is how often the centralized health monitor scans connections
+	// for idle/lifetime expiration. Default: 1s. Set to 0 to disable health checks
+	// (connections will then manage their own timeouts via timers).
+	HealthCheckPeriod time.Duration
+	Auth              Auth
+	TLSConfig         *tls.Config
+	ConnFactory       ConnFactory
 	// ProxyURL configures SOCKS proxy connection (e.g., "socks5://host:port" or "socks5://user:pass@host:port").
 	// Supports socks4, socks4a, and socks5 protocols.
 	// Only used when ConnFactory is nil.
@@ -54,13 +73,23 @@ type Provider struct {
 	connCount int32
 	config    ProviderConfig
 
-	closed  atomic.Bool
-	closeMu sync.Mutex
+	closed atomic.Bool
+	sendWg sync.WaitGroup // Tracks in-flight SendRequest calls for safe channel close
+
+	// deadCh is closed when all connections die (connCount reaches 0)
+	// and reopened when a new connection is established.
+	// This allows SendRequest to immediately fail when provider is unavailable.
+	deadCh   chan struct{}
+	deadChMu sync.Mutex
 
 	// Metrics
 	bytesRead    uint64
 	bytesWritten uint64
 	currentSpeed uint64 // bytes per second
+
+	// Connection throttling for max connections exceeded errors
+	throttledMaxConns int32        // Temporarily reduced max connections (0 = not throttled)
+	throttleUntil     atomic.Int64 // Unix timestamp when throttle expires
 }
 
 func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) {
@@ -141,6 +170,12 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 		config.InflightPerConnection = 1
 	}
 
+	// Default health check period of 1 second if idle/lifetime timeouts are configured.
+	// A value of -1 explicitly disables health checks.
+	if config.HealthCheckPeriod == 0 && (config.MaxConnIdleTime > 0 || config.MaxConnLifetime > 0) {
+		config.HealthCheckPeriod = 5 * time.Second
+	}
+
 	// Extract host from address for deduplication
 	host, _, err := net.SplitHostPort(config.Address)
 	if err != nil {
@@ -159,10 +194,16 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 		reqCh:  make(chan *Request, config.MaxConnections),
 		conns:  make([]*NNTPConnection, 0, config.MaxConnections),
 		config: config,
+		deadCh: make(chan struct{}),
 	}
 
 	// Start metrics monitor
 	go c.monitorSpeed()
+
+	// Start centralized health check goroutine if enabled
+	if config.HealthCheckPeriod > 0 {
+		go c.healthCheckLoop()
+	}
 
 	for i := 0; i < config.InitialConnections; i++ {
 		if err := c.addConnection(true); err != nil {
@@ -172,6 +213,13 @@ func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) 
 			}
 			return nil, err
 		}
+	}
+
+	// If no connections (InitialConnections was 0), ensure deadCh is closed.
+	// This ensures signalAlive() will properly create a new open channel
+	// when the first connection is established.
+	if len(c.conns) == 0 {
+		close(c.deadCh)
 	}
 
 	return c, nil
@@ -192,6 +240,50 @@ func (c *Provider) monitorSpeed() {
 			diff := current - lastBytesRead
 			lastBytesRead = current
 			atomic.StoreUint64(&c.currentSpeed, diff)
+		}
+	}
+}
+
+// healthCheckLoop periodically scans all connections for idle/lifetime expiration.
+// This centralizes timeout detection, eliminating per-connection timer allocations.
+func (c *Provider) healthCheckLoop() {
+	ticker := time.NewTicker(c.config.HealthCheckPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.performHealthCheck()
+		}
+	}
+}
+
+// performHealthCheck scans all connections and requests graceful shutdown for those
+// that have exceeded their idle or lifetime limits.
+func (c *Provider) performHealthCheck() {
+	now := time.Now()
+
+	// Take a snapshot of connections under read lock
+	c.connsMu.RLock()
+	conns := make([]*NNTPConnection, len(c.conns))
+	copy(conns, c.conns)
+	c.connsMu.RUnlock()
+
+	for _, conn := range conns {
+		// Check lifetime expiration first (takes precedence)
+		if c.config.MaxConnLifetime > 0 && now.Sub(conn.createdAt) > c.config.MaxConnLifetime {
+			conn.requestClose()
+			continue
+		}
+
+		// Check idle expiration
+		if c.config.MaxConnIdleTime > 0 {
+			lastActivity := time.Unix(atomic.LoadInt64(&conn.lastActivity), 0)
+			if now.Sub(lastActivity) > c.config.MaxConnIdleTime {
+				conn.requestClose()
+			}
 		}
 	}
 }
@@ -219,11 +311,12 @@ func (c *Provider) addConnection(syncMode bool) error {
 	}
 
 	if !syncMode {
+		maxConns := c.getEffectiveMaxConnections()
 		current := atomic.LoadInt32(&c.connCount)
-		if current >= int32(c.config.MaxConnections) {
+		if current >= maxConns {
 			return nil
 		}
-		if atomic.AddInt32(&c.connCount, 1) > int32(c.config.MaxConnections) {
+		if atomic.AddInt32(&c.connCount, 1) > maxConns {
 			atomic.AddInt32(&c.connCount, -1)
 			return nil
 		}
@@ -244,7 +337,7 @@ func (c *Provider) addConnection(syncMode bool) error {
 		BytesWritten: &c.bytesWritten,
 	}
 
-	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth, c.config.MaxConnIdleTime, c.config.MaxConnLifetime)
+	w, err := newNNTPConnectionFromConn(c.ctx, meteredConn, c.config.InflightPerConnection, c.reqCh, c.config.Auth, c.config.MaxConnIdleTime, c.config.MaxConnLifetime, c)
 	if err != nil {
 		_ = conn.Close()
 		atomic.AddInt32(&c.connCount, -1)
@@ -252,17 +345,182 @@ func (c *Provider) addConnection(syncMode bool) error {
 	}
 
 	c.connsMu.Lock()
+	wasEmpty := len(c.conns) == 0
 	c.conns = append(c.conns, w)
 	c.connsMu.Unlock()
+
+	// If this is the first connection after being dead, re-enable the provider
+	if wasEmpty {
+		c.signalAlive()
+	}
 
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		defer atomic.AddInt32(&c.connCount, -1)
 		w.Run()
+		// Remove connection from slice after it exits.
+		// Note: connCount is decremented inside removeConnection() to ensure
+		// it happens atomically with signalDead(), preventing a race where
+		// connCount > 0 but no connections are actually consuming from reqCh.
+		c.removeConnection(w)
 	}()
 
+	// Wait for the connection to be ready to receive requests.
+	// This prevents a race where addConnection returns before Run() starts
+	// consuming from reqCh, causing concurrent requests to pile up and timeout.
+	select {
+	case <-w.Ready():
+		// Connection is ready to receive requests
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+
 	return nil
+}
+
+// removeConnection removes a connection from the conns slice.
+// Called when a connection exits (lifetime, idle, error).
+func (c *Provider) removeConnection(conn *NNTPConnection) {
+	// Flush any accumulated metrics before removing
+	if mc, ok := conn.conn.(*internal.MeteredConn); ok {
+		mc.Flush()
+	}
+
+	shouldDrain := false
+	c.connsMu.Lock()
+	found := false
+	for i, cc := range c.conns {
+		if cc == conn {
+			// Remove by swapping with last element and truncating
+			c.conns[i] = c.conns[len(c.conns)-1]
+			c.conns[len(c.conns)-1] = nil // Clear reference for GC
+			c.conns = c.conns[:len(c.conns)-1]
+			found = true
+			break
+		}
+	}
+
+	// Decrement connCount BEFORE signalDead() to prevent race condition where
+	// SendRequest sees connCount > 0 but no connections are consuming from reqCh.
+	// Only decrement if we actually found and removed the connection.
+	if found {
+		atomic.AddInt32(&c.connCount, -1)
+	}
+
+	// Check if this was the last connection - signal unavailability
+	// so callers can retry with other providers or wait for reconnect
+	if len(c.conns) == 0 && !c.closed.Load() {
+		c.signalDead()
+		shouldDrain = true
+	}
+	c.connsMu.Unlock()
+
+	// Drain orphaned requests AFTER releasing lock to avoid deadlock.
+	// drainOrphanedRequests only accesses channels, not protected state.
+	if shouldDrain {
+		c.drainOrphanedRequests()
+	}
+}
+
+// signalDead closes deadCh to signal that provider is unavailable.
+// This unblocks any SendRequest calls waiting to send to reqCh.
+func (c *Provider) signalDead() {
+	var shouldLog bool
+	c.deadChMu.Lock()
+	// Only close if not already closed (check by trying to receive)
+	select {
+	case <-c.deadCh:
+		// Already closed
+	default:
+		close(c.deadCh)
+		shouldLog = true
+	}
+	c.deadChMu.Unlock()
+
+	if shouldLog {
+		slog.Info("provider offline", "host", c.Host)
+	}
+}
+
+// signalAlive creates a new deadCh to allow SendRequest calls to proceed.
+// Called when a new connection is established after provider was dead.
+func (c *Provider) signalAlive() {
+	var shouldLog bool
+	c.deadChMu.Lock()
+	// Only recreate if currently closed
+	select {
+	case <-c.deadCh:
+		// Was closed, recreate
+		c.deadCh = make(chan struct{})
+		shouldLog = true
+	default:
+		// Still open, nothing to do
+	}
+	c.deadChMu.Unlock()
+
+	if shouldLog {
+		slog.Info("provider online", "host", c.Host)
+	}
+}
+
+// ThrottleConnections temporarily reduces max connections to current active count.
+// Called when the server returns a "max connections exceeded" error.
+func (c *Provider) ThrottleConnections() {
+	current := atomic.LoadInt32(&c.connCount)
+	if current < 1 {
+		current = 1 // Keep at least 1 connection
+	}
+
+	atomic.StoreInt32(&c.throttledMaxConns, current)
+	c.throttleUntil.Store(time.Now().Add(connectionThrottleDuration).Unix())
+
+	slog.Warn("provider max connections throttled",
+		"host", c.Host,
+		"reduced_to", current,
+		"original_max", c.config.MaxConnections,
+		"duration", connectionThrottleDuration,
+	)
+}
+
+// getEffectiveMaxConnections returns current max connections (throttled or configured)
+func (c *Provider) getEffectiveMaxConnections() int32 {
+	throttled := atomic.LoadInt32(&c.throttledMaxConns)
+	if throttled > 0 {
+		until := c.throttleUntil.Load()
+		if time.Now().Unix() < until {
+			return throttled
+		}
+		// Throttle expired, clear it
+		atomic.StoreInt32(&c.throttledMaxConns, 0)
+		slog.Info("provider max connections throttle expired",
+			"host", c.Host,
+			"restored_to", c.config.MaxConnections,
+		)
+	}
+	return int32(c.config.MaxConnections)
+}
+
+// drainOrphanedRequests drains any requests from reqCh with ErrProviderUnavailable.
+// Called when all connections have died but the provider is not closed.
+// This allows callers to fail fast and retry with other providers.
+func (c *Provider) drainOrphanedRequests() {
+	for {
+		select {
+		case req := <-c.reqCh:
+			if req != nil && req.RespCh != nil {
+				select {
+				case req.RespCh <- Response{Err: ErrProviderUnavailable, Request: req}:
+				default:
+				}
+				internal.SafeClose(req.RespCh)
+			}
+			// Note: We don't call sendWg.Done() here because the request
+			// was already tracked and the caller's SendRequest defer already
+			// handled the Done() call when sending completed.
+		default:
+			return // Channel empty
+		}
+	}
 }
 
 // Close cancels the provider, closes its request channel, and waits for all connections to stop.
@@ -271,11 +529,30 @@ func (c *Provider) Close() error {
 		return nil
 	}
 
+	c.connsMu.Lock()
+	activeConns := len(c.conns)
+	c.connsMu.Unlock()
+
+	slog.Info("provider closing", "host", c.Host, "active_connections", activeConns)
+
 	c.cancel()
 
-	c.closeMu.Lock()
+	// Wait for all in-flight SendRequest calls to complete before closing channel.
+	// This prevents the race between sending on reqCh and closing it.
+	c.sendWg.Wait()
+
 	close(c.reqCh)
-	c.closeMu.Unlock()
+	// Drain any queued requests to prevent caller hangs
+	for req := range c.reqCh {
+		if req != nil && req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: ErrProviderClosed, Request: req}:
+			default:
+			}
+			close(req.RespCh)
+		}
+	}
 
 	c.connsMu.Lock()
 	for _, cc := range c.conns {
@@ -296,13 +573,13 @@ func (c *Provider) Date(ctx context.Context) error {
 		return ctx.Err()
 	case resp, ok := <-ch:
 		if !ok {
-			return fmt.Errorf("response channel closed unexpectedly")
+			return fmt.Errorf("DATE: response channel closed")
 		}
 		if resp.Err != nil {
 			return resp.Err
 		}
 		if resp.StatusCode != 111 {
-			return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
+			return fmt.Errorf("DATE: unexpected status code %d: %s", resp.StatusCode, resp.Status)
 		}
 		return nil
 	}
@@ -325,8 +602,13 @@ func (c *Provider) Send(ctx context.Context, payload []byte, bodyWriter io.Write
 }
 
 func (c *Provider) SendRequest(req *Request) <-chan Response {
-	closeAndReturn := func() <-chan Response {
+	closeWithError := func(err error) <-chan Response {
 		if req.RespCh != nil {
+			// Send error response so caller can distinguish from unexpected closure
+			select {
+			case req.RespCh <- Response{Err: err, Request: req}:
+			default:
+			}
 			close(req.RespCh)
 		}
 		return req.RespCh
@@ -334,30 +616,101 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 
 	// Fast path: provider already closed
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
 	}
 
-	// Trigger lazy connection growth
-	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+	// Connection scaling logic using channel backpressure instead of activeConsumers.
+	// This eliminates 2 atomic operations per request cycle in the connection Run() loop.
+	//
+	// Decision matrix:
+	// - connCount == 0: Must add a connection synchronously (provider was idle)
+	// - connCount > 0 && connCount < max: Opportunistically scale up to handle concurrent load
+	connCount := atomic.LoadInt32(&c.connCount)
+	if connCount == 0 {
+		// No connections - must add one synchronously
+		if err := c.addConnection(false); err != nil {
+			return closeWithError(ErrProviderUnavailable)
+		}
+		// Re-check in case addConnection succeeded
+		if atomic.LoadInt32(&c.connCount) == 0 {
+			return closeWithError(ErrProviderUnavailable)
+		}
+	}
+
+	// Track this send operation so Close() can wait for us
+	c.sendWg.Add(1)
+	defer c.sendWg.Done()
+
+	// Opportunistically scale up when under max connections.
+	// This ensures we grow capacity to handle concurrent requests.
+	// addConnection(false) will no-op if we're already at max.
+	if atomic.LoadInt32(&c.connCount) < c.getEffectiveMaxConnections() {
+		c.sendWg.Add(1)
 		go func() {
+			defer c.sendWg.Done()
 			_ = c.addConnection(false)
 		}()
 	}
 
-	// Synchronize with Close() to prevent send-on-closed-channel
-	c.closeMu.Lock()
-	defer c.closeMu.Unlock()
-
+	// Re-check closed after adding to wait group
 	if c.closed.Load() {
-		return closeAndReturn()
+		return closeWithError(ErrProviderClosed)
+	}
+
+	timeout := time.NewTimer(sendRequestTimeout)
+	defer timeout.Stop()
+
+	// Get current deadCh - used to detect when all connections die while we're waiting.
+	// This MUST be grabbed after addConnection to get the fresh channel if signalAlive was called.
+	c.deadChMu.Lock()
+	deadCh := c.deadCh
+	c.deadChMu.Unlock()
+
+	// Check if deadCh is already closed (stale reference from concurrent addConnection race).
+	// If so, but we have connections (connCount > 0), skip deadCh monitoring and just try
+	// to send - the connection is being initialized and will start consuming shortly.
+	skipDeadCh := false
+	select {
+	case <-deadCh:
+		// deadCh is closed - check if we actually have connections
+		if atomic.LoadInt32(&c.connCount) > 0 {
+			// Connection exists but deadCh is stale (signalAlive racing with us).
+			// Don't fail on deadCh - proceed to send.
+			skipDeadCh = true
+		} else {
+			// No connections and deadCh closed - truly unavailable
+			return closeWithError(ErrProviderUnavailable)
+		}
+	default:
+		// deadCh is open, normal path
+	}
+
+	if skipDeadCh {
+		// Don't monitor deadCh - just try to send with timeout
+		select {
+		case <-c.ctx.Done():
+			return closeWithError(c.ctx.Err())
+		case <-req.Ctx.Done():
+			return closeWithError(req.Ctx.Err())
+		case c.reqCh <- req:
+			return req.RespCh
+		case <-timeout.C:
+			return closeWithError(fmt.Errorf("send request timeout after %v", sendRequestTimeout))
+		}
 	}
 
 	select {
 	case <-c.ctx.Done():
-		return closeAndReturn()
+		return closeWithError(c.ctx.Err())
 	case <-req.Ctx.Done():
-		return closeAndReturn()
+		return closeWithError(req.Ctx.Err())
+	case <-deadCh:
+		// Provider became unavailable while we were waiting (all connections died)
+		return closeWithError(ErrProviderUnavailable)
 	case c.reqCh <- req:
+		// Request is now in the channel, waiting to be processed
 		return req.RespCh
+	case <-timeout.C:
+		return closeWithError(fmt.Errorf("send request timeout after %v", sendRequestTimeout))
 	}
 }

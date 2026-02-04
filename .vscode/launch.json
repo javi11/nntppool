@@ -1,0 +1,23 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Package",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "./cmd/nzb-downloader/main.go",
+            "args": [
+                "--host", "client.fr7.newshosting.com",
+                "--port", "563",
+                "--user", "ceqim5rld4",
+                "--pass", "cembo2-ruVxex-qedjyr",
+                "--nzb", "/Users/javi/Downloads/La.Sirenita.2023.ESP.2160p.WEB.h265.nzb",
+                "--connections", "50"
+            ]
+        }
+    ]
+}

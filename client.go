@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,11 +15,11 @@ import (
 	"github.com/mnightingale/rapidyenc"
 )
 
+const addProviderTimeout = 20 * time.Second
+
 type Client struct {
-	primaries   atomic.Value // []*Provider
-	backups     atomic.Value // []*Provider
-	maxInflight int
-	sem         chan struct{}
+	primaries atomic.Value // []*Provider
+	backups   atomic.Value // []*Provider
 
 	mu            sync.Mutex // Protects updates to atomic values and dead lists
 	deadPrimaries []*Provider
@@ -29,26 +30,29 @@ type Client struct {
 // Compile-time check that Client implements NNTPClient interface
 var _ NNTPClient = (*Client)(nil)
 
-func NewClient(maxInflight int) *Client {
+func NewClient() *Client {
 	c := &Client{
-		maxInflight: maxInflight,
-		closeCh:     make(chan struct{}),
+		closeCh: make(chan struct{}),
 	}
 	c.primaries.Store(make([]*Provider, 0))
 	c.backups.Store(make([]*Provider, 0))
-
-	if maxInflight > 0 {
-		c.sem = make(chan struct{}, maxInflight)
-	}
 
 	go c.healthCheckLoop()
 
 	return c
 }
 
-func (c *Client) AddProvider(provider *Provider, tier ProviderType) {
+func (c *Client) AddProvider(provider *Provider, tier ProviderType) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), addProviderTimeout)
+	defer cancel()
+
+	err := provider.Date(ctx)
+	if err != nil {
+		return err
+	}
 
 	if tier == ProviderPrimary {
 		current := c.primaries.Load().([]*Provider)
@@ -63,9 +67,11 @@ func (c *Client) AddProvider(provider *Provider, tier ProviderType) {
 		newlist[len(current)] = provider
 		c.backups.Store(newlist)
 	}
+
+	return nil
 }
 
-func (c *Client) RemoveProvider(provider *Provider) {
+func (c *Client) RemoveProvider(provider *Provider) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -114,19 +120,25 @@ func (c *Client) RemoveProvider(provider *Provider) {
 	}
 
 	if found {
-		_ = provider.Close()
+		err := provider.Close()
+		if err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
 func (c *Client) Close() {
 	close(c.closeCh)
 
 	primaries := c.primaries.Load().([]*Provider)
+	backups := c.backups.Load().([]*Provider)
+	slog.Info("client closing", "primary_providers", len(primaries), "backup_providers", len(backups))
 	for _, p := range primaries {
 		_ = p.Close()
 	}
 
-	backups := c.backups.Load().([]*Provider)
 	for _, p := range backups {
 		_ = p.Close()
 	}
@@ -315,25 +327,40 @@ func (c *Client) Date(ctx context.Context) error {
 func (c *Client) sendRequest(req *Request) {
 	defer close(req.RespCh)
 
-	// Acquire global capacity
-	if c.sem != nil {
-		select {
-		case c.sem <- struct{}{}:
-			defer func() { <-c.sem }()
-		case <-req.Ctx.Done():
-			req.RespCh <- Response{Err: req.Ctx.Err()}
-			return
+	var (
+		visitedHosts []string
+		lastErr      error
+		lastResp     Response
+		attempted    bool
+		tracker      *trackingWriter
+	)
+	// Track if any bytes were written to BodyWriter.
+	// If provider1 partially writes then fails, we can't retry with provider2
+	// as that would corrupt the output (appending to partially written data).
+	bodyWriter := req.BodyWriter
+
+	if req.BodyWriter != nil {
+		tracker = &trackingWriter{w: req.BodyWriter}
+		// If the underlying writer supports WriteAt, wrap appropriately
+		// so the decoder can use WriteAt for parallel writes.
+		if wa, ok := req.BodyWriter.(io.WriterAt); ok {
+			bodyWriter = &trackingWriterAt{trackingWriter: tracker, wa: wa}
+		} else {
+			bodyWriter = tracker
 		}
 	}
-
-	var visitedHosts []string
-	var lastErr error
-	var lastResp Response
-	var attempted bool
 
 	// Helper to try a list of providers
 	tryProviders := func(providers []*Provider) bool { // returns true if successful
 		for _, p := range providers {
+			// Check if context is cancelled - don't try other providers
+			select {
+			case <-req.Ctx.Done():
+				lastErr = req.Ctx.Err()
+				return false
+			default:
+			}
+
 			// Check if visited
 			var visited bool
 			for _, h := range visitedHosts {
@@ -353,15 +380,33 @@ func (c *Client) sendRequest(req *Request) {
 			subReq := &Request{
 				Ctx:          req.Ctx,
 				Payload:      req.Payload,
-				BodyWriter:   req.BodyWriter,
+				BodyWriter:   bodyWriter,
 				RespCh:       attemptCh,
 				OnYencHeader: req.OnYencHeader,
 			}
 
 			ch := p.SendRequest(subReq)
-			resp, ok := <-ch
+
+			// Wait for response with context awareness to prevent indefinite blocking
+			var resp Response
+			var ok bool
+			select {
+			case resp, ok = <-ch:
+				// Got response from provider
+			case <-req.Ctx.Done():
+				// Context cancelled while waiting for response
+				// The request is already sent to provider, but we should not block indefinitely
+				lastErr = req.Ctx.Err()
+				// Don't continue to next provider - context is cancelled
+				return false
+			}
+
 			if !ok {
 				lastErr = fmt.Errorf("provider %s closed unexpectedly", p.Host)
+				// If bytes were written, can't retry - would corrupt output
+				if tracker != nil && tracker.written > 0 {
+					return false
+				}
 				continue
 			}
 
@@ -372,6 +417,12 @@ func (c *Client) sendRequest(req *Request) {
 			if resp.Err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				req.RespCh <- resp
 				return true
+			}
+
+			// If bytes were written to BodyWriter but we got an error,
+			// can't retry with another provider - would corrupt output
+			if tracker != nil && tracker.written > 0 {
+				return false
 			}
 
 			// If 430 (Article Not Found) or error, we continue to next provider.
@@ -591,6 +642,36 @@ type countingDiscard struct {
 func (c *countingDiscard) Write(p []byte) (int, error) {
 	atomic.AddInt64(&c.n, int64(len(p)))
 	return len(p), nil
+}
+
+// trackingWriter wraps a writer to track if any bytes were written.
+// Used to detect partial writes during failover - if bytes were written
+// to the original writer, we can't retry with another provider.
+type trackingWriter struct {
+	w       io.Writer
+	written int64
+}
+
+func (t *trackingWriter) Write(p []byte) (int, error) {
+	n, err := t.w.Write(p)
+	if n > 0 {
+		atomic.AddInt64(&t.written, int64(n))
+	}
+	return n, err
+}
+
+// trackingWriterAt wraps a WriterAt to track if any bytes were written.
+type trackingWriterAt struct {
+	*trackingWriter
+	wa io.WriterAt
+}
+
+func (t *trackingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := t.wa.WriteAt(p, off)
+	if n > 0 {
+		atomic.AddInt64(&t.written, int64(n))
+	}
+	return n, err
 }
 
 // Post posts an article to the NNTP server with the given headers and body.

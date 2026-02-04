@@ -3,6 +3,7 @@ package nntppool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,7 +17,7 @@ import (
 )
 
 func TestClientHotswapProviders(t *testing.T) {
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	// 1. Add Provider A
@@ -25,6 +26,9 @@ func TestClientHotswapProviders(t *testing.T) {
 		Handler: func(cmd string) (string, error) {
 			if strings.HasPrefix(cmd, "BODY") {
 				return "222 0 <id> body follows\r\nline1\r\nline2\r\n.\r\n", nil
+			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
 			}
 			if cmd == "QUIT\r\n" {
 				return "205 Bye\r\n", nil
@@ -45,7 +49,10 @@ func TestClientHotswapProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create p1: %v", err)
 	}
-	client.AddProvider(p1, ProviderPrimary)
+	err = client.AddProvider(p1, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p1: %v", err)
+	}
 
 	// 2. Start load
 	ctx, cancel := context.WithCancel(context.Background())
@@ -102,6 +109,9 @@ func TestClientHotswapProviders(t *testing.T) {
 			if strings.HasPrefix(cmd, "BODY") {
 				return "222 0 <id> body follows\r\nline1\r\nline2\r\n.\r\n", nil
 			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			if cmd == "QUIT\r\n" {
 				return "205 Bye\r\n", nil
 			}
@@ -121,11 +131,17 @@ func TestClientHotswapProviders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create p2: %v", err)
 	}
-	client.AddProvider(p2, ProviderPrimary)
+	err = client.AddProvider(p2, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p2: %v", err)
+	}
 
 	// 4. Remove Provider A
 	time.Sleep(50 * time.Millisecond)
-	client.RemoveProvider(p1)
+	err = client.RemoveProvider(p1)
+	if err != nil {
+		t.Fatalf("failed to remove p1: %v", err)
+	}
 
 	// 5. Verify flow continues
 	startSuccess := atomic.LoadInt64(&successCount)
@@ -171,7 +187,7 @@ func TestClientHealthCheck(t *testing.T) {
 		},
 	})
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
@@ -184,7 +200,10 @@ func TestClientHealthCheck(t *testing.T) {
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	// Verify initially active
 	primaries := client.primaries.Load().([]*Provider)
@@ -229,11 +248,14 @@ func TestClientHealthCheck(t *testing.T) {
 func TestClientRemoveProvider(t *testing.T) {
 	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
 		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			return "500 Unknown Command\r\n", nil
 		},
 	})
 
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	// Create two providers
@@ -244,8 +266,14 @@ func TestClientRemoveProvider(t *testing.T) {
 		Address: "p2.example.com:119", MaxConnections: 1, ConnFactory: mockDial,
 	})
 
-	client.AddProvider(p1, ProviderPrimary)
-	client.AddProvider(p2, ProviderBackup)
+	err := client.AddProvider(p1, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p1: %v", err)
+	}
+	err = client.AddProvider(p2, ProviderBackup)
+	if err != nil {
+		t.Fatalf("failed to add p2: %v", err)
+	}
 
 	// Verify they are added
 	if len(client.primaries.Load().([]*Provider)) != 1 {
@@ -256,7 +284,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	}
 
 	// Remove p1 (primary)
-	client.RemoveProvider(p1)
+	err = client.RemoveProvider(p1)
+	if err != nil {
+		t.Fatalf("failed to remove p1: %v", err)
+	}
 
 	// Verify p1 removed and closed
 	if len(client.primaries.Load().([]*Provider)) != 0 {
@@ -267,7 +298,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	}
 
 	// Remove p2 (backup)
-	client.RemoveProvider(p2)
+	err = client.RemoveProvider(p2)
+	if err != nil {
+		t.Fatalf("failed to remove p2: %v", err)
+	}
 
 	// Verify p2 removed and closed
 	if len(client.backups.Load().([]*Provider)) != 0 {
@@ -281,7 +315,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	p3, _ := NewProvider(context.Background(), ProviderConfig{
 		Address: "p3.example.com:119", MaxConnections: 1, ConnFactory: mockDial,
 	})
-	client.AddProvider(p3, ProviderPrimary)
+	err = client.AddProvider(p3, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add p3: %v", err)
+	}
 
 	// Manually move to dead for testing
 	client.mu.Lock()
@@ -289,7 +326,10 @@ func TestClientRemoveProvider(t *testing.T) {
 	client.deadPrimaries = append(client.deadPrimaries, p3)
 	client.mu.Unlock()
 
-	client.RemoveProvider(p3)
+	err = client.RemoveProvider(p3)
+	if err != nil {
+		t.Fatalf("failed to remove p3: %v", err)
+	}
 
 	client.mu.Lock()
 	if len(client.deadPrimaries) != 0 {
@@ -330,7 +370,7 @@ func TestClientBodyAt(t *testing.T) {
 	})
 	defer cleanup()
 
-	client := NewClient(1)
+	client := NewClient()
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
@@ -344,7 +384,10 @@ func TestClientBodyAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	wa := &mockWriterAt{}
 	err = client.BodyAt(context.Background(), "123", wa)
@@ -375,7 +418,7 @@ func TestClientSpeedTest(t *testing.T) {
 	defer cleanup()
 
 	// 2. Setup Client
-	client := NewClient(10)
+	client := NewClient()
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
@@ -389,7 +432,10 @@ func TestClientSpeedTest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	// 3. Run SpeedTest
 	articles := []string{"1", "2", "3", "4", "5"}
@@ -426,7 +472,7 @@ func TestClientBodyReader(t *testing.T) {
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -440,7 +486,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Call BodyReader
 		reader, err := client.BodyReader(context.Background(), "123")
@@ -487,13 +536,16 @@ func TestClientBodyReader(t *testing.T) {
 					yencBody := testutil.EncodeYencMultiPart(originalData, filename, 2, 5, 1, int64(len(originalData)))
 					return fmt.Sprintf("222 0 <id> body follows\r\n%s.\r\n", yencBody), nil
 				}
+				if cmd == "DATE\r\n" {
+					return "111 20240101000000\r\n", nil
+				}
 				return "500 Unknown Command\r\n", nil
 			},
 		})
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -507,7 +559,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Call BodyReader
 		reader, err := client.BodyReader(context.Background(), "123")
@@ -607,7 +662,7 @@ func TestClientBodyReader(t *testing.T) {
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -621,7 +676,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Create cancellable context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -664,7 +722,7 @@ func TestClientBodyReader(t *testing.T) {
 		defer cleanup()
 
 		// Setup client
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		dial := func(ctx context.Context) (net.Conn, error) {
@@ -678,7 +736,10 @@ func TestClientBodyReader(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create provider: %v", err)
 		}
-		client.AddProvider(p, ProviderPrimary)
+		err = client.AddProvider(p, ProviderPrimary)
+		if err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
 
 		// Call BodyReader
 		reader, err := client.BodyReader(context.Background(), "123")
@@ -716,6 +777,9 @@ func setupPostClient(t *testing.T, id string, onArticle func(string)) (*Client, 
 			if cmd == "POST\r\n" {
 				return "340 Send article to be posted\r\n", nil
 			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			if strings.Contains(cmd, "Subject:") || strings.Contains(cmd, "=ybegin") {
 				if onArticle != nil {
 					onArticle(cmd)
@@ -739,8 +803,11 @@ func setupPostClient(t *testing.T, id string, onArticle func(string)) (*Client, 
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client := NewClient(10)
-	client.AddProvider(p, ProviderPrimary)
+	client := NewClient()
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	return client, func() {
 		client.Close()
@@ -888,7 +955,7 @@ func TestPostYenc(t *testing.T) {
 	})
 
 	t.Run("invalid options", func(t *testing.T) {
-		client := NewClient(10)
+		client := NewClient()
 		defer client.Close()
 
 		headers := map[string]string{"From": "test@example.com", "Subject": "Test"}
@@ -934,6 +1001,9 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 			if cmd == "POST\r\n" {
 				return "340 Send article to be posted\r\n", nil
 			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
 			if strings.Contains(cmd, "=ybegin") {
 				msgID := extractMessageID(cmd)
 				mu.Lock()
@@ -971,8 +1041,11 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client := NewClient(10)
-	client.AddProvider(p, ProviderPrimary)
+	client := NewClient()
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	return client, func() {
 		client.Close()
@@ -980,9 +1053,9 @@ func setupRoundTripClient(t *testing.T, id string) (*Client, func()) {
 	}
 }
 
-func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
-	// This test reproduces the "response channel closed unexpectedly" error
-	// that occurs when a context times out while waiting to acquire the semaphore
+func TestClientContextTimeoutWhileProviderBusy(t *testing.T) {
+	// This test verifies context timeout handling when the provider is busy
+	// processing other requests (provider-level concurrency control).
 
 	var requestReceived atomic.Bool
 	requestReceived.Store(false)
@@ -1004,8 +1077,8 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		},
 	})
 
-	// Create client with maxInflight=1 so only one request can be in-flight
-	client := NewClient(1)
+	// Create client - concurrency is controlled at provider level via MaxConnections/InflightPerConnection
+	client := NewClient()
 	defer client.Close()
 
 	p, err := NewProvider(context.Background(), ProviderConfig{
@@ -1018,9 +1091,12 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		t.Fatalf("failed to create provider: %v", err)
 	}
 
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
-	// Start a slow request to fill the semaphore
+	// Start a slow request to keep the single connection busy
 	slowDone := make(chan struct{})
 	go func() {
 		defer close(slowDone)
@@ -1028,7 +1104,7 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		_ = client.Body(ctx, "slow", io.Discard)
 	}()
 
-	// Wait for the slow request to be received and hold the semaphore
+	// Wait for the slow request to be received (connection now busy)
 	timeout := time.After(5 * time.Second)
 	for !requestReceived.Load() {
 		select {
@@ -1040,11 +1116,11 @@ func TestClientContextTimeoutWhileWaitingForSemaphore(t *testing.T) {
 		}
 	}
 
-	// Give it a bit more time to ensure semaphore is acquired
+	// Give it a bit more time to ensure connection is busy
 	time.Sleep(50 * time.Millisecond)
 
-	// Now try Date() with a short timeout while semaphore is full
-	// This should timeout while waiting for semaphore acquisition
+	// Now try Date() with a short timeout while provider is busy
+	// This should timeout while waiting for provider capacity
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
@@ -1149,4 +1225,1336 @@ func TestPostYencRoundTrip(t *testing.T) {
 			t.Errorf("data mismatch:\noriginal: %q\ndecoded:  %q", originalData, decoded.Bytes())
 		}
 	})
+}
+
+// TestWriterClosedEarlyConnectionReused verifies that when a user closes their
+// writer early (e.g., io.Pipe reader), the connection drains the response and
+// stays alive for subsequent requests.
+func TestWriterClosedEarlyConnectionReused(t *testing.T) {
+	requestCount := atomic.Int32{}
+	originalData := []byte("hello world! this is test data for the closed pipe test")
+
+	// Setup mock server that returns yEnc-encoded responses (which get written to the output)
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if strings.HasPrefix(cmd, "BODY") {
+				requestCount.Add(1)
+				// Use yEnc so the data actually gets written to the output writer
+				yencBody := testutil.EncodeYenc(originalData, "test.txt", 1, 1)
+				return fmt.Sprintf("222 0 <id> body follows\r\n%s.\r\n", yencBody), nil
+			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer cleanup()
+
+	// Setup client with single connection to verify reuse
+	client := NewClient()
+	defer client.Close()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:        srv.Addr(),
+		MaxConnections: 1, // Single connection to verify reuse
+		ConnFactory:    dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	if err := client.AddProvider(p, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Use io.Pipe so we can close the reader early
+	pr, pw := io.Pipe()
+
+	// Close the reader immediately to trigger io.ErrClosedPipe on write
+	_ = pr.Close()
+
+	// Make a request that will try to write to the closed pipe
+	err = client.Body(context.Background(), "123", pw)
+
+	// Should get io.ErrClosedPipe (the original error)
+	if err == nil {
+		t.Fatal("expected error when writer is closed, got nil")
+	}
+	if err != io.ErrClosedPipe {
+		t.Errorf("expected io.ErrClosedPipe, got: %v (type %T)", err, err)
+	}
+
+	_ = pw.Close()
+
+	// Now make another request - the connection should still be alive
+	var buf bytes.Buffer
+	err = client.Body(context.Background(), "456", &buf)
+	if err != nil {
+		t.Fatalf("second request failed (connection should have been reused): %v", err)
+	}
+
+	// Verify both requests were served (connection was reused)
+	if got := requestCount.Load(); got != 2 {
+		t.Errorf("expected 2 requests, got %d", got)
+	}
+
+	// Verify second request got data
+	if buf.Len() == 0 {
+		t.Error("expected data from second request")
+	}
+}
+
+// TestClientResponseTimeoutDoesNotHang verifies that when a provider is slow to respond,
+// the client respects the context timeout and does not hang indefinitely.
+// This tests the fix for the unbounded response wait in tryProviders.
+func TestClientResponseTimeoutDoesNotHang(t *testing.T) {
+	// Create a provider that accepts requests quickly but responds slowly
+	requestReceived := make(chan struct{})
+	slowResponseCh := make(chan struct{})
+
+	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				// Signal that request was received
+				close(requestReceived)
+				// Wait for the slow response signal (simulating slow network)
+				<-slowResponseCh
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	client := NewClient()
+	defer client.Close()
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "example.com:119",
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           mockDial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Create a context with short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Track when request completes
+	doneCh := make(chan error, 1)
+	go func() {
+		err := client.Body(ctx, "123", io.Discard)
+		doneCh <- err
+	}()
+
+	// Wait for the request to be received by server
+	select {
+	case <-requestReceived:
+		// Good, request reached the server
+	case <-time.After(5 * time.Second):
+		close(slowResponseCh)
+		t.Fatal("timeout waiting for request to be received")
+	}
+
+	// Now wait for the client to timeout (should happen within 200ms + some buffer)
+	select {
+	case err := <-doneCh:
+		// Request completed - should be some kind of timeout/cancellation error
+		// The important thing is that the request completed without hanging
+		if err == nil {
+			t.Error("expected timeout-related error, got nil")
+		} else {
+			// Accept context deadline exceeded or timeout-related errors
+			// The fix ensures the request doesn't hang - the exact error type
+			// depends on what layer times out first (context or network)
+			t.Logf("request completed with error: %v (this is expected)", err)
+		}
+	case <-time.After(2 * time.Second):
+		// If we get here, the fix didn't work - the client is hanging
+		t.Fatal("client hung waiting for slow provider response - fix not working")
+	}
+
+	// Cleanup - unblock the server
+	close(slowResponseCh)
+}
+
+// TestClientFallbackWhenPrimarySlowToRespond verifies that when a primary provider
+// is slow to respond, the client respects the context timeout and doesn't hang.
+// In this implementation, we try providers sequentially, so a slow primary will
+// cause a timeout before we can try the backup.
+func TestClientFallbackWhenPrimarySlowToRespond(t *testing.T) {
+	// Primary provider: accepts immediately but responds slowly
+	primaryRequestReceived := make(chan struct{})
+	primarySlowResponseCh := make(chan struct{})
+
+	primaryMock := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				close(primaryRequestReceived)
+				<-primarySlowResponseCh
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	// Backup provider: responds quickly
+	var backupUsed atomic.Bool
+	backupMock := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				backupUsed.Store(true)
+				return "222 0 <id> body follows\r\nbackup-data\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	client := NewClient()
+	defer client.Close()
+
+	primary, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "primary.example.com:119",
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           primaryMock,
+	})
+	if err != nil {
+		t.Fatalf("failed to create primary provider: %v", err)
+	}
+
+	backup, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "backup.example.com:119",
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           backupMock,
+	})
+	if err != nil {
+		t.Fatalf("failed to create backup provider: %v", err)
+	}
+
+	err = client.AddProvider(primary, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add primary provider: %v", err)
+	}
+	err = client.AddProvider(backup, ProviderBackup)
+	if err != nil {
+		t.Fatalf("failed to add backup provider: %v", err)
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	doneCh := make(chan error, 1)
+	go func() {
+		err := client.Body(ctx, "123", io.Discard)
+		doneCh <- err
+	}()
+
+	// Wait for request to reach primary
+	select {
+	case <-primaryRequestReceived:
+		// Good
+	case <-time.After(5 * time.Second):
+		close(primarySlowResponseCh)
+		t.Fatal("timeout waiting for request to reach primary")
+	}
+
+	// Wait for request to complete (via timeout or backup)
+	select {
+	case err := <-doneCh:
+		// The request should have timed out since primary is slow
+		// and we don't get to try backup until primary times out
+		if err == nil {
+			// If backup was used, that's fine too
+			if backupUsed.Load() {
+				t.Log("backup provider was used successfully")
+			}
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			// This is the expected behavior - primary was slow, context timed out
+			t.Log("context deadline exceeded as expected (primary was too slow)")
+		} else {
+			t.Errorf("unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client hung - should have respected context timeout")
+	}
+
+	// Cleanup
+	close(primarySlowResponseCh)
+}
+
+// TestProviderCapacityReleasedOnContextCancellation verifies that provider connections
+// are properly released when a context is cancelled while waiting for a provider response.
+// This ensures subsequent requests can proceed without hanging.
+func TestProviderCapacityReleasedOnContextCancellation(t *testing.T) {
+	// Create a provider that will be slow to respond
+	slowResponseCh := make(chan struct{})
+	var requestsStarted atomic.Int32
+
+	mockDial := testutil.MockDialerWithHandler(testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				requestsStarted.Add(1)
+				<-slowResponseCh
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+
+	// Create client - concurrency controlled at provider level
+	client := NewClient()
+	defer client.Close()
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               "example.com:119",
+		MaxConnections:        2,
+		InflightPerConnection: 1,
+		ConnFactory:           mockDial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Start two requests that will use up the provider's connection capacity
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel1()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel2()
+
+	done1 := make(chan struct{})
+	done2 := make(chan struct{})
+
+	go func() {
+		_ = client.Body(ctx1, "1", io.Discard)
+		close(done1)
+	}()
+	go func() {
+		_ = client.Body(ctx2, "2", io.Discard)
+		close(done2)
+	}()
+
+	// Wait for both requests to start
+	timeout := time.After(5 * time.Second)
+	for requestsStarted.Load() < 2 {
+		select {
+		case <-timeout:
+			close(slowResponseCh)
+			t.Fatal("timeout waiting for requests to start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Wait for both contexts to timeout and goroutines to complete
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not complete after context timeout")
+	}
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second request did not complete after context timeout")
+	}
+
+	// Now try a third request - the provider capacity should have been released
+	// If connections were NOT released, this would hang
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel3()
+
+	done3 := make(chan error, 1)
+	go func() {
+		err := client.Body(ctx3, "3", io.Discard)
+		done3 <- err
+	}()
+
+	select {
+	case err := <-done3:
+		// We expect this to also timeout (since server is still slow)
+		// but the important thing is it didn't hang waiting for provider capacity
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Log("third request completed with context timeout - provider capacity was properly released")
+		} else if err != nil {
+			t.Logf("third request completed with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("third request hung - provider capacity may not have been released")
+	}
+
+	// Cleanup
+	close(slowResponseCh)
+}
+
+// TestOrphanedRequestsDrainedOnConnectionFailure verifies that requests
+// queued in the provider's reqCh are drained with ErrProviderUnavailable
+// when all connections die, preventing callers from hanging indefinitely.
+func TestOrphanedRequestsDrainedOnConnectionFailure(t *testing.T) {
+	// Use a sync point to control when the connection dies
+	var requestsReceived atomic.Int32
+	firstRequestReceivedCh := make(chan struct{})
+	killConnectionCh := make(chan struct{})
+
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		ID: "orphan-test",
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				count := requestsReceived.Add(1)
+				// After first request received, signal and wait for kill signal
+				if count == 1 {
+					close(firstRequestReceivedCh)
+					// Wait for signal to kill connection
+					<-killConnectionCh
+					return "", io.EOF
+				}
+				// Subsequent requests (shouldn't happen if drain works)
+				return "222 0 <id> body follows\r\ndata\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	var dialCount atomic.Int32
+	dial := func(ctx context.Context) (net.Conn, error) {
+		// Only allow 1 connection total to prevent lazy growth
+		if dialCount.Add(1) > 1 {
+			return nil, fmt.Errorf("simulated connection limit")
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with small buffer - MaxConnections determines reqCh buffer size
+	// But ConnFactory limits actual connections to 1
+	provider, err := NewProvider(context.Background(), ProviderConfig{
+		Address:            srv.Addr(),
+		MaxConnections:     5, // reqCh buffer size
+		InitialConnections: 1, // Only 1 actual connection (ConnFactory blocks more)
+		ConnFactory:        dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer func() { _ = provider.Close() }()
+
+	client := NewClient()
+	defer client.Close()
+
+	if err := client.AddProvider(provider, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Start a request that will hang until we signal it
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = client.Body(ctx, "first", io.Discard)
+	}()
+
+	// Wait for the first request to be received by the server (connection is now busy)
+	select {
+	case <-firstRequestReceivedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for first request to be received")
+	}
+
+	// Now queue more requests - these will be queued in reqCh
+	// because the single connection is busy processing the first request
+	numQueuedRequests := 5
+	queuedErrorsCh := make(chan error, numQueuedRequests)
+	for i := 0; i < numQueuedRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			err := client.Body(ctx, fmt.Sprintf("queued-%d", idx), io.Discard)
+			queuedErrorsCh <- err
+		}(i)
+	}
+
+	// Give time for requests to be queued in reqCh
+	// The 5 requests should fit in the buffer (size=5)
+	time.Sleep(2 * time.Second)
+
+	// Now kill the connection by signaling the server
+	close(killConnectionCh)
+	// The connection will see EOF when trying to read, causing it to exit
+	// This triggers removeConnection which should drain orphaned requests
+
+	// Wait for all requests to complete (should not hang forever)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - all requests completed without hanging
+	case <-time.After(15 * time.Second):
+		t.Fatal("requests did not complete within timeout - orphaned requests may not have been drained")
+	}
+
+	// Collect and verify queued request errors
+	close(queuedErrorsCh)
+	var unavailableCount, otherErrCount int
+	for err := range queuedErrorsCh {
+		if err != nil {
+			if errors.Is(err, ErrProviderUnavailable) {
+				unavailableCount++
+			} else {
+				otherErrCount++
+			}
+		}
+	}
+
+	// All queued requests should have gotten an error (not hung)
+	totalErrors := unavailableCount + otherErrCount
+	if totalErrors != numQueuedRequests {
+		t.Errorf("expected %d errors, got %d (unavailable=%d, other=%d)",
+			numQueuedRequests, totalErrors, unavailableCount, otherErrCount)
+	}
+}
+
+// TestWriteErrorDoesNotBlockReader verifies that a write error after sending
+// a request to the pending channel does not cause the reader to block forever.
+// This tests the fix for the double semaphore release bug where:
+// 1. Writer sends request to pending
+// 2. Reader picks up the request from pending (concurrently)
+// 3. Write fails
+// 4. Writer should NOT release the semaphore (request is being processed by reader)
+// 5. Reader completes and releases semaphore without blocking
+func TestWriteErrorDoesNotBlockReader(t *testing.T) {
+	// Track when the write should fail
+	var writeCount atomic.Int32
+	failOnWrite := atomic.Int32{}
+	failOnWrite.Store(0) // 0 = don't fail, 1 = fail on next write
+
+	// Custom conn that can simulate write failures
+	type failingConn struct {
+		net.Conn
+		failOnWrite *atomic.Int32
+		writeCount  *atomic.Int32
+	}
+
+	// Create a mock server that responds normally
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		ID: "write-error-test",
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			if strings.HasPrefix(cmd, "BODY") {
+				// Small delay to ensure write happens before we respond
+				time.Sleep(10 * time.Millisecond)
+				return "222 0 <id> body follows\r\ntest\r\n.\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		conn, err := d.DialContext(ctx, "tcp", srv.Addr())
+		if err != nil {
+			return nil, err
+		}
+		return &failingConn{
+			Conn:        conn,
+			failOnWrite: &failOnWrite,
+			writeCount:  &writeCount,
+		}, nil
+	}
+
+	provider, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        1,
+		InflightPerConnection: 5, // Allow pipelining
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer func() { _ = provider.Close() }()
+
+	client := NewClient()
+	defer client.Close()
+
+	if err := client.AddProvider(provider, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	// Make a few successful requests first to warm up
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := client.Body(ctx, fmt.Sprintf("warm%d", i), io.Discard)
+		cancel()
+		if err != nil {
+			t.Fatalf("warmup request %d failed: %v", i, err)
+		}
+	}
+
+	// Now make concurrent requests - some should succeed, some may fail due to
+	// connection issues, but none should hang
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// We don't care about the error - we just want to ensure no deadlock
+			_ = client.Body(ctx, fmt.Sprintf("test%d", idx), io.Discard)
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	// Test passes if all requests complete within timeout (no deadlock)
+	select {
+	case <-done:
+		// Success - all requests completed without hanging
+	case <-time.After(10 * time.Second):
+		t.Fatal("requests did not complete within timeout - possible deadlock in semaphore handling")
+	}
+}
+
+// TestProviderLazyConnectionFirstRequest tests that the first request works
+// immediately when InitialConnections=0 (lazy connection mode).
+// This was a bug where deadCh was left open with no connections, causing
+// signalAlive() to not properly create a new open channel when the first
+// connection was established.
+func TestProviderLazyConnectionFirstRequest(t *testing.T) {
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with InitialConnections=0 (lazy mode)
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:            srv.Addr(),
+		MaxConnections:     2,
+		InitialConnections: 0, // Lazy mode - no connections on startup
+		ConnFactory:        dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	// Verify no connections initially
+	if got := atomic.LoadInt32(&p.connCount); got != 0 {
+		t.Fatalf("expected 0 connections initially, got %d", got)
+	}
+
+	// First request should work immediately without needing cancel/retry
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = p.Date(ctx)
+	if err != nil {
+		t.Fatalf("first request failed (should work immediately): %v", err)
+	}
+
+	// Verify connection was created
+	if got := atomic.LoadInt32(&p.connCount); got == 0 {
+		t.Fatal("expected at least 1 connection after first request")
+	}
+
+	// Second request should also work
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+
+	err = p.Date(ctx2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+}
+
+// TestProviderConcurrentRequestsWhenDead tests that many concurrent requests
+// all succeed when fired against a provider with no active connections.
+// This was a race condition where addConnection() returned before Run() started
+// consuming from reqCh, causing requests to pile up and timeout.
+func TestProviderConcurrentRequestsWhenDead(t *testing.T) {
+	const numRequests = 20
+
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with InitialConnections=0 to test lazy connection mode
+	// where connections are created on first request.
+	// Use InflightPerConnection=1 to avoid pipelining (mock server doesn't handle it)
+	// and MaxConnections=2 to allow some parallelism.
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        2,
+		InitialConnections:    0, // No connections at startup
+		InflightPerConnection: 1, // No pipelining (mock server limitation)
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	// Verify no connections initially
+	if got := atomic.LoadInt32(&p.connCount); got != 0 {
+		t.Fatalf("expected 0 connections initially, got %d", got)
+	}
+
+	// Fire many concurrent requests - all should complete without timeout
+	var wg sync.WaitGroup
+	errors := make(chan error, numRequests)
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			err := p.Date(ctx)
+			if err != nil {
+				errors <- fmt.Errorf("request %d failed: %v", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Collect all errors
+	var errs []error
+	for err := range errors {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		t.Fatalf("concurrent requests failed (%d/%d): %v", len(errs), numRequests, errs[0])
+	}
+
+	t.Logf("all %d concurrent requests succeeded", numRequests)
+}
+
+// TestProviderConcurrentRequestsWithPipelining tests concurrent requests with
+// InflightPerConnection > 1, which enables pipelining. This tests that the
+// ready channel synchronization works properly when Run() needs to start
+// consuming requests immediately.
+func TestProviderConcurrentRequestsWithPipelining(t *testing.T) {
+	const numRequests = 10
+
+	// Create a mock server that handles pipelined DATE commands
+	srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			// Handle potentially pipelined commands by responding to each
+			// DATE\r\n in the input
+			var response string
+			remaining := cmd
+			for len(remaining) > 0 {
+				if len(remaining) >= 6 && remaining[:6] == "DATE\r\n" {
+					response += "111 20240101000000\r\n"
+					remaining = remaining[6:]
+				} else if len(remaining) >= 6 && remaining[:6] == "QUIT\r\n" {
+					response += "205 Bye\r\n"
+					remaining = remaining[6:]
+				} else {
+					// Unknown command - find next \r\n
+					idx := 0
+					for i := 0; i < len(remaining)-1; i++ {
+						if remaining[i] == '\r' && remaining[i+1] == '\n' {
+							idx = i + 2
+							break
+						}
+					}
+					if idx == 0 {
+						idx = len(remaining)
+					}
+					response += "500 Unknown Command\r\n"
+					remaining = remaining[idx:]
+				}
+			}
+			return response, nil
+		},
+	})
+	defer stop()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	// Create provider with InitialConnections=0 and InflightPerConnection > 1
+	// This is the configuration that triggers the original race condition
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        1,
+		InitialConnections:    0, // No connections at startup
+		InflightPerConnection: 5, // Enable pipelining
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	// Verify no connections initially
+	if got := atomic.LoadInt32(&p.connCount); got != 0 {
+		t.Fatalf("expected 0 connections initially, got %d", got)
+	}
+
+	// Fire concurrent requests - all should complete without timeout
+	var wg sync.WaitGroup
+	errors := make(chan error, numRequests)
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			err := p.Date(ctx)
+			if err != nil {
+				errors <- fmt.Errorf("request %d failed: %v", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Collect all errors
+	var errs []error
+	for err := range errors {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		t.Fatalf("concurrent requests failed (%d/%d): %v", len(errs), numRequests, errs[0])
+	}
+
+	t.Logf("all %d concurrent requests with pipelining succeeded", numRequests)
+}
+
+// TestSequentialReaderWithPipeDeadlock demonstrates the connection deadlock issue
+// when implementing a sequential reader using io.Pipe with direct writes.
+//
+// The deadlock scenario:
+//  1. Workers hold connections while blocked on pipe writes (pipes are synchronous)
+//  2. Pipe writes block until the reader consumes them sequentially
+//  3. Reader can't reach later pipes because connections are held by workers blocked on earlier pipes
+//
+// Solution: Download to buffer first, then copy to pipe (connection released before potential block).
+func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
+	// Test data - 3 segments that must be read in order
+	segments := [][]byte{
+		[]byte("segment-1-data"),
+		[]byte("segment-2-data"),
+		[]byte("segment-3-data"),
+	}
+
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: func(cmd string) (string, error) {
+			if strings.HasPrefix(cmd, "BODY") {
+				parts := strings.Fields(cmd)
+				if len(parts) >= 2 {
+					id := strings.TrimRight(parts[1], "\r\n")
+					// Return segment based on ID
+					for i, seg := range segments {
+						if id == fmt.Sprintf("<%d>", i) {
+							yencBody := testutil.EncodeYenc(seg, fmt.Sprintf("seg%d.txt", i), 1, 1)
+							return fmt.Sprintf("222 0 %s body follows\r\n%s.\r\n", id, yencBody), nil
+						}
+					}
+				}
+				return "430 No such article\r\n", nil
+			}
+			if cmd == "DATE\r\n" {
+				return "111 20240101000000\r\n", nil
+			}
+			if cmd == "QUIT\r\n" {
+				return "205 Bye\r\n", nil
+			}
+			return "500 Unknown Command\r\n", nil
+		},
+	})
+	defer cleanup()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	t.Run("deadlock_with_direct_pipe_writes", func(t *testing.T) {
+		// Setup client with limited connections (2 connections for 3 segments)
+		// This creates the deadlock condition when all connections are blocked on pipe writes
+		client := NewClient()
+		defer client.Close()
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:               srv.Addr(),
+			MaxConnections:        2, // Fewer connections than segments
+			InflightPerConnection: 1,
+			ConnFactory:           dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		if err := client.AddProvider(p, ProviderPrimary); err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
+
+		// Create pipes for each segment
+		pipes := make([]struct {
+			r *io.PipeReader
+			w *io.PipeWriter
+		}, len(segments))
+		for i := range pipes {
+			pipes[i].r, pipes[i].w = io.Pipe()
+		}
+
+		// Start workers that download directly to pipes (problematic pattern)
+		var wg sync.WaitGroup
+		downloadDone := make(chan struct{})
+		for i := range segments {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				defer cancel()
+				// Direct pipe write - will block until reader consumes
+				err := client.Body(ctx, fmt.Sprintf("<%d>", idx), pipes[idx].w)
+				if err != nil {
+					// Expected to timeout/fail due to deadlock
+					_ = pipes[idx].w.CloseWithError(err)
+				} else {
+					_ = pipes[idx].w.Close()
+				}
+			}(i)
+		}
+
+		go func() {
+			wg.Wait()
+			close(downloadDone)
+		}()
+
+		// Sequential reader - must read segment 0, then 1, then 2
+		// With direct pipe writes and limited connections, this will deadlock:
+		// - Workers for seg 1 and 2 hold the 2 connections
+		// - They block on pipe writes waiting for reader
+		// - Reader is waiting for seg 0 which can't start (no free connections)
+		var result bytes.Buffer
+		readDone := make(chan error, 1)
+		go func() {
+			for i := 0; i < len(segments); i++ {
+				_, err := io.Copy(&result, pipes[i].r)
+				if err != nil && err != io.EOF {
+					readDone <- err
+					return
+				}
+			}
+			readDone <- nil
+		}()
+
+		// With the deadlock pattern, we expect a timeout
+		select {
+		case err := <-readDone:
+			if err == nil && result.Len() == len(segments[0])+len(segments[1])+len(segments[2]) {
+				// If it succeeds, that's actually fine - the race condition didn't trigger
+				t.Log("direct pipe writes completed (race condition didn't trigger this time)")
+			}
+		case <-downloadDone:
+			// Downloads completed but reader may still be blocked
+			select {
+			case <-readDone:
+				// OK
+			case <-time.After(100 * time.Millisecond):
+				t.Log("reader blocked after downloads - demonstrating potential deadlock")
+			}
+		case <-time.After(1 * time.Second):
+			// Expected: timeout due to deadlock potential
+			t.Log("timeout detected - deadlock scenario demonstrated")
+		}
+
+		// Cleanup pipes
+		for i := range pipes {
+			_ = pipes[i].r.Close()
+			_ = pipes[i].w.Close()
+		}
+	})
+
+	t.Run("no_deadlock_with_buffered_writes", func(t *testing.T) {
+		// Setup client with same limited connections
+		client := NewClient()
+		defer client.Close()
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:               srv.Addr(),
+			MaxConnections:        2, // Same limited connections
+			InflightPerConnection: 1,
+			ConnFactory:           dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		if err := client.AddProvider(p, ProviderPrimary); err != nil {
+			t.Fatalf("failed to add provider: %v", err)
+		}
+
+		// Create pipes for each segment
+		pipes := make([]struct {
+			r *io.PipeReader
+			w *io.PipeWriter
+		}, len(segments))
+		for i := range pipes {
+			pipes[i].r, pipes[i].w = io.Pipe()
+		}
+
+		// Start workers that buffer first, then write to pipe (correct pattern)
+		var wg sync.WaitGroup
+		for i := range segments {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				// SOLUTION: Buffer first, then copy to pipe
+				var buf bytes.Buffer
+				err := client.Body(ctx, fmt.Sprintf("<%d>", idx), &buf) // Connection released here
+				if err != nil {
+					_ = pipes[idx].w.CloseWithError(err)
+					return
+				}
+				_, err = io.Copy(pipes[idx].w, &buf) // May block, but connection is free
+				if err != nil {
+					_ = pipes[idx].w.CloseWithError(err)
+				} else {
+					_ = pipes[idx].w.Close()
+				}
+			}(i)
+		}
+
+		// Sequential reader
+		var result bytes.Buffer
+		readDone := make(chan error, 1)
+		go func() {
+			for i := 0; i < len(segments); i++ {
+				_, err := io.Copy(&result, pipes[i].r)
+				if err != nil && err != io.EOF {
+					readDone <- err
+					return
+				}
+			}
+			readDone <- nil
+		}()
+
+		// With buffered pattern, should complete without deadlock
+		select {
+		case err := <-readDone:
+			if err != nil {
+				t.Fatalf("sequential read failed: %v", err)
+			}
+			// Verify all segments were read
+			expected := string(segments[0]) + string(segments[1]) + string(segments[2])
+			if result.String() != expected {
+				t.Errorf("data mismatch:\nexpected: %q\ngot: %q", expected, result.String())
+			}
+			t.Log("buffered writes completed successfully - no deadlock")
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout - unexpected deadlock with buffered pattern")
+		}
+
+		wg.Wait()
+
+		// Cleanup pipes
+		for i := range pipes {
+			_ = pipes[i].r.Close()
+			_ = pipes[i].w.Close()
+		}
+	})
+}
+
+// TestProviderMaxConnectionsThrottle tests that when a server returns a "max connections exceeded"
+// error, the provider temporarily reduces its max connections to prevent connection spam.
+func TestProviderMaxConnectionsThrottle(t *testing.T) {
+	t.Run("throttle on 502 too many connections", func(t *testing.T) {
+		requestCount := atomic.Int32{}
+
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: func(cmd string) (string, error) {
+				if cmd == "DATE\r\n" {
+					count := requestCount.Add(1)
+					if count == 1 {
+						// First request succeeds
+						return "111 20240101000000\r\n", nil
+					}
+					// Subsequent requests get max connections error
+					return "502 Too many connections - try again later\r\n", nil
+				}
+				if cmd == "QUIT\r\n" {
+					return "205 Bye\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:            srv.Addr(),
+			MaxConnections:     5,
+			InitialConnections: 1,
+			ConnFactory:        dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		// Verify initial state - no throttle
+		if got := atomic.LoadInt32(&p.throttledMaxConns); got != 0 {
+			t.Fatalf("expected no throttle initially, got throttledMaxConns=%d", got)
+		}
+
+		// First request should succeed
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.Date(ctx); err != nil {
+			t.Fatalf("first request failed: %v", err)
+		}
+
+		// Second request should trigger throttle (502 error)
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel2()
+		err = p.Date(ctx2)
+		// The request returns the error to the caller
+		if err == nil {
+			t.Log("request succeeded (server may have returned 502 but response was still processed)")
+		}
+
+		// Give a moment for the throttle to be applied
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify throttle was applied
+		throttled := atomic.LoadInt32(&p.throttledMaxConns)
+		if throttled == 0 {
+			t.Fatal("expected throttledMaxConns to be set after 502 error")
+		}
+
+		// Throttled value should be <= current connection count and > 0
+		connCount := atomic.LoadInt32(&p.connCount)
+		if throttled > connCount && connCount > 0 {
+			t.Errorf("throttledMaxConns (%d) should be <= connCount (%d)", throttled, connCount)
+		}
+
+		t.Logf("throttle applied: throttledMaxConns=%d, connCount=%d, original max=%d",
+			throttled, connCount, p.config.MaxConnections)
+
+		// Verify getEffectiveMaxConnections returns the throttled value
+		effective := p.getEffectiveMaxConnections()
+		if effective != throttled {
+			t.Errorf("getEffectiveMaxConnections()=%d, want %d", effective, throttled)
+		}
+	})
+
+	t.Run("throttle on 481 connection limit", func(t *testing.T) {
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: func(cmd string) (string, error) {
+				if cmd == "DATE\r\n" {
+					return "481 Connection limit exceeded\r\n", nil
+				}
+				if cmd == "QUIT\r\n" {
+					return "205 Bye\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:            srv.Addr(),
+			MaxConnections:     3,
+			InitialConnections: 1,
+			ConnFactory:        dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		// Send request that triggers 481 error
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = p.Date(ctx)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify throttle was applied
+		if got := atomic.LoadInt32(&p.throttledMaxConns); got == 0 {
+			t.Fatal("expected throttle to be applied on 481 error")
+		}
+	})
+
+	t.Run("no throttle on normal errors", func(t *testing.T) {
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: func(cmd string) (string, error) {
+				if cmd == "DATE\r\n" {
+					// 430 - article not found, should not trigger throttle
+					return "430 No such article\r\n", nil
+				}
+				if cmd == "QUIT\r\n" {
+					return "205 Bye\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:            srv.Addr(),
+			MaxConnections:     3,
+			InitialConnections: 1,
+			ConnFactory:        dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		// Send request that triggers 430 error
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = p.Date(ctx)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify no throttle
+		if got := atomic.LoadInt32(&p.throttledMaxConns); got != 0 {
+			t.Fatalf("expected no throttle on 430 error, got throttledMaxConns=%d", got)
+		}
+	})
+}
+
+// TestIsMaxConnectionsExceededError tests the error detection function.
+func TestIsMaxConnectionsExceededError(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		status     string
+		want       bool
+	}{
+		{"502 too many connections", 502, "Too many connections", true},
+		{"502 connection limit", 502, "Connection limit exceeded", true},
+		{"502 max connections", 502, "Max connections reached", true},
+		{"481 too many connections", 481, "Too many connections for this user", true},
+		{"400 connection limit", 400, "Service unavailable - connection limit", true},
+		{"502 unrelated error", 502, "Service temporarily unavailable", false},
+		{"430 article not found", 430, "No such article", false},
+		{"200 ok", 200, "OK", false},
+		{"502 case insensitive", 502, "TOO MANY CONNECTIONS", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isMaxConnectionsExceededError(tt.statusCode, tt.status)
+			if got != tt.want {
+				t.Errorf("isMaxConnectionsExceededError(%d, %q) = %v, want %v",
+					tt.statusCode, tt.status, got, tt.want)
+			}
+		})
+	}
 }

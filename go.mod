@@ -3,9 +3,11 @@ module github.com/javi11/nntppool/v3
 go 1.25.1
 
 require (
+	github.com/avast/retry-go/v4 v4.7.0
 	github.com/javi11/nzbparser v0.5.4
 	github.com/mnightingale/rapidyenc v0.0.0-20251128204712-7aafef1eaf1c
 	github.com/schollz/progressbar/v3 v3.19.0
+	github.com/sourcegraph/conc v0.3.0
 	github.com/spf13/pflag v1.0.10
 	golang.org/x/net v0.49.0
 )

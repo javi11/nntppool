@@ -38,7 +38,21 @@ func TestClientConnectionRotation(t *testing.T) {
 				_, _ = c.Write([]byte("200 Service Ready\r\n"))
 				buf := make([]byte, 1024)
 				for {
-					if _, err := c.Read(buf); err != nil {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+
+					var response string
+					if cmd == "DATE\r\n" {
+						response = "111 20240101000000\r\n"
+					} else {
+						response = "500 Unknown Command\r\n"
+					}
+
+					_, err = c.Write([]byte(response))
+					if err != nil {
 						return
 					}
 				}
@@ -46,7 +60,7 @@ func TestClientConnectionRotation(t *testing.T) {
 		}
 	}()
 
-	client := NewClient(1)
+	client := NewClient()
 	defer client.Close()
 
 	dial := func(ctx context.Context) (net.Conn, error) {
@@ -54,17 +68,21 @@ func TestClientConnectionRotation(t *testing.T) {
 		return d.DialContext(ctx, "tcp", l.Addr().String())
 	}
 
-	// Provider with very short lifetime
+	// Provider with very short lifetime and health check period
 	p, err := NewProvider(context.Background(), ProviderConfig{
-		Address:         l.Addr().String(),
-		MaxConnections:  1,
-		MaxConnLifetime: 200 * time.Millisecond,
-		ConnFactory:     dial,
+		Address:           l.Addr().String(),
+		MaxConnections:    1,
+		MaxConnLifetime:   200 * time.Millisecond,
+		HealthCheckPeriod: 100 * time.Millisecond, // Check frequently to trigger rotation
+		ConnFactory:       dial,
 	})
 	if err != nil {
 		t.Fatalf("failed to create provider: %v", err)
 	}
-	client.AddProvider(p, ProviderPrimary)
+	err = client.AddProvider(p, ProviderPrimary)
+	if err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
 
 	// Wait enough time for at least 2 rotations
 	time.Sleep(600 * time.Millisecond)
