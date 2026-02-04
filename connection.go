@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -423,6 +424,11 @@ func (c *NNTPConnection) readerLoop() {
 		resp.Lines = decoder.Lines
 		resp.Meta = decoder
 
+		// Check for max connections exceeded error and throttle provider
+		if c.provider != nil && isMaxConnectionsExceededError(resp.StatusCode, resp.Status) {
+			c.provider.ThrottleConnections()
+		}
+
 		// Always send a response so caller can distinguish cancellation from provider failure.
 		// If request was cancelled mid-response, set the error to context.Canceled.
 		if !deliver {
@@ -473,4 +479,16 @@ func (c *NNTPConnection) readOneResponse(out io.Writer, timeout time.Duration) (
 		return resp, err
 	}
 	return resp, nil
+}
+
+// isMaxConnectionsExceededError checks if an NNTP response indicates connection limit exceeded.
+// NNTP servers typically return 502, 481, or 400 with messages about connection limits.
+func isMaxConnectionsExceededError(statusCode int, status string) bool {
+	if statusCode == 502 || statusCode == 481 || statusCode == 400 {
+		lower := strings.ToLower(status)
+		return strings.Contains(lower, "too many connection") ||
+			strings.Contains(lower, "connection limit") ||
+			strings.Contains(lower, "max connection")
+	}
+	return false
 }

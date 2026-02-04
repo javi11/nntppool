@@ -2353,3 +2353,208 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 		}
 	})
 }
+
+// TestProviderMaxConnectionsThrottle tests that when a server returns a "max connections exceeded"
+// error, the provider temporarily reduces its max connections to prevent connection spam.
+func TestProviderMaxConnectionsThrottle(t *testing.T) {
+	t.Run("throttle on 502 too many connections", func(t *testing.T) {
+		requestCount := atomic.Int32{}
+
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: func(cmd string) (string, error) {
+				if cmd == "DATE\r\n" {
+					count := requestCount.Add(1)
+					if count == 1 {
+						// First request succeeds
+						return "111 20240101000000\r\n", nil
+					}
+					// Subsequent requests get max connections error
+					return "502 Too many connections - try again later\r\n", nil
+				}
+				if cmd == "QUIT\r\n" {
+					return "205 Bye\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:            srv.Addr(),
+			MaxConnections:     5,
+			InitialConnections: 1,
+			ConnFactory:        dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		// Verify initial state - no throttle
+		if got := atomic.LoadInt32(&p.throttledMaxConns); got != 0 {
+			t.Fatalf("expected no throttle initially, got throttledMaxConns=%d", got)
+		}
+
+		// First request should succeed
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.Date(ctx); err != nil {
+			t.Fatalf("first request failed: %v", err)
+		}
+
+		// Second request should trigger throttle (502 error)
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel2()
+		err = p.Date(ctx2)
+		// The request returns the error to the caller
+		if err == nil {
+			t.Log("request succeeded (server may have returned 502 but response was still processed)")
+		}
+
+		// Give a moment for the throttle to be applied
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify throttle was applied
+		throttled := atomic.LoadInt32(&p.throttledMaxConns)
+		if throttled == 0 {
+			t.Fatal("expected throttledMaxConns to be set after 502 error")
+		}
+
+		// Throttled value should be <= current connection count and > 0
+		connCount := atomic.LoadInt32(&p.connCount)
+		if throttled > connCount && connCount > 0 {
+			t.Errorf("throttledMaxConns (%d) should be <= connCount (%d)", throttled, connCount)
+		}
+
+		t.Logf("throttle applied: throttledMaxConns=%d, connCount=%d, original max=%d",
+			throttled, connCount, p.config.MaxConnections)
+
+		// Verify getEffectiveMaxConnections returns the throttled value
+		effective := p.getEffectiveMaxConnections()
+		if effective != throttled {
+			t.Errorf("getEffectiveMaxConnections()=%d, want %d", effective, throttled)
+		}
+	})
+
+	t.Run("throttle on 481 connection limit", func(t *testing.T) {
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: func(cmd string) (string, error) {
+				if cmd == "DATE\r\n" {
+					return "481 Connection limit exceeded\r\n", nil
+				}
+				if cmd == "QUIT\r\n" {
+					return "205 Bye\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:            srv.Addr(),
+			MaxConnections:     3,
+			InitialConnections: 1,
+			ConnFactory:        dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		// Send request that triggers 481 error
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = p.Date(ctx)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify throttle was applied
+		if got := atomic.LoadInt32(&p.throttledMaxConns); got == 0 {
+			t.Fatal("expected throttle to be applied on 481 error")
+		}
+	})
+
+	t.Run("no throttle on normal errors", func(t *testing.T) {
+		srv, stop := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+			Handler: func(cmd string) (string, error) {
+				if cmd == "DATE\r\n" {
+					// 430 - article not found, should not trigger throttle
+					return "430 No such article\r\n", nil
+				}
+				if cmd == "QUIT\r\n" {
+					return "205 Bye\r\n", nil
+				}
+				return "500 Unknown Command\r\n", nil
+			},
+		})
+		defer stop()
+
+		dial := func(ctx context.Context) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", srv.Addr())
+		}
+
+		p, err := NewProvider(context.Background(), ProviderConfig{
+			Address:            srv.Addr(),
+			MaxConnections:     3,
+			InitialConnections: 1,
+			ConnFactory:        dial,
+		})
+		if err != nil {
+			t.Fatalf("failed to create provider: %v", err)
+		}
+		defer func() { _ = p.Close() }()
+
+		// Send request that triggers 430 error
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = p.Date(ctx)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Verify no throttle
+		if got := atomic.LoadInt32(&p.throttledMaxConns); got != 0 {
+			t.Fatalf("expected no throttle on 430 error, got throttledMaxConns=%d", got)
+		}
+	})
+}
+
+// TestIsMaxConnectionsExceededError tests the error detection function.
+func TestIsMaxConnectionsExceededError(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		status     string
+		want       bool
+	}{
+		{"502 too many connections", 502, "Too many connections", true},
+		{"502 connection limit", 502, "Connection limit exceeded", true},
+		{"502 max connections", 502, "Max connections reached", true},
+		{"481 too many connections", 481, "Too many connections for this user", true},
+		{"400 connection limit", 400, "Service unavailable - connection limit", true},
+		{"502 unrelated error", 502, "Service temporarily unavailable", false},
+		{"430 article not found", 430, "No such article", false},
+		{"200 ok", 200, "OK", false},
+		{"502 case insensitive", 502, "TOO MANY CONNECTIONS", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isMaxConnectionsExceededError(tt.statusCode, tt.status)
+			if got != tt.want {
+				t.Errorf("isMaxConnectionsExceededError(%d, %q) = %v, want %v",
+					tt.statusCode, tt.status, got, tt.want)
+			}
+		})
+	}
+}

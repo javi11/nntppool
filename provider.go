@@ -19,6 +19,10 @@ import (
 
 const sendRequestTimeout = 5 * time.Second
 
+// connectionThrottleDuration is how long max connections throttling lasts after
+// receiving a "max connections exceeded" error from the server.
+const connectionThrottleDuration = 5 * time.Minute
+
 // ErrProviderClosed is returned when a request is made to a closed provider.
 var ErrProviderClosed = errors.New("provider closed")
 
@@ -82,6 +86,10 @@ type Provider struct {
 	bytesRead    uint64
 	bytesWritten uint64
 	currentSpeed uint64 // bytes per second
+
+	// Connection throttling for max connections exceeded errors
+	throttledMaxConns int32        // Temporarily reduced max connections (0 = not throttled)
+	throttleUntil     atomic.Int64 // Unix timestamp when throttle expires
 }
 
 func NewProvider(ctx context.Context, config ProviderConfig) (*Provider, error) {
@@ -303,11 +311,12 @@ func (c *Provider) addConnection(syncMode bool) error {
 	}
 
 	if !syncMode {
+		maxConns := c.getEffectiveMaxConnections()
 		current := atomic.LoadInt32(&c.connCount)
-		if current >= int32(c.config.MaxConnections) {
+		if current >= maxConns {
 			return nil
 		}
-		if atomic.AddInt32(&c.connCount, 1) > int32(c.config.MaxConnections) {
+		if atomic.AddInt32(&c.connCount, 1) > maxConns {
 			atomic.AddInt32(&c.connCount, -1)
 			return nil
 		}
@@ -435,6 +444,43 @@ func (c *Provider) signalAlive() {
 	if shouldLog {
 		slog.Info("provider online", "host", c.Host)
 	}
+}
+
+// ThrottleConnections temporarily reduces max connections to current active count.
+// Called when the server returns a "max connections exceeded" error.
+func (c *Provider) ThrottleConnections() {
+	current := atomic.LoadInt32(&c.connCount)
+	if current < 1 {
+		current = 1 // Keep at least 1 connection
+	}
+
+	atomic.StoreInt32(&c.throttledMaxConns, current)
+	c.throttleUntil.Store(time.Now().Add(connectionThrottleDuration).Unix())
+
+	slog.Warn("provider max connections throttled",
+		"host", c.Host,
+		"reduced_to", current,
+		"original_max", c.config.MaxConnections,
+		"duration", connectionThrottleDuration,
+	)
+}
+
+// getEffectiveMaxConnections returns current max connections (throttled or configured)
+func (c *Provider) getEffectiveMaxConnections() int32 {
+	throttled := atomic.LoadInt32(&c.throttledMaxConns)
+	if throttled > 0 {
+		until := c.throttleUntil.Load()
+		if time.Now().Unix() < until {
+			return throttled
+		}
+		// Throttle expired, clear it
+		atomic.StoreInt32(&c.throttledMaxConns, 0)
+		slog.Info("provider max connections throttle expired",
+			"host", c.Host,
+			"restored_to", c.config.MaxConnections,
+		)
+	}
+	return int32(c.config.MaxConnections)
 }
 
 // drainOrphanedRequests drains any requests from reqCh with ErrProviderUnavailable.
@@ -577,7 +623,7 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	// Opportunistically scale up when under max connections.
 	// This ensures we grow capacity to handle concurrent requests.
 	// addConnection(false) will no-op if we're already at max.
-	if atomic.LoadInt32(&c.connCount) < int32(c.config.MaxConnections) {
+	if atomic.LoadInt32(&c.connCount) < c.getEffectiveMaxConnections() {
 		c.sendWg.Add(1)
 		go func() {
 			defer c.sendWg.Done()
