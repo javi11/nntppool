@@ -212,7 +212,7 @@ func (c *NNTPConnection) drainPending() {
 	// All slots acquired = no in-flight requests, safe to close
 }
 
-func (c *NNTPConnection) failOutstanding() {
+func (c *NNTPConnection) failOutstanding(err error) {
 	// This can be called multiple times (from readerLoop and from Run).
 	// Each call drains whatever is currently in pending at that moment.
 	// The semaphore release uses select{default:} to avoid blocking if
@@ -224,9 +224,10 @@ func (c *NNTPConnection) failOutstanding() {
 			if req == nil {
 				continue
 			}
-			// Send error response so caller can distinguish from successful completion
+			// Send error response so caller can distinguish from successful completion.
+			// Pass through the actual error that caused the connection failure.
 			select {
-			case req.RespCh <- Response{Err: context.Canceled, Request: req}:
+			case req.RespCh <- Response{Err: err, Request: req}:
 			default:
 			}
 			internal.SafeClose(req.RespCh)
@@ -255,7 +256,7 @@ func (c *NNTPConnection) Run() {
 	defer func() {
 		c.cancel()
 		_ = c.conn.Close()
-		c.failOutstanding()
+		c.failOutstanding(context.Canceled)
 		c.closeDone()
 	}()
 
@@ -338,7 +339,7 @@ func (c *NNTPConnection) Run() {
 			// Releasing here would cause double-release when reader finishes normally,
 			// which blocks the reader forever trying to release from an empty semaphore.
 			_ = c.conn.Close()
-			c.failOutstanding()
+			c.failOutstanding(err)
 			return
 		}
 		_ = c.conn.SetWriteDeadline(time.Time{})
@@ -349,7 +350,7 @@ func (c *NNTPConnection) readerLoop() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			c.failOutstanding()
+			c.failOutstanding(c.ctx.Err())
 			return
 		default:
 		}
@@ -359,7 +360,7 @@ func (c *NNTPConnection) readerLoop() {
 		select {
 		case req = <-c.pending:
 		case <-c.ctx.Done():
-			c.failOutstanding()
+			c.failOutstanding(c.ctx.Err())
 			return
 		}
 		if req.Ctx == nil {
@@ -454,7 +455,7 @@ func (c *NNTPConnection) readerLoop() {
 			!errors.Is(resp.Err, context.Canceled) &&
 			!errors.Is(resp.Err, io.ErrClosedPipe) {
 			_ = c.conn.Close()
-			c.failOutstanding()
+			c.failOutstanding(resp.Err)
 			return
 		}
 	}
