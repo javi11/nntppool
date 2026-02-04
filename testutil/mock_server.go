@@ -99,12 +99,17 @@ func StartMockNNTPServer(t *testing.T, config MockServerConfig) (*MockServer, fu
 					}
 
 					cmd := string(buf[:n])
-					response, err := config.Handler(cmd)
-					if err != nil {
-						return
+					response, handlerErr := config.Handler(cmd)
+
+					// Write response first (even if partial) before checking error
+					if response != "" {
+						if _, err := c.Write([]byte(response)); err != nil {
+							return
+						}
 					}
 
-					if _, err := c.Write([]byte(response)); err != nil {
+					// Now handle the error (close connection to simulate disconnect)
+					if handlerErr != nil {
 						return
 					}
 				}
@@ -153,12 +158,17 @@ func MockDialerWithHandler(config MockServerConfig) func(ctx context.Context) (n
 				}
 
 				cmd := string(buf[:n])
-				response, err := config.Handler(cmd)
-				if err != nil {
-					return
+				response, handlerErr := config.Handler(cmd)
+
+				// Write response first (even if partial) before checking error
+				if response != "" {
+					if _, err := c2.Write([]byte(response)); err != nil {
+						return
+					}
 				}
 
-				if _, err := c2.Write([]byte(response)); err != nil {
+				// Now handle the error (close connection to simulate disconnect)
+				if handlerErr != nil {
 					return
 				}
 			}

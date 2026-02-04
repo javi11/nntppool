@@ -106,11 +106,12 @@ func TestPartialWritePreventsFailover(t *testing.T) {
 	defer cancel()
 
 	err = client.Body(ctx, "test-article", &buf)
-	if err != nil {
-		t.Fatalf("failed to get body: %v", err)
+
+	// The request should fail (partial write scenario with disconnect)
+	if err == nil {
+		t.Error("expected error from partial write with disconnect")
 	}
 
-	// The request should fail (partial write scenario)
 	// Provider 2 should NOT be tried since bytes were already written
 	if atomic.LoadInt32(&provider2Attempts) > 0 {
 		t.Error("expected provider2 NOT to be tried after partial write to provider1")
@@ -322,9 +323,12 @@ func TestPartialWriteWithWriterAt(t *testing.T) {
 	defer cancel()
 
 	err = client.BodyAt(ctx, "test-article", wa)
-	if err != nil {
-		t.Fatalf("failed to get body: %v", err)
+
+	// The request should fail (partial write scenario with disconnect)
+	if err == nil {
+		t.Error("expected error from partial write with disconnect")
 	}
+
 	// If partial bytes were written via WriteAt, provider2 should NOT be tried
 	if wa.bytesWritten > 0 && atomic.LoadInt32(&provider2Attempts) > 0 {
 		t.Error("expected provider2 NOT to be tried after partial WriteAt to provider1")
@@ -543,10 +547,12 @@ func TestPartialWriteConnectionError(t *testing.T) {
 	defer cancel()
 
 	err = client.Body(ctx, "test-article", &buf)
-	if err != nil {
-		t.Fatalf("failed to get body: %v", err)
-	}
+
 	// Should have an error (partial write, then connection closed)
+	if err == nil {
+		t.Error("expected error from partial write with connection close")
+	}
+
 	// Provider 2 should NOT be called if bytes were written
 	p2Calls := atomic.LoadInt32(&provider2Called)
 	if buf.Len() > 0 && p2Calls > 0 {
