@@ -629,7 +629,7 @@ func (c *Provider) SendRequest(req *Request) <-chan Response {
 	if connCount == 0 {
 		// No connections - must add one synchronously
 		if err := c.addConnection(false); err != nil {
-			return closeWithError(ErrProviderUnavailable)
+			return closeWithError(fmt.Errorf("%w: %w", ErrProviderUnavailable, err))
 		}
 		// Re-check in case addConnection succeeded
 		if atomic.LoadInt32(&c.connCount) == 0 {
