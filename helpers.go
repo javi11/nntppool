@@ -323,12 +323,16 @@ func (s *socks5ContextDialer) DialContext(ctx context.Context, network, address 
 		return ctxDialer.DialContext(ctx, network, address)
 	}
 
-	// Fallback: dial with basic context cancellation check
+	// Fallback: dial with context cancellation handling.
+	// The goroutine will complete even if context is cancelled, but we handle
+	// the cleanup properly to avoid connection leaks.
 	type dialResult struct {
 		conn net.Conn
 		err  error
 	}
-	done := make(chan dialResult, 1)
+	// Use unbuffered channel so goroutine blocks until result is consumed or
+	// we spawn a cleanup goroutine
+	done := make(chan dialResult)
 
 	go func() {
 		conn, err := s.dialer.Dial(network, address)
@@ -337,6 +341,15 @@ func (s *socks5ContextDialer) DialContext(ctx context.Context, network, address 
 
 	select {
 	case <-ctx.Done():
+		// Context cancelled. The goroutine is still running Dial().
+		// Spawn a cleanup goroutine to wait for the dial to complete
+		// and close any connection that was established.
+		go func() {
+			result := <-done
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+		}()
 		return nil, ctx.Err()
 	case result := <-done:
 		return result.conn, result.err

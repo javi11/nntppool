@@ -1315,28 +1315,37 @@ func (p *connectionPool) getConnection(
 	cPool []*providerPool,
 	poolNumber int,
 ) (*puddle.Resource[*internalConnection], error) {
-	if poolNumber > len(cPool)-1 {
-		poolNumber = 0
-		pool := cPool[poolNumber]
+	if len(cPool) == 0 {
+		return nil, ErrNoProviderAvailable
+	}
 
-		conn, err := pool.connectionPool.Acquire(ctx)
-		if err != nil {
-			return nil, err
+	// Iterate through providers at most once to find one with available capacity.
+	// This prevents infinite recursion when all providers are at max capacity.
+	numPools := len(cPool)
+
+	for i := 0; i < numPools; i++ {
+		currentIdx := (poolNumber + i) % numPools
+		pool := cPool[currentIdx]
+
+		// Check if pool has available capacity before trying to acquire
+		stat := pool.connectionPool.Stat()
+		if stat.AcquiredResources() < int32(pool.provider.MaxConnections) {
+			conn, err := pool.connectionPool.Acquire(ctx)
+			if err != nil {
+				// If acquisition fails, try next provider
+				continue
+			}
+			return conn, nil
 		}
-
-		return conn, nil
 	}
 
-	pool := cPool[poolNumber]
-	if pool.connectionPool.Stat().AcquiredResources() == int32(pool.provider.MaxConnections) {
-		return p.getConnection(ctx, cPool, poolNumber+1)
-	}
-
-	conn, err := pool.connectionPool.Acquire(ctx)
+	// All providers are at capacity. Try to acquire from the first provider
+	// and let puddle handle the waiting. This respects context cancellation.
+	startIdx := poolNumber % numPools
+	conn, err := cPool[startIdx].connectionPool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-
 	return conn, nil
 }
 
