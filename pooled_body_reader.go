@@ -8,7 +8,10 @@ import (
 	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 )
 
-// pooledBodyReader wraps an io.ReadCloser and manages the associated pooled connection
+// pooledBodyReader wraps an io.ReadCloser and manages the associated pooled connection.
+// It provides thread-safe access to the underlying reader using lock-free atomics.
+// If Close() races with Read(), the underlying reader returns an error which propagates
+// to the caller - this is acceptable behavior as the caller handles read errors.
 type pooledBodyReader struct {
 	reader    nntpcli.ArticleBodyReader
 	conn      PooledConnection
@@ -20,12 +23,10 @@ type pooledBodyReader struct {
 }
 
 func (r *pooledBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
-	// Check if reader is nil
 	if r.reader == nil {
 		return nntpcli.YencHeaders{}, io.EOF
 	}
 
-	// Fast path: check if already closed (lock-free)
 	if r.closed.Load() {
 		return nntpcli.YencHeaders{}, io.EOF
 	}
@@ -37,17 +38,15 @@ func (r *pooledBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
 	default:
 	}
 
-	// Safe to call reader method - if Close() runs now, closeCh will signal
+	// If Close() races here, underlying reader returns error which propagates to caller
 	return r.reader.GetYencHeaders()
 }
 
 func (r *pooledBodyReader) Read(p []byte) (n int, err error) {
-	// Check if reader is nil
 	if r.reader == nil {
 		return 0, io.EOF
 	}
 
-	// Fast path: check if already closed (lock-free)
 	if r.closed.Load() {
 		return 0, io.EOF
 	}
@@ -59,10 +58,9 @@ func (r *pooledBodyReader) Read(p []byte) (n int, err error) {
 	default:
 	}
 
-	// Safe to call reader method - if Close() runs now, closeCh will signal
+	// If Close() races here, underlying reader returns error which propagates to caller
 	n, err = r.reader.Read(p)
 
-	// Track bytes read for metrics
 	if n > 0 {
 		r.bytesRead.Add(int64(n))
 	}
@@ -77,7 +75,7 @@ func (r *pooledBodyReader) Close() error {
 		// Set closed flag atomically (prevents new operations from starting)
 		r.closed.Store(true)
 
-		// Signal any in-progress Read/GetYencHeaders operations
+		// Signal any waiting operations
 		close(r.closeCh)
 
 		// Close the reader first

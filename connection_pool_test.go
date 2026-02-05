@@ -241,3 +241,71 @@ func TestGetConnection(t *testing.T) {
 		_ = conn.Free()
 	})
 }
+
+// TestGetConnection_ContextCancellationUnderCapacity verifies that GetConnection
+// respects context cancellation when all providers are at capacity, preventing hangs.
+func TestGetConnection_ContextCancellationUnderCapacity(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockClient := nntpcli.NewMockClient(ctrl)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	mockConn := nntpcli.NewMockConnection(ctrl)
+
+	mockConn.EXPECT().Close().AnyTimes()
+
+	providers := []UsenetProviderConfig{
+		{
+			Host:                      "primary.example.com",
+			Port:                      119,
+			MaxConnections:            1, // Only 1 connection allowed
+			MaxConnectionTTLInSeconds: 2400,
+		},
+	}
+
+	ttl := time.Duration(2400) * time.Second
+
+	mockClient.EXPECT().Dial(
+		gomock.Any(),
+		"primary.example.com",
+		119,
+		nntpcli.DialConfig{
+			KeepAliveTime: ttl,
+		},
+	).Return(mockConn, nil).AnyTimes()
+
+	mockConn.EXPECT().Capabilities().Return([]string{}, nil).AnyTimes()
+
+	pool, err := NewConnectionPool(Config{
+		Providers:           providers,
+		NntpCli:             mockClient,
+		Logger:              logger,
+		HealthCheckInterval: time.Hour,
+		MinConnections:      0, // Don't pre-warm
+	})
+	assert.NoError(t, err)
+	defer pool.Quit()
+
+	// First, acquire the only available connection
+	conn1, err := pool.GetConnection(context.Background(), []string{}, false)
+	assert.NoError(t, err)
+	assert.NotNil(t, conn1)
+
+	// Now try to get another connection with a short timeout
+	// This should time out because the pool is at capacity
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = pool.GetConnection(ctx, []string{}, false)
+	elapsed := time.Since(start)
+
+	// Should fail with context deadline exceeded
+	assert.Error(t, err)
+
+	// Should return reasonably quickly (not hang forever)
+	assert.Less(t, elapsed, 500*time.Millisecond, "GetConnection should respect context timeout, not hang")
+
+	// Clean up
+	_ = conn1.Free()
+}

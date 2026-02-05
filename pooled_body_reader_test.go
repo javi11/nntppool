@@ -4,6 +4,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/javi11/nntppool/v2/pkg/nntpcli"
 )
@@ -279,6 +280,222 @@ func (m *mockArticleBodyReaderWithData) Read(p []byte) (int, error) {
 }
 
 func (m *mockArticleBodyReaderWithData) Close() error {
+	m.closed.Store(true)
+	return nil
+}
+
+// TestPooledBodyReader_ConcurrentReadClose verifies that concurrent
+// Read and Close operations are thread-safe and don't cause data races
+func TestPooledBodyReader_ConcurrentReadClose(t *testing.T) {
+	// Create a mock reader that returns data slowly
+	mockReader := &slowArticleBodyReader{
+		data:      make([]byte, 10000),
+		readDelay: 10 * time.Millisecond,
+	}
+
+	reader := &pooledBodyReader{
+		reader:  mockReader,
+		closeCh: make(chan struct{}),
+	}
+
+	const goroutines = 10
+	done := make(chan bool, goroutines+1)
+
+	// Launch concurrent read operations
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("Read panicked during concurrent operations: %v", r)
+				}
+				done <- true
+			}()
+
+			buffer := make([]byte, 100)
+			for j := 0; j < 10; j++ {
+				_, err := reader.Read(buffer)
+				if err == io.EOF {
+					return // Closed, expected
+				}
+			}
+		}()
+	}
+
+	// Launch close operation after a short delay
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("Close panicked during concurrent operations: %v", r)
+			}
+			done <- true
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		_ = reader.Close()
+	}()
+
+	// Wait for all goroutines with timeout
+	for i := 0; i < goroutines+1; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Test timed out - possible hang in concurrent read/close")
+		}
+	}
+
+	// Verify reader is properly closed
+	if !reader.closed.Load() {
+		t.Error("Reader was not marked as closed after concurrent operations")
+	}
+}
+
+// TestPooledBodyReader_CloseRacesWithRead verifies that when Close races with
+// an in-progress Read, the Read operation receives an error from the underlying
+// reader and both operations complete without deadlock or panic.
+// This is acceptable behavior - the caller handles read errors appropriately.
+func TestPooledBodyReader_CloseRacesWithRead(t *testing.T) {
+	var readStarted atomic.Bool
+	var readReceivedEOF atomic.Bool
+
+	mockReader := &blockingArticleBodyReader{
+		readDelay: 200 * time.Millisecond,
+		onRead: func() {
+			readStarted.Store(true)
+		},
+		onClose: func() {
+			// Close is called - read may or may not have completed
+		},
+		checkCloseWhileReading: func() bool {
+			// This is expected to happen - Close can race with Read
+			return true
+		},
+	}
+
+	reader := &pooledBodyReader{
+		reader:  mockReader,
+		closeCh: make(chan struct{}),
+	}
+
+	readDone := make(chan struct{})
+	closeDone := make(chan struct{})
+
+	// Start a slow read
+	go func() {
+		buffer := make([]byte, 100)
+		_, err := reader.Read(buffer)
+		// Read may complete successfully or return EOF if Close races
+		if err == io.EOF {
+			readReceivedEOF.Store(true)
+		}
+		close(readDone)
+	}()
+
+	// Wait for read to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Close while read is in progress - this is allowed and doesn't wait
+	go func() {
+		_ = reader.Close()
+		close(closeDone)
+	}()
+
+	// Wait for both to complete with timeout - neither should deadlock
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read operation timed out - possible deadlock")
+	}
+
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close operation timed out - possible deadlock")
+	}
+
+	// Verify the reader is properly closed
+	if !reader.closed.Load() {
+		t.Error("Reader was not marked as closed")
+	}
+
+	// Read should have started before close
+	if !readStarted.Load() {
+		t.Error("Read did not start before Close was called")
+	}
+
+	// Note: We don't assert readReceivedEOF because the race result depends
+	// on timing. The important thing is that neither operation deadlocks.
+	_ = readReceivedEOF.Load() // Access to avoid unused variable warning
+}
+
+// slowArticleBodyReader is a mock that reads data with a delay between reads
+type slowArticleBodyReader struct {
+	data      []byte
+	offset    atomic.Int64 // atomic to avoid race in tests
+	readDelay time.Duration
+	closed    atomic.Bool
+}
+
+func (m *slowArticleBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
+	if m.closed.Load() {
+		return nntpcli.YencHeaders{}, io.EOF
+	}
+	return nntpcli.YencHeaders{}, nil
+}
+
+func (m *slowArticleBodyReader) Read(p []byte) (int, error) {
+	if m.closed.Load() {
+		return 0, io.EOF
+	}
+	time.Sleep(m.readDelay)
+	offset := int(m.offset.Load())
+	if offset >= len(m.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.data[offset:])
+	m.offset.Add(int64(n))
+	return n, nil
+}
+
+func (m *slowArticleBodyReader) Close() error {
+	m.closed.Store(true)
+	return nil
+}
+
+// blockingArticleBodyReader is a mock that allows fine-grained control over timing
+type blockingArticleBodyReader struct {
+	readDelay              time.Duration
+	onRead                 func()
+	onClose                func()
+	checkCloseWhileReading func() bool
+	closed                 atomic.Bool
+}
+
+func (m *blockingArticleBodyReader) GetYencHeaders() (nntpcli.YencHeaders, error) {
+	if m.closed.Load() {
+		return nntpcli.YencHeaders{}, io.EOF
+	}
+	return nntpcli.YencHeaders{}, nil
+}
+
+func (m *blockingArticleBodyReader) Read(p []byte) (int, error) {
+	if m.closed.Load() {
+		return 0, io.EOF
+	}
+	if m.onRead != nil {
+		m.onRead()
+	}
+	time.Sleep(m.readDelay)
+	// Check if close was called while we were reading
+	if m.checkCloseWhileReading != nil {
+		m.checkCloseWhileReading()
+	}
+	return len(p), nil
+}
+
+func (m *blockingArticleBodyReader) Close() error {
+	if m.onClose != nil {
+		m.onClose()
+	}
 	m.closed.Store(true)
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,6 +165,64 @@ func TestSocks5ContextDialer_DialContext_ContextCancellation(t *testing.T) {
 		t.Errorf("DialContext() took %v, expected to return quickly on context cancellation", elapsed)
 	}
 }
+
+// TestSocks5ContextDialer_DialContext_ConnectionCleanupOnCancellation verifies that
+// when context is cancelled while dial is in progress, any successful connection
+// is properly closed to prevent resource leaks.
+func TestSocks5ContextDialer_DialContext_ConnectionCleanupOnCancellation(t *testing.T) {
+	// Create a mock dialer that succeeds after a delay
+	mockConn := &trackingNetConn{}
+	mockDialer := &delayedSuccessDialer{
+		delay: 200 * time.Millisecond,
+		conn:  mockConn,
+	}
+	dialer := &socks5ContextDialer{dialer: mockDialer}
+
+	// Context will be cancelled before dial completes
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := dialer.DialContext(ctx, "tcp", "example.com:80")
+	if err != context.DeadlineExceeded {
+		t.Errorf("DialContext() error = %v, want %v", err, context.DeadlineExceeded)
+	}
+
+	// Wait for the dial goroutine to complete
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify the connection was closed (since context was cancelled)
+	if !mockConn.closed.Load() {
+		t.Error("Connection was not closed after context cancellation - potential resource leak")
+	}
+}
+
+// delayedSuccessDialer is a mock dialer that succeeds after a delay
+type delayedSuccessDialer struct {
+	delay time.Duration
+	conn  net.Conn
+}
+
+func (d *delayedSuccessDialer) Dial(network, address string) (net.Conn, error) {
+	time.Sleep(d.delay)
+	return d.conn, nil
+}
+
+// trackingNetConn is a net.Conn that tracks if Close was called
+type trackingNetConn struct {
+	closed atomic.Bool
+}
+
+func (m *trackingNetConn) Read(b []byte) (n int, err error)   { return 0, nil }
+func (m *trackingNetConn) Write(b []byte) (n int, err error)  { return len(b), nil }
+func (m *trackingNetConn) Close() error {
+	m.closed.Store(true)
+	return nil
+}
+func (m *trackingNetConn) LocalAddr() net.Addr                { return nil }
+func (m *trackingNetConn) RemoteAddr() net.Addr               { return nil }
+func (m *trackingNetConn) SetDeadline(t time.Time) error      { return nil }
+func (m *trackingNetConn) SetReadDeadline(t time.Time) error  { return nil }
+func (m *trackingNetConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // slowDialer is a mock dialer that delays before returning
 type slowDialer struct {
