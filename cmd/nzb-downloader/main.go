@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +44,10 @@ func main() {
 		pflag.Usage()
 		return
 	}
+
+	// Start pprof server for memory profiling:
+	//   go tool pprof http://localhost:6060/debug/pprof/heap
+	go func() { log.Println(http.ListenAndServe("localhost:6060", nil)) }()
 
 	log.Printf("Parsing NZB file: %s", nzbPath)
 	fileData, err := os.Open(nzbPath)

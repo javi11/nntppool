@@ -74,12 +74,11 @@ func (m *MeteredConn) Flush() {
 // ApplyConnOptimizations applies TCP buffer optimizations and optional TLS wrapping to a connection.
 // This is used for both direct and proxy connections.
 func ApplyConnOptimizations(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
-	// Optimize socket buffers for high-speed downloads (10Gbps+)
+	// Optimize socket buffers — sized for ~250KB BDP per connection
+	// (50 conns sharing 1Gbps at 100ms RTT) with headroom.
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		// 8MB receive buffer
-		_ = tcpConn.SetReadBuffer(8 * 1024 * 1024)
-		// 1MB send buffer
-		_ = tcpConn.SetWriteBuffer(1024 * 1024)
+		_ = tcpConn.SetReadBuffer(512 * 1024)  // 512KB receive buffer
+		_ = tcpConn.SetWriteBuffer(128 * 1024) // 128KB send buffer (NNTP commands are tiny)
 		// Enable TCP keepalive to detect dead connections after laptop sleep/idle.
 		// OS sends probe packets every 30s; connection marked dead after ~8-9 failed probes.
 		_ = tcpConn.SetKeepAlive(true)
