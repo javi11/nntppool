@@ -9,8 +9,9 @@ import (
 
 const (
 	// DefaultReadBufSize is the initial read buffer size.
-	// 1MB matches TCP receive buffer better for high-throughput connections.
-	DefaultReadBufSize = 1 * 1024 * 1024
+	// 64KB matches typical TCP segment sizes. The buffer grows on demand
+	// (doubling up to MaxReadBufSize) so large articles still work.
+	DefaultReadBufSize = 64 * 1024
 	MaxReadBufSize     = 8 * 1024 * 1024
 
 	// DefaultReadTimeout is used when no context deadline is set.
@@ -56,6 +57,22 @@ func (rb *ReadBuffer) Compact() {
 	copy(rb.buf, rb.buf[rb.start:rb.end])
 	rb.end -= rb.start
 	rb.start = 0
+}
+
+// Reset shrinks the buffer back to DefaultReadBufSize after a request completes.
+// If leftover bytes remain (start of next pipelined response), it compacts
+// without shrinking. Only shrinks when the buffer is fully consumed.
+func (rb *ReadBuffer) Reset() {
+	if rb.start < rb.end {
+		// Leftover bytes from next response — compact but don't shrink
+		rb.Compact()
+		return
+	}
+	// Buffer fully consumed — safe to shrink
+	if len(rb.buf) > DefaultReadBufSize {
+		rb.buf = make([]byte, DefaultReadBufSize)
+	}
+	rb.start, rb.end = 0, 0
 }
 
 func (rb *ReadBuffer) ensureWriteSpace() error {

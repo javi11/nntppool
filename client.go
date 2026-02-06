@@ -238,7 +238,7 @@ func (c *Client) BodyReader(ctx context.Context, id string) (YencReader, error) 
 // Body retrieves the body of an article by its message ID.
 func (c *Client) Body(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
-	resp, err := c.sendStreamSync(ctx, cmd, w)
+	resp, err := c.sendSync(ctx, cmd, w)
 	if err != nil {
 		return err
 	}
@@ -264,7 +264,7 @@ func (c *Client) BodyAt(ctx context.Context, id string, w io.WriterAt) error {
 // Article retrieves the header and body of an article by its message ID.
 func (c *Client) Article(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("ARTICLE %s\r\n", c.formatID(id))
-	resp, err := c.sendStreamSync(ctx, cmd, w)
+	resp, err := c.sendSync(ctx, cmd, w)
 	if err != nil {
 		return err
 	}
@@ -633,54 +633,6 @@ func (c *Client) sendSync(ctx context.Context, cmd string, w io.Writer) (*Respon
 	}
 }
 
-// sendStreamSync sends a body command and streams decoded bytes to w via an
-// io.Pipe, avoiding the deadlock that occurs when w is itself an io.Pipe or
-// any synchronous writer. A background goroutine monitors the response channel
-// and closes the pipe writer to signal EOF or propagate errors.
-func (c *Client) sendStreamSync(ctx context.Context, cmd string, w io.Writer) (*Response, error) {
-	pr, pw := io.Pipe()
-	respCh := c.Send(ctx, []byte(cmd), pw)
-
-	type sendResult struct {
-		resp Response
-		ok   bool
-	}
-	doneCh := make(chan sendResult, 1)
-
-	go func() {
-		select {
-		case resp, ok := <-respCh:
-			doneCh <- sendResult{resp, ok}
-			if !ok {
-				pw.CloseWithError(fmt.Errorf("response channel closed unexpectedly"))
-				return
-			}
-			if resp.Err != nil {
-				pw.CloseWithError(resp.Err)
-				return
-			}
-			_ = pw.Close() // signal EOF
-		case <-ctx.Done():
-			doneCh <- sendResult{Response{Err: ctx.Err()}, true}
-			pw.CloseWithError(ctx.Err())
-		}
-	}()
-
-	_, copyErr := io.Copy(w, pr)
-	_ = pr.Close()
-
-	res := <-doneCh
-	if !res.ok {
-		return nil, fmt.Errorf("response channel closed unexpectedly")
-	}
-	if res.resp.Err != nil {
-		return nil, res.resp.Err
-	}
-	if copyErr != nil {
-		return &res.resp, copyErr
-	}
-	return &res.resp, nil
-}
 
 type writerAtAdapter struct {
 	w io.WriterAt

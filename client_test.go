@@ -2115,13 +2115,14 @@ func TestProviderConcurrentRequestsWithPipelining(t *testing.T) {
 	t.Logf("all %d concurrent requests with pipelining succeeded", numRequests)
 }
 
-// TestSequentialReaderWithPipeDeadlock demonstrates the connection deadlock issue
+// TestSequentialReaderWithPipeDeadlock demonstrates the connection-exhaustion issue
 // when implementing a sequential reader using io.Pipe with direct writes.
 //
-// The deadlock scenario:
+// The exhaustion scenario:
 //  1. Workers hold connections while blocked on pipe writes (pipes are synchronous)
 //  2. Pipe writes block until the reader consumes them sequentially
-//  3. Reader can't reach later pipes because connections are held by workers blocked on earlier pipes
+//  3. With fewer connections than segments, later segments wait for a free connection
+//     while earlier segments hold connections blocked on unread pipes
 //
 // Solution: Download to buffer first, then copy to pipe (connection released before potential block).
 func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
@@ -2165,13 +2166,12 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 	}
 
 	t.Run("deadlock_with_direct_pipe_writes", func(t *testing.T) {
-		// With sendStreamSync, Body() no longer deadlocks when writing to an
-		// io.Pipe because the caller's goroutine drives io.Copy(w, pr) while
-		// a background goroutine monitors the response channel. However, with
-		// fewer connections than segments, connection exhaustion can still cause
-		// timeouts (segment 2 waits for a free connection while seg 0 and 1
-		// hold them, but seg 0/1's connections are released once their streams
-		// finish — the reader must consume them in order).
+		// Body() writes directly to the caller's io.Pipe. With a separate
+		// reader goroutine consuming from the pipe, data flows through and
+		// connections are released. However, with fewer connections than
+		// segments, connection exhaustion can still cause timeouts (segment 2
+		// waits for a free connection while seg 0 and 1 hold them — the
+		// reader must consume pipes in order to free connections).
 		client := NewClient()
 		defer client.Close()
 
@@ -2198,9 +2198,8 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 		}
 
 		// Start workers that download directly to pipes.
-		// With sendStreamSync, each Body() call streams via an internal pipe
-		// and copies to the caller's pipe, so it doesn't block on respCh.
-		// The connection is held during streaming though, so with 2 connections
+		// Each Body() call writes directly to the caller's pipe writer.
+		// The connection is held during streaming, so with 2 connections
 		// and 3 segments, the 3rd segment must wait for a connection to free up.
 		var wg sync.WaitGroup
 		downloadDone := make(chan struct{})
@@ -2225,7 +2224,7 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 		}()
 
 		// Sequential reader - must read segment 0, then 1, then 2.
-		// With sendStreamSync the pipe-level deadlock is resolved.
+		// With a separate reader goroutine, pipe writes don't block sendSync.
 		// Connection exhaustion may still cause timeouts when connections < segments
 		// and the reader doesn't consume pipes fast enough to free connections.
 		var result bytes.Buffer
@@ -2244,7 +2243,7 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 		select {
 		case err := <-readDone:
 			if err == nil && result.Len() == len(segments[0])+len(segments[1])+len(segments[2]) {
-				t.Log("direct pipe writes completed successfully with sendStreamSync")
+				t.Log("direct pipe writes completed successfully")
 			} else if err != nil {
 				t.Logf("read completed with error (connection exhaustion expected): %v", err)
 			}
@@ -2563,8 +2562,8 @@ func TestIsMaxConnectionsExceededError(t *testing.T) {
 }
 
 // TestBodyStreamingWithPipe verifies that Body() works with an io.Pipe as the
-// writer without deadlocking. Before sendStreamSync this would deadlock because
-// sendSync blocked on <-respCh while the readerLoop blocked writing to the pipe.
+// writer without deadlocking. This works because a separate goroutine reads
+// from the pipe, allowing readerLoop to complete writing and send on respCh.
 func TestBodyStreamingWithPipe(t *testing.T) {
 	raw := []byte("hello world!")
 

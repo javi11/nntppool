@@ -442,6 +442,9 @@ func (c *NNTPConnection) readerLoop() {
 		}
 		internal.SafeClose(req.RespCh)
 
+		// Shrink read buffer back to default if fully consumed.
+		c.rb.Reset()
+
 		// release inflight slot
 		<-c.inflightSem
 
