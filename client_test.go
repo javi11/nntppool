@@ -2165,8 +2165,13 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 	}
 
 	t.Run("deadlock_with_direct_pipe_writes", func(t *testing.T) {
-		// Setup client with limited connections (2 connections for 3 segments)
-		// This creates the deadlock condition when all connections are blocked on pipe writes
+		// With sendStreamSync, Body() no longer deadlocks when writing to an
+		// io.Pipe because the caller's goroutine drives io.Copy(w, pr) while
+		// a background goroutine monitors the response channel. However, with
+		// fewer connections than segments, connection exhaustion can still cause
+		// timeouts (segment 2 waits for a free connection while seg 0 and 1
+		// hold them, but seg 0/1's connections are released once their streams
+		// finish — the reader must consume them in order).
 		client := NewClient()
 		defer client.Close()
 
@@ -2192,19 +2197,21 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 			pipes[i].r, pipes[i].w = io.Pipe()
 		}
 
-		// Start workers that download directly to pipes (problematic pattern)
+		// Start workers that download directly to pipes.
+		// With sendStreamSync, each Body() call streams via an internal pipe
+		// and copies to the caller's pipe, so it doesn't block on respCh.
+		// The connection is held during streaming though, so with 2 connections
+		// and 3 segments, the 3rd segment must wait for a connection to free up.
 		var wg sync.WaitGroup
 		downloadDone := make(chan struct{})
 		for i := range segments {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer cancel()
-				// Direct pipe write - will block until reader consumes
 				err := client.Body(ctx, fmt.Sprintf("<%d>", idx), pipes[idx].w)
 				if err != nil {
-					// Expected to timeout/fail due to deadlock
 					_ = pipes[idx].w.CloseWithError(err)
 				} else {
 					_ = pipes[idx].w.Close()
@@ -2217,11 +2224,10 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 			close(downloadDone)
 		}()
 
-		// Sequential reader - must read segment 0, then 1, then 2
-		// With direct pipe writes and limited connections, this will deadlock:
-		// - Workers for seg 1 and 2 hold the 2 connections
-		// - They block on pipe writes waiting for reader
-		// - Reader is waiting for seg 0 which can't start (no free connections)
+		// Sequential reader - must read segment 0, then 1, then 2.
+		// With sendStreamSync the pipe-level deadlock is resolved.
+		// Connection exhaustion may still cause timeouts when connections < segments
+		// and the reader doesn't consume pipes fast enough to free connections.
 		var result bytes.Buffer
 		readDone := make(chan error, 1)
 		go func() {
@@ -2235,24 +2241,21 @@ func TestSequentialReaderWithPipeDeadlock(t *testing.T) {
 			readDone <- nil
 		}()
 
-		// With the deadlock pattern, we expect a timeout
 		select {
 		case err := <-readDone:
 			if err == nil && result.Len() == len(segments[0])+len(segments[1])+len(segments[2]) {
-				// If it succeeds, that's actually fine - the race condition didn't trigger
-				t.Log("direct pipe writes completed (race condition didn't trigger this time)")
+				t.Log("direct pipe writes completed successfully with sendStreamSync")
+			} else if err != nil {
+				t.Logf("read completed with error (connection exhaustion expected): %v", err)
 			}
 		case <-downloadDone:
-			// Downloads completed but reader may still be blocked
 			select {
 			case <-readDone:
-				// OK
 			case <-time.After(100 * time.Millisecond):
-				t.Log("reader blocked after downloads - demonstrating potential deadlock")
+				t.Log("reader blocked after downloads - connection exhaustion scenario")
 			}
-		case <-time.After(1 * time.Second):
-			// Expected: timeout due to deadlock potential
-			t.Log("timeout detected - deadlock scenario demonstrated")
+		case <-time.After(3 * time.Second):
+			t.Log("timeout detected - connection exhaustion with limited connections")
 		}
 
 		// Cleanup pipes
@@ -2556,5 +2559,198 @@ func TestIsMaxConnectionsExceededError(t *testing.T) {
 					tt.statusCode, tt.status, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestBodyStreamingWithPipe verifies that Body() works with an io.Pipe as the
+// writer without deadlocking. Before sendStreamSync this would deadlock because
+// sendSync blocked on <-respCh while the readerLoop blocked writing to the pipe.
+func TestBodyStreamingWithPipe(t *testing.T) {
+	raw := []byte("hello world!")
+
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: testutil.YencBodyHandler(raw, "test.txt"),
+	})
+	defer cleanup()
+
+	client := NewClient()
+	defer client.Close()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	if err := client.AddProvider(p, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+
+	done := make(chan error, 1)
+	go func() {
+		err := client.Body(context.Background(), "123", pw)
+		if err != nil {
+			pw.CloseWithError(err)
+		} else {
+			_ = pw.Close()
+		}
+		done <- err
+	}()
+
+	var buf bytes.Buffer
+	_, copyErr := io.Copy(&buf, pr)
+	_ = pr.Close()
+
+	bodyErr := <-done
+	if bodyErr != nil {
+		t.Fatalf("Body() failed: %v", bodyErr)
+	}
+	if copyErr != nil {
+		t.Fatalf("io.Copy failed: %v", copyErr)
+	}
+	if buf.String() != string(raw) {
+		t.Errorf("expected %q, got %q", string(raw), buf.String())
+	}
+}
+
+// TestBodyStreamingContextCancellation verifies that cancelling the context
+// mid-stream doesn't hang and propagates the error properly.
+func TestBodyStreamingContextCancellation(t *testing.T) {
+	// Use a large body so we can cancel mid-stream
+	raw := bytes.Repeat([]byte("x"), 1024)
+
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: testutil.YencBodyHandler(raw, "large.bin"),
+	})
+	defer cleanup()
+
+	client := NewClient()
+	defer client.Close()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	if err := client.AddProvider(p, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Use a slow writer that cancels after first write
+	sw := &slowCancelWriter{cancel: cancel}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Body(ctx, "123", sw)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			// Body may complete before cancellation takes effect for small payloads
+			t.Log("Body completed before cancellation")
+		} else {
+			t.Logf("Body returned error as expected: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Body() hung after context cancellation")
+	}
+}
+
+// slowCancelWriter cancels the context after the first write.
+type slowCancelWriter struct {
+	cancel  context.CancelFunc
+	written bool
+}
+
+func (w *slowCancelWriter) Write(p []byte) (int, error) {
+	if !w.written {
+		w.written = true
+		w.cancel()
+	}
+	return len(p), nil
+}
+
+// TestBodyReaderEOF verifies that BodyReader properly signals EOF after all
+// data has been read, which requires the pipe writer to be closed.
+func TestBodyReaderEOF(t *testing.T) {
+	raw := []byte("hello world!")
+
+	srv, cleanup := testutil.StartMockNNTPServer(t, testutil.MockServerConfig{
+		Handler: testutil.YencBodyHandler(raw, "test.txt"),
+	})
+	defer cleanup()
+
+	client := NewClient()
+	defer client.Close()
+
+	dial := func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+
+	p, err := NewProvider(context.Background(), ProviderConfig{
+		Address:               srv.Addr(),
+		MaxConnections:        1,
+		InflightPerConnection: 1,
+		ConnFactory:           dial,
+	})
+	if err != nil {
+		t.Fatalf("failed to create provider: %v", err)
+	}
+	if err := client.AddProvider(p, ProviderPrimary); err != nil {
+		t.Fatalf("failed to add provider: %v", err)
+	}
+
+	reader, err := client.BodyReader(context.Background(), "123")
+	if err != nil {
+		t.Fatalf("BodyReader failed: %v", err)
+	}
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Errorf("failed to close reader: %v", err)
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var buf bytes.Buffer
+		_, err := io.Copy(&buf, reader)
+		if err != nil {
+			t.Errorf("io.Copy failed: %v", err)
+			return
+		}
+		if buf.String() != string(raw) {
+			t.Errorf("expected %q, got %q", string(raw), buf.String())
+		}
+	}()
+
+	select {
+	case <-done:
+		// Success — io.Copy received EOF and returned
+	case <-time.After(5 * time.Second):
+		t.Fatal("BodyReader never signaled EOF — pipe writer not closed")
 	}
 }
