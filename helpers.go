@@ -18,17 +18,6 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-func joinGroup(c nntpcli.Connection, groups []string) error {
-	var err error
-
-	for _, g := range groups {
-		if err = c.JoinGroup(g); err == nil {
-			return nil
-		}
-	}
-
-	return err
-}
 func getPools(
 	p []UsenetProviderConfig,
 	nttpCli nntpcli.Client,

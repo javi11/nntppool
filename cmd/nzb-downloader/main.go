@@ -154,19 +154,12 @@ func main() {
 		}
 	}()
 
-	// Semaphore to limit concurrency to avoid high memory usage
-	sem := make(chan struct{}, connections*3)
-
 	// Iterate and download files
 	for _, file := range nzb.Files {
-		var outWriter io.WriterAt
-		var f *os.File
-		var fileWg sync.WaitGroup
-		var writeMu sync.Mutex // Protects writes to the file
-
 		fmt.Printf("Downloading file: %s\n", file.Filename)
 		fmt.Printf("Output directory: %s\n", output)
 
+		var f *os.File
 		if output != "" {
 			// Basic sanitization: take just the filename element to avoid directory traversal
 			fname := filepath.Base(file.Filename)
@@ -180,20 +173,33 @@ func main() {
 			f, err = os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 			if err != nil {
 				log.Printf("Failed to open output file %s: %v", filePath, err)
-			} else {
-				outWriter = f
+				continue
 			}
 		}
 
 		// Track cumulative offset for each segment
-		segmentOffsets := make(map[string]int64)
+		type segmentInfo struct {
+			id     string
+			offset int64
+			size   int64
+		}
+		segments := make([]segmentInfo, 0, len(file.Segments))
 		var currentOffset int64
 		for _, segment := range file.Segments {
-			segmentOffsets[segment.ID] = currentOffset
+			segments = append(segments, segmentInfo{
+				id:     segment.ID,
+				offset: currentOffset,
+				size:   int64(segment.Bytes),
+			})
 			currentOffset += int64(segment.Bytes)
 		}
 
-		for _, segment := range file.Segments {
+		// Download segments concurrently
+		sem := make(chan struct{}, connections*3)
+		var fileWg sync.WaitGroup
+		var writeMu sync.Mutex
+
+		for _, seg := range segments {
 			wg.Add(1)
 			fileWg.Add(1)
 			count++
@@ -201,27 +207,24 @@ func main() {
 			// Acquire semaphore
 			sem <- struct{}{}
 
-			go func(msgID string, segSize int64, offset int64, w io.WriterAt) {
+			go func(msgID string, segSize int64, offset int64) {
 				defer wg.Done()
 				defer fileWg.Done()
-				defer func() { <-sem }() // Release semaphore
+				defer func() { <-sem }()
 
-				// Use the Body method to download
 				if output == "" {
-					_, err := pool.Body(ctx, msgID, io.Discard, nil)
+					_, err := pool.Body(ctx, msgID, io.Discard)
 					if err != nil {
 						fmt.Printf("Error downloading %s: %v\n", msgID, err)
 					}
-				} else if w != nil {
-					// Download to buffer first, then write at position
+				} else if f != nil {
 					buf := &bytes.Buffer{}
-					_, err := pool.Body(ctx, msgID, buf, nil)
+					_, err := pool.Body(ctx, msgID, buf)
 					if err != nil {
 						fmt.Printf("Error downloading %s: %v\n", msgID, err)
 					} else {
-						// Write to file at the correct offset
 						writeMu.Lock()
-						_, writeErr := w.WriteAt(buf.Bytes(), offset)
+						_, writeErr := f.WriteAt(buf.Bytes(), offset)
 						writeMu.Unlock()
 						if writeErr != nil {
 							fmt.Printf("Error writing %s: %v\n", msgID, writeErr)
@@ -229,16 +232,16 @@ func main() {
 					}
 				}
 				_ = bar.Add(int(segSize))
-			}(segment.ID, int64(segment.Bytes), segmentOffsets[segment.ID], outWriter)
+			}(seg.id, seg.size, seg.offset)
 		}
 
+		// Wait for this file's segments to complete before closing
+		fileWg.Wait()
+
 		if f != nil {
-			go func(fh *os.File) {
-				fileWg.Wait()
-				if err := fh.Close(); err != nil {
-					log.Printf("Failed to close file: %v", err)
-				}
-			}(f)
+			if err := f.Close(); err != nil {
+				log.Printf("Failed to close file: %v", err)
+			}
 		}
 	}
 

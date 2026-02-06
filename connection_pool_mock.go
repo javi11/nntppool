@@ -43,47 +43,33 @@ func (m *MockUsenetConnectionPool) EXPECT() *MockUsenetConnectionPoolMockRecorde
 }
 
 // Body mocks base method.
-func (m *MockUsenetConnectionPool) Body(ctx context.Context, msgID string, w io.Writer, nntpGroups []string) (int64, error) {
+func (m *MockUsenetConnectionPool) Body(ctx context.Context, msgID string, w io.Writer) (int64, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Body", ctx, msgID, w, nntpGroups)
+	ret := m.ctrl.Call(m, "Body", ctx, msgID, w)
 	ret0, _ := ret[0].(int64)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // Body indicates an expected call of Body.
-func (mr *MockUsenetConnectionPoolMockRecorder) Body(ctx, msgID, w, nntpGroups any) *gomock.Call {
+func (mr *MockUsenetConnectionPoolMockRecorder) Body(ctx, msgID, w any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Body", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Body), ctx, msgID, w, nntpGroups)
-}
-
-// BodyBatch mocks base method.
-func (m *MockUsenetConnectionPool) BodyBatch(ctx context.Context, group string, requests []BodyBatchRequest) []BodyBatchResult {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "BodyBatch", ctx, group, requests)
-	ret0, _ := ret[0].([]BodyBatchResult)
-	return ret0
-}
-
-// BodyBatch indicates an expected call of BodyBatch.
-func (mr *MockUsenetConnectionPoolMockRecorder) BodyBatch(ctx, group, requests any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyBatch", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyBatch), ctx, group, requests)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Body", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Body), ctx, msgID, w)
 }
 
 // BodyReader mocks base method.
-func (m *MockUsenetConnectionPool) BodyReader(ctx context.Context, msgID string, nntpGroups []string) (nntpcli.ArticleBodyReader, error) {
+func (m *MockUsenetConnectionPool) BodyReader(ctx context.Context, msgID string) (nntpcli.ArticleBodyReader, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "BodyReader", ctx, msgID, nntpGroups)
+	ret := m.ctrl.Call(m, "BodyReader", ctx, msgID)
 	ret0, _ := ret[0].(nntpcli.ArticleBodyReader)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // BodyReader indicates an expected call of BodyReader.
-func (mr *MockUsenetConnectionPoolMockRecorder) BodyReader(ctx, msgID, nntpGroups any) *gomock.Call {
+func (mr *MockUsenetConnectionPoolMockRecorder) BodyReader(ctx, msgID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyReader", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyReader), ctx, msgID, nntpGroups)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyReader", reflect.TypeOf((*MockUsenetConnectionPool)(nil).BodyReader), ctx, msgID)
 }
 
 // GetConnection mocks base method.
@@ -185,32 +171,16 @@ func (mr *MockUsenetConnectionPoolMockRecorder) Quit() *gomock.Call {
 }
 
 // Stat mocks base method.
-func (m *MockUsenetConnectionPool) Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error) {
+func (m *MockUsenetConnectionPool) Stat(ctx context.Context, msgID string) (int, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Stat", ctx, msgID, nntpGroups)
+	ret := m.ctrl.Call(m, "Stat", ctx, msgID)
 	ret0, _ := ret[0].(int)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // Stat indicates an expected call of Stat.
-func (mr *MockUsenetConnectionPoolMockRecorder) Stat(ctx, msgID, nntpGroups any) *gomock.Call {
+func (mr *MockUsenetConnectionPoolMockRecorder) Stat(ctx, msgID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stat", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Stat), ctx, msgID, nntpGroups)
-}
-
-// TestProviderPipelineSupport mocks base method.
-func (m *MockUsenetConnectionPool) TestProviderPipelineSupport(ctx context.Context, providerHost, testMsgID string) (bool, int, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "TestProviderPipelineSupport", ctx, providerHost, testMsgID)
-	ret0, _ := ret[0].(bool)
-	ret1, _ := ret[1].(int)
-	ret2, _ := ret[2].(error)
-	return ret0, ret1, ret2
-}
-
-// TestProviderPipelineSupport indicates an expected call of TestProviderPipelineSupport.
-func (mr *MockUsenetConnectionPoolMockRecorder) TestProviderPipelineSupport(ctx, providerHost, testMsgID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TestProviderPipelineSupport", reflect.TypeOf((*MockUsenetConnectionPool)(nil).TestProviderPipelineSupport), ctx, providerHost, testMsgID)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stat", reflect.TypeOf((*MockUsenetConnectionPool)(nil).Stat), ctx, msgID)
 }

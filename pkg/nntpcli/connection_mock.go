@@ -70,20 +70,6 @@ func (mr *MockConnectionMockRecorder) BodyDecoded(msgID, w, discard any) *gomock
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyDecoded", reflect.TypeOf((*MockConnection)(nil).BodyDecoded), msgID, w, discard)
 }
 
-// BodyPipelined mocks base method.
-func (m *MockConnection) BodyPipelined(requests []PipelineRequest) []PipelineResult {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "BodyPipelined", requests)
-	ret0, _ := ret[0].([]PipelineResult)
-	return ret0
-}
-
-// BodyPipelined indicates an expected call of BodyPipelined.
-func (mr *MockConnectionMockRecorder) BodyPipelined(requests any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BodyPipelined", reflect.TypeOf((*MockConnection)(nil).BodyPipelined), requests)
-}
-
 // BodyReader mocks base method.
 func (m *MockConnection) BodyReader(msgID string) (ArticleBodyReader, error) {
 	m.ctrl.T.Helper()
@@ -212,20 +198,4 @@ func (m *MockConnection) Stat(msgID string) (int, error) {
 func (mr *MockConnectionMockRecorder) Stat(msgID any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Stat", reflect.TypeOf((*MockConnection)(nil).Stat), msgID)
-}
-
-// TestPipelineSupport mocks base method.
-func (m *MockConnection) TestPipelineSupport(testMsgID string) (bool, int, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "TestPipelineSupport", testMsgID)
-	ret0, _ := ret[0].(bool)
-	ret1, _ := ret[1].(int)
-	ret2, _ := ret[2].(error)
-	return ret0, ret1, ret2
-}
-
-// TestPipelineSupport indicates an expected call of TestPipelineSupport.
-func (mr *MockConnectionMockRecorder) TestPipelineSupport(testMsgID any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TestPipelineSupport", reflect.TypeOf((*MockConnection)(nil).TestPipelineSupport), testMsgID)
 }
