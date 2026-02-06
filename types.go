@@ -178,6 +178,9 @@ type NNTPClient interface {
 	Post(ctx context.Context, headers map[string]string, body io.Reader) (*Response, error)
 	PostYenc(ctx context.Context, headers map[string]string, body io.Reader, opts *YencOptions) (*Response, error)
 
+	// Async article retrieval
+	BodyAsync(ctx context.Context, id string, w io.Writer) <-chan Response
+
 	// Advanced methods
 	Send(ctx context.Context, payload []byte, bodyWriter io.Writer) <-chan Response
 	Metrics() map[string]ProviderMetrics

@@ -179,6 +179,16 @@ func (c *Client) Metrics() map[string]ProviderMetrics {
 	return metrics
 }
 
+// BodyAsync is the non-blocking version of Body. It starts downloading the
+// article body in a background goroutine and returns a channel that receives
+// the response. The decoded body streams directly to w via BodyWriter.
+// Provider rotation (including 430 article-not-found failover) is handled
+// by the underlying Send/sendRequest mechanism.
+func (c *Client) BodyAsync(ctx context.Context, id string, w io.Writer) <-chan Response {
+	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
+	return c.Send(ctx, []byte(cmd), w)
+}
+
 func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer) <-chan Response {
 	respCh := make(chan Response, 1)
 

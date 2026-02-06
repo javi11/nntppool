@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/javi11/nntppool/v3"
@@ -108,11 +107,9 @@ func main() {
 		}
 	}
 
-	var wg sync.WaitGroup
 	count := 0
 	startTime := time.Now()
 
-	// Wait group for all downloads
 	var totalBytes int64
 	for _, file := range nzb.Files {
 		for _, segment := range file.Segments {
@@ -147,24 +144,20 @@ func main() {
 		}
 	}()
 
-	// Semaphore to limit concurrency to avoid high memory usage
-	// Using connections * 2 to keep the pipeline full
-	sem := make(chan struct{}, connections*3)
+	type pending struct {
+		ch      <-chan nntppool.Response
+		msgID   string
+		segSize int64
+	}
 
-	// Iterate and send
 	for _, file := range nzb.Files {
-		var outWriter io.WriterAt
-		var f *os.File
-		var fileWg sync.WaitGroup
-
 		fmt.Printf("Downloading file: %s\n", file.Filename)
 		fmt.Printf("Output directory: %s\n", output)
 
+		var f *os.File
 		if output != "" {
-			// Basic sanitization: take just the filename element to avoid directory traversal
 			fname := filepath.Base(file.Filename)
 			if fname == "." || fname == "/" {
-				// Fallback if filename is weird
 				fname = fmt.Sprintf("file_%d.bin", time.Now().UnixNano())
 			}
 			filePath := filepath.Join(output, fname)
@@ -173,52 +166,42 @@ func main() {
 			f, err = os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 			if err != nil {
 				log.Printf("Failed to open output file %s: %v", filePath, err)
-			} else {
-				outWriter = f
 			}
 		}
 
+		// Fire all segments for this file via BodyAsync.
+		// The pool's reqCh + inflightSem provide natural backpressure.
+		// *os.File implements io.WriterAt, so sendRequest uses WriteAt for
+		// correct concurrent segment writes at yEnc-specified offsets.
+		segments := make([]pending, 0, len(file.Segments))
 		for _, segment := range file.Segments {
-			wg.Add(1)
-			fileWg.Add(1)
 			count++
+			var w io.Writer
+			if f != nil {
+				w = f
+			} else {
+				w = io.Discard
+			}
+			ch := client.BodyAsync(ctx, segment.ID, w)
+			segments = append(segments, pending{ch: ch, msgID: segment.ID, segSize: int64(segment.Bytes)})
+		}
 
-			// Acquire semaphore
-			sem <- struct{}{}
-
-			go func(msgID string, segSize int64, w io.WriterAt) {
-				defer wg.Done()
-				defer fileWg.Done()
-				defer func() { <-sem }() // Release semaphore
-
-				// Use the high-level Body method which blocks until complete
-				if output == "" {
-					err := client.Body(ctx, msgID, io.Discard)
-					if err != nil {
-						fmt.Printf("Error downloading %s: %v\n", msgID, err)
-					}
-				} else {
-					err := client.BodyAt(ctx, msgID, w)
-					if err != nil {
-						fmt.Printf("Error downloading %s: %v\n", msgID, err)
-					}
-				}
-				_ = bar.Add(int(segSize))
-			}(segment.ID, int64(segment.Bytes), outWriter)
+		// Drain responses
+		for _, seg := range segments {
+			resp := <-seg.ch
+			if resp.Err != nil {
+				fmt.Printf("Error downloading %s: %v\n", seg.msgID, resp.Err)
+			}
+			_ = bar.Add(int(seg.segSize))
 		}
 
 		if f != nil {
-			go func(fh *os.File) {
-				fileWg.Wait()
-				if err := fh.Close(); err != nil {
-					log.Printf("Failed to close file: %v", err)
-				}
-			}(f)
+			if err := f.Close(); err != nil {
+				log.Printf("Failed to close file: %v", err)
+			}
 		}
 	}
 
-	log.Println("Waiting for downloads to complete...")
-	wg.Wait()
 	close(stopMetrics)
 
 	duration := time.Since(startTime)
