@@ -76,13 +76,19 @@ func (m *MeteredConn) Flush() {
 func ApplyConnOptimizations(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
 	// Optimize socket buffers — sized for ~250KB BDP per connection
 	// (50 conns sharing 1Gbps at 100ms RTT) with headroom.
+	// Optimize TCP socket
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetReadBuffer(512 * 1024)  // 512KB receive buffer
-		_ = tcpConn.SetWriteBuffer(128 * 1024) // 128KB send buffer (NNTP commands are tiny)
-		// Enable TCP keepalive to detect dead connections after laptop sleep/idle.
-		// OS sends probe packets every 30s; connection marked dead after ~8-9 failed probes.
-		_ = tcpConn.SetKeepAlive(true)
-		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetReadBuffer(1024 * 1024)
+		_ = tcpConn.SetWriteBuffer(256 * 1024)
+	}
+	// For TLS, get underlying conn
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		if tcpConn, ok := tlsConn.NetConn().(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetReadBuffer(1024 * 1024)
+			_ = tcpConn.SetWriteBuffer(256 * 1024)
+		}
 	}
 
 	if tlsConfig != nil {
