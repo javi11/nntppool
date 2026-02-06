@@ -2562,8 +2562,8 @@ func TestIsMaxConnectionsExceededError(t *testing.T) {
 }
 
 // TestBodyStreamingWithPipe verifies that Body() works with an io.Pipe as the
-// writer without deadlocking. This works because a separate goroutine reads
-// from the pipe, allowing readerLoop to complete writing and send on respCh.
+// writer. Body() buffers internally so the connection is released before
+// writing to the pipe, but the test still validates data correctness.
 func TestBodyStreamingWithPipe(t *testing.T) {
 	raw := []byte("hello world!")
 

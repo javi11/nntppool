@@ -236,16 +236,20 @@ func (c *Client) BodyReader(ctx context.Context, id string) (YencReader, error) 
 }
 
 // Body retrieves the body of an article by its message ID.
+// The body is buffered internally so the NNTP connection is released before
+// writing to w. Callers needing true streaming should use BodyReader.
 func (c *Client) Body(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
-	resp, err := c.sendSync(ctx, cmd, w)
+	var buf bytes.Buffer
+	resp, err := c.sendSync(ctx, cmd, &buf)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
 	}
-	return nil
+	_, err = io.Copy(w, &buf)
+	return err
 }
 
 // BodyAt retrieves the body of an article by its message ID, writing to an io.WriterAt.
@@ -262,16 +266,20 @@ func (c *Client) BodyAt(ctx context.Context, id string, w io.WriterAt) error {
 }
 
 // Article retrieves the header and body of an article by its message ID.
+// The article is buffered internally so the NNTP connection is released before
+// writing to w.
 func (c *Client) Article(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("ARTICLE %s\r\n", c.formatID(id))
-	resp, err := c.sendSync(ctx, cmd, w)
+	var buf bytes.Buffer
+	resp, err := c.sendSync(ctx, cmd, &buf)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
 	}
-	return nil
+	_, err = io.Copy(w, &buf)
+	return err
 }
 
 // Head retrieves the headers of an article by its message ID.
