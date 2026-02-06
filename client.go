@@ -17,6 +17,10 @@ import (
 
 const addProviderTimeout = 20 * time.Second
 
+var bufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
 type Client struct {
 	primaries atomic.Value // []*Provider
 	backups   atomic.Value // []*Provider
@@ -240,15 +244,18 @@ func (c *Client) BodyReader(ctx context.Context, id string) (YencReader, error) 
 // writing to w. Callers needing true streaming should use BodyReader.
 func (c *Client) Body(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("BODY %s\r\n", c.formatID(id))
-	var buf bytes.Buffer
-	resp, err := c.sendSync(ctx, cmd, &buf)
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	resp, err := c.sendSync(ctx, cmd, buf)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
 	}
-	_, err = io.Copy(w, &buf)
+	_, err = io.Copy(w, buf)
 	return err
 }
 
@@ -270,15 +277,18 @@ func (c *Client) BodyAt(ctx context.Context, id string, w io.WriterAt) error {
 // writing to w.
 func (c *Client) Article(ctx context.Context, id string, w io.Writer) error {
 	cmd := fmt.Sprintf("ARTICLE %s\r\n", c.formatID(id))
-	var buf bytes.Buffer
-	resp, err := c.sendSync(ctx, cmd, &buf)
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	resp, err := c.sendSync(ctx, cmd, buf)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code: %d %s", resp.StatusCode, resp.Status)
 	}
-	_, err = io.Copy(w, &buf)
+	_, err = io.Copy(w, buf)
 	return err
 }
 
