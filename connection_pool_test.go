@@ -47,8 +47,7 @@ func TestBody(t *testing.T) {
 		// Allow capabilities call during verification
 		mockConn.EXPECT().Capabilities().Return([]string{}, nil).AnyTimes()
 
-		// Allow JoinGroup and BodyDecoded for the actual operation
-		mockConn.EXPECT().JoinGroup("alt.test").Return(nil)
+		// Allow BodyDecoded for the actual operation
 		mockConn.EXPECT().BodyDecoded("<test@example.com>", gomock.Any(), int64(0)).Return(int64(100), nil)
 
 		// Create the pool
@@ -63,7 +62,7 @@ func TestBody(t *testing.T) {
 		defer pool.Quit()
 
 		// Test the Body method
-		bytes, err := pool.Body(context.Background(), "<test@example.com>", io.Discard, []string{"alt.test"})
+		bytes, err := pool.Body(context.Background(), "<test@example.com>", io.Discard)
 		assert.NoError(t, err)
 		assert.Equal(t, int64(100), bytes)
 	})
@@ -105,7 +104,6 @@ func TestBodyReader_ContextCancellation(t *testing.T) {
 		mockConn.EXPECT().Capabilities().Return([]string{}, nil).AnyTimes()
 
 		// Simulate BodyReader failure with generic error
-		mockConn.EXPECT().JoinGroup("alt.test").Return(nil)
 		mockConn.EXPECT().BodyReader("<test@example.com>").Return(nil, io.ErrUnexpectedEOF)
 
 		// Create the pool
@@ -121,7 +119,7 @@ func TestBodyReader_ContextCancellation(t *testing.T) {
 		defer pool.Quit()
 
 		// Test the BodyReader method - should return error, not nil reader
-		reader, err := pool.BodyReader(context.Background(), "<test@example.com>", []string{"alt.test"})
+		reader, err := pool.BodyReader(context.Background(), "<test@example.com>")
 
 		// Should get an error, not a nil reader
 		assert.Error(t, err, "Expected error when BodyReader fails")
@@ -163,7 +161,6 @@ func TestBodyReader_ContextCancellation(t *testing.T) {
 		mockConn.EXPECT().Capabilities().Return([]string{}, nil).AnyTimes()
 
 		// Simulate BodyReader returning nil without error (edge case)
-		mockConn.EXPECT().JoinGroup("alt.test").Return(nil)
 		mockConn.EXPECT().BodyReader("<test@example.com>").Return(nil, context.Canceled)
 
 		// Create the pool
@@ -179,7 +176,7 @@ func TestBodyReader_ContextCancellation(t *testing.T) {
 		defer pool.Quit()
 
 		// Test the BodyReader method with normal context
-		reader, err := pool.BodyReader(context.Background(), "<test@example.com>", []string{"alt.test"})
+		reader, err := pool.BodyReader(context.Background(), "<test@example.com>")
 
 		// Should get an error because reader is nil
 		assert.Error(t, err, context.Canceled)

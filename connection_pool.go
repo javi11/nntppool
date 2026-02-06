@@ -20,30 +20,6 @@ import (
 
 const defaultHealthCheckInterval = 1 * time.Minute
 
-// BodyBatchRequest represents a request in a batch download operation.
-type BodyBatchRequest struct {
-	// MessageID is the article message ID to retrieve.
-	MessageID string
-	// Writer is the destination for the decoded body content.
-	Writer io.Writer
-	// Discard is the number of bytes to discard from the beginning of the body.
-	// Use 0 for full download.
-	Discard int64
-}
-
-// BodyBatchResult represents the result of a batch download request.
-type BodyBatchResult struct {
-	// MessageID is the article message ID that was requested.
-	MessageID string
-	// BytesWritten is the number of bytes written to the writer.
-	BytesWritten int64
-	// Error is any error that occurred during the request.
-	// nil indicates success.
-	Error error
-	// ProviderHost is the host of the provider that served this request.
-	ProviderHost string
-}
-
 type UsenetConnectionPool interface {
 	GetConnection(
 		ctx context.Context,
@@ -56,25 +32,13 @@ type UsenetConnectionPool interface {
 		ctx context.Context,
 		msgID string,
 		w io.Writer,
-		nntpGroups []string,
 	) (int64, error)
 	BodyReader(
 		ctx context.Context,
 		msgID string,
-		nntpGroups []string,
 	) (nntpcli.ArticleBodyReader, error)
 	Post(ctx context.Context, r io.Reader) error
-	Stat(ctx context.Context, msgID string, nntpGroups []string) (int, error)
-	// BodyBatch downloads multiple articles using pipelining if supported by the provider.
-	// The group parameter specifies the newsgroup to join before downloading.
-	// Articles are batched according to the provider's PipelineDepth setting.
-	// Returns results in the same order as requests.
-	// Failed requests are automatically retried with provider rotation.
-	BodyBatch(ctx context.Context, group string, requests []BodyBatchRequest) []BodyBatchResult
-	// TestProviderPipelineSupport tests if a specific provider supports pipelining.
-	// Requires a known valid message ID for testing.
-	// Returns true if pipelining is supported, along with a suggested pipeline depth.
-	TestProviderPipelineSupport(ctx context.Context, providerHost string, testMsgID string) (supported bool, suggestedDepth int, err error)
+	Stat(ctx context.Context, msgID string) (int, error)
 	GetProvidersInfo() []ProviderInfo
 	GetProviderStatus(providerID string) (*ProviderInfo, bool)
 	GetMetrics() *PoolMetrics
@@ -450,7 +414,6 @@ func (p *connectionPool) GetMetricsSnapshot() PoolMetricsSnapshot {
 //   - ctx: The context for the operation.
 //   - msgID: The message ID of the article to retrieve.
 //   - w: The io.Writer to which the message body will be written.
-//   - nntpGroups: The list of groups to join before retrieving the article.
 //
 // Returns:
 //   - int64: The number of bytes written to the io.Writer.
@@ -465,7 +428,6 @@ func (p *connectionPool) Body(
 	ctx context.Context,
 	msgID string,
 	w io.Writer,
-	nntpGroups []string,
 ) (int64, error) {
 	var (
 		totalBytesFromPreviousAttempts int64 // Cumulative bytes written across failed retry attempts
@@ -501,13 +463,6 @@ func (p *connectionPool) Body(
 
 		conn = c
 		nntpConn := conn.Connection()
-
-		if len(nntpGroups) > 0 {
-			err = joinGroup(nntpConn, nntpGroups)
-			if err != nil {
-				return fmt.Errorf("error joining group: %w", err)
-			}
-		}
 
 		n, err := nntpConn.BodyDecoded(msgID, w, totalBytesFromPreviousAttempts)
 		if err != nil {
@@ -625,244 +580,11 @@ func (p *connectionPool) Body(
 	return finalBytesWritten, nil
 }
 
-// BodyBatch downloads multiple articles using pipelining if supported by the provider.
-// The group parameter specifies the newsgroup to join before downloading.
-// Articles are batched according to the provider's PipelineDepth setting.
-// Returns results in the same order as requests.
-// Failed requests are automatically retried with provider rotation.
-//
-// Parameters:
-//   - ctx: The context for the operation.
-//   - group: The newsgroup to join before downloading (required).
-//   - requests: The list of articles to download.
-//
-// Returns:
-//   - []BodyBatchResult: Results in the same order as requests, each containing
-//     bytes written, error (if any), and the provider host that served the request.
-func (p *connectionPool) BodyBatch(
-	ctx context.Context,
-	group string,
-	requests []BodyBatchRequest,
-) []BodyBatchResult {
-	results := make([]BodyBatchResult, len(requests))
-
-	// Handle edge cases
-	if len(requests) == 0 {
-		return results
-	}
-
-	// For single request, use regular Body() method
-	if len(requests) == 1 {
-		n, err := p.Body(ctx, requests[0].MessageID, requests[0].Writer, []string{group})
-		results[0] = BodyBatchResult{
-			MessageID:    requests[0].MessageID,
-			BytesWritten: n,
-			Error:        err,
-		}
-		return results
-	}
-
-	// Track which requests still need to be processed
-	pendingIndices := make([]int, len(requests))
-	for i := range pendingIndices {
-		pendingIndices[i] = i
-	}
-
-	skipProviders := make([]string, 0)
-	maxAttempts := int(p.config.MaxRetries)
-
-	for attempt := 0; attempt < maxAttempts && len(pendingIndices) > 0; attempt++ {
-		// Check context cancellation
-		if ctx.Err() != nil {
-			for _, idx := range pendingIndices {
-				results[idx] = BodyBatchResult{
-					MessageID: requests[idx].MessageID,
-					Error:     ctx.Err(),
-				}
-			}
-			return results
-		}
-
-		// Get connection
-		useBackupProviders := len(skipProviders) > 0
-		conn, err := p.GetConnection(ctx, skipProviders, useBackupProviders)
-		if err != nil {
-			if conn != nil {
-				_ = conn.Close()
-			}
-			// Mark all pending as failed with this error
-			for _, idx := range pendingIndices {
-				results[idx] = BodyBatchResult{
-					MessageID: requests[idx].MessageID,
-					Error:     fmt.Errorf("error getting nntp connection: %w", err),
-				}
-			}
-			return results
-		}
-
-		nntpConn := conn.Connection()
-		provider := conn.Provider()
-		pipelineDepth := provider.PipelineDepth
-
-		// Join the group
-		if err := nntpConn.JoinGroup(group); err != nil {
-			_ = conn.Close()
-			// Mark all pending as failed and try next provider
-			for _, idx := range pendingIndices {
-				results[idx].Error = fmt.Errorf("error joining group: %w", err)
-			}
-			continue
-		}
-
-		// If pipelining is disabled (depth <= 1), fall back to sequential
-		if pipelineDepth <= 1 {
-			// Process sequentially
-			newPending := make([]int, 0)
-			for _, idx := range pendingIndices {
-				req := requests[idx]
-				n, bodyErr := nntpConn.BodyDecoded(req.MessageID, req.Writer, req.Discard)
-				results[idx] = BodyBatchResult{
-					MessageID:    req.MessageID,
-					BytesWritten: n,
-					Error:        bodyErr,
-					ProviderHost: provider.Host,
-				}
-
-				if bodyErr != nil {
-					p.metrics.RecordError(provider.Host)
-					if nntpcli.IsArticleNotFoundError(bodyErr) {
-						// Article not found - will retry with another provider
-						newPending = append(newPending, idx)
-					}
-				} else {
-					p.metrics.RecordDownload(n, provider.Host)
-					p.metrics.RecordArticleDownloaded(provider.Host)
-				}
-			}
-			pendingIndices = newPending
-			if len(newPending) > 0 {
-				skipProviders = append(skipProviders, provider.ID())
-			}
-			_ = conn.Free()
-			continue
-		}
-
-		// Process in batches according to pipeline depth
-		newPending := make([]int, 0)
-
-		for batchStart := 0; batchStart < len(pendingIndices); batchStart += pipelineDepth {
-			batchEnd := batchStart + pipelineDepth
-			if batchEnd > len(pendingIndices) {
-				batchEnd = len(pendingIndices)
-			}
-			batchIndices := pendingIndices[batchStart:batchEnd]
-
-			// Build pipeline requests for this batch
-			pipelineReqs := make([]nntpcli.PipelineRequest, len(batchIndices))
-			for i, idx := range batchIndices {
-				pipelineReqs[i] = nntpcli.PipelineRequest{
-					MessageID: requests[idx].MessageID,
-					Writer:    requests[idx].Writer,
-					Discard:   requests[idx].Discard,
-				}
-			}
-
-			// Execute pipelined batch
-			pipelineResults := nntpConn.BodyPipelined(pipelineReqs)
-
-			// Process results
-			for i, idx := range batchIndices {
-				pr := pipelineResults[i]
-				results[idx] = BodyBatchResult{
-					MessageID:    pr.MessageID,
-					BytesWritten: pr.BytesWritten,
-					Error:        pr.Error,
-					ProviderHost: provider.Host,
-				}
-
-				if pr.Error != nil {
-					p.metrics.RecordError(provider.Host)
-					if nntpcli.IsArticleNotFoundError(pr.Error) {
-						// Article not found - will retry with another provider
-						newPending = append(newPending, idx)
-					}
-				} else {
-					p.metrics.RecordDownload(pr.BytesWritten, provider.Host)
-					p.metrics.RecordArticleDownloaded(provider.Host)
-				}
-			}
-		}
-
-		pendingIndices = newPending
-		if len(newPending) > 0 {
-			skipProviders = append(skipProviders, provider.ID())
-		}
-		_ = conn.Free()
-	}
-
-	// Mark any remaining pending requests as failed
-	for _, idx := range pendingIndices {
-		if results[idx].Error == nil {
-			results[idx] = BodyBatchResult{
-				MessageID: requests[idx].MessageID,
-				Error:     ErrArticleNotFoundInProviders,
-			}
-		}
-	}
-
-	return results
-}
-
-// TestProviderPipelineSupport tests if a specific provider supports pipelining.
-// Requires a known valid message ID for testing.
-//
-// Parameters:
-//   - ctx: The context for the operation.
-//   - providerHost: The host of the provider to test.
-//   - testMsgID: A known valid message ID to use for testing.
-//
-// Returns:
-//   - supported: true if pipelining is working correctly
-//   - suggestedDepth: recommended pipeline depth based on latency (0 if not supported)
-//   - err: any error that occurred during testing
-func (p *connectionPool) TestProviderPipelineSupport(
-	ctx context.Context,
-	providerHost string,
-	testMsgID string,
-) (supported bool, suggestedDepth int, err error) {
-	// Find the provider
-	p.connPoolsMu.RLock()
-	var targetPool *providerPool
-	for _, pool := range p.connPools {
-		if pool.provider.Host == providerHost {
-			targetPool = pool
-			break
-		}
-	}
-	p.connPoolsMu.RUnlock()
-
-	if targetPool == nil {
-		return false, 0, fmt.Errorf("provider %s not found", providerHost)
-	}
-
-	// Acquire a connection from this specific provider
-	resource, err := targetPool.connectionPool.Acquire(ctx)
-	if err != nil {
-		return false, 0, fmt.Errorf("failed to acquire connection from %s: %w", providerHost, err)
-	}
-	defer resource.Release()
-
-	// Get the connection and test pipelining
-	nntpConn := resource.Value().nntp
-	return nntpConn.TestPipelineSupport(testMsgID)
-}
-
 // BodyReader retrieves the body reader of a message with the given message ID from the NNTP server.
 //
 // Parameters:
 //   - ctx: The context for the operation.
 //   - msgID: The message ID of the article to retrieve.
-//   - nntpGroups: The list of groups to join before retrieving the article.
 //
 // Returns:
 //   - io.ReadCloser: A reader for the message body.
@@ -873,7 +595,6 @@ func (p *connectionPool) TestProviderPipelineSupport(
 func (p *connectionPool) BodyReader(
 	ctx context.Context,
 	msgID string,
-	nntpGroups []string,
 ) (nntpcli.ArticleBodyReader, error) {
 	var (
 		conn   PooledConnection
@@ -907,13 +628,6 @@ func (p *connectionPool) BodyReader(
 
 		conn = c
 		nntpConn := conn.Connection()
-
-		if len(nntpGroups) > 0 {
-			err = joinGroup(nntpConn, nntpGroups)
-			if err != nil {
-				return fmt.Errorf("error joining group: %w", err)
-			}
-		}
 
 		reader, err = nntpConn.BodyReader(msgID)
 		if err != nil {
@@ -1159,7 +873,6 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 // Parameters:
 //
 //	msgID - The message ID to check.
-//	nntpGroups - The list of groups to join before checking the message.
 //
 // Returns:
 //
@@ -1168,7 +881,6 @@ func (p *connectionPool) Post(ctx context.Context, r io.Reader) error {
 func (p *connectionPool) Stat(
 	ctx context.Context,
 	msgID string,
-	nntpGroups []string,
 ) (int, error) {
 	var (
 		conn PooledConnection
@@ -1197,13 +909,6 @@ func (p *connectionPool) Stat(
 
 		conn = c
 		nntpConn := conn.Connection()
-
-		if len(nntpGroups) > 0 {
-			err = joinGroup(nntpConn, nntpGroups)
-			if err != nil {
-				return fmt.Errorf("error joining group: %w", err)
-			}
-		}
 
 		res, err = nntpConn.Stat(msgID)
 		if err != nil {

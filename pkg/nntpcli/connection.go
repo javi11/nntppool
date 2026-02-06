@@ -20,18 +20,6 @@ type Connection interface {
 	JoinGroup(name string) error
 	BodyDecoded(msgID string, w io.Writer, discard int64) (int64, error)
 	BodyReader(msgID string) (ArticleBodyReader, error)
-	// BodyPipelined sends multiple BODY commands in a pipeline and returns results in order.
-	// This method sends all BODY commands before reading any responses, which can significantly
-	// improve throughput on high-latency connections.
-	// If requests is empty, returns an empty slice.
-	// If requests has only one element, falls back to sequential BodyDecoded for simplicity.
-	BodyPipelined(requests []PipelineRequest) []PipelineResult
-	// TestPipelineSupport tests if the server supports pipelining by sending multiple
-	// STAT commands for the same message ID and verifying all responses are received correctly.
-	// Returns true if pipelining is supported, along with a suggested pipeline depth based on
-	// measured round-trip latency.
-	// Suggested depth ranges: 2-4 for <50ms latency, 4-6 for 50-100ms, 6-10 for >100ms.
-	TestPipelineSupport(testMsgID string) (supported bool, suggestedDepth int, err error)
 	Post(r io.Reader) (int64, error)
 	Ping() error
 	CurrentJoinedGroup() string
@@ -533,3 +521,4 @@ func (c *connection) setOperationDeadline(timeout time.Duration) error {
 func (c *connection) clearDeadline() error {
 	return c.netconn.SetDeadline(time.Time{})
 }
+
