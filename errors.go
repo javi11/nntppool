@@ -2,72 +2,60 @@ package nntppool
 
 import (
 	"errors"
-	"io"
-	"net"
-	"net/textproto"
-	"syscall"
-
-	"golang.org/x/text/transform"
+	"fmt"
 )
 
-var (
-	ErrCapabilitiesUnpopulated    = errors.New("capabilities unpopulated")
-	ErrNoSuchCapability           = errors.New("no such capability")
-	ErrNilNntpConn                = errors.New("nil nntp connection")
-	ErrNoProviderAvailable        = errors.New("no provider available, because possible max connections reached")
-	ErrArticleNotFoundInProviders = errors.New("the article is not found in any of your providers")
-	ErrFailedToPostInAllProviders = errors.New("failed to post in all providers")
-	ErrConnectionPoolShutdown     = errors.New("connection pool is shutdown")
-)
-
-const (
-	SegmentAlreadyExistsErrCode = 441
-	ToManyConnectionsErrCode    = 502
-	ArticleNotFoundErrCode      = 430
-	CanNotJoinGroup             = 411
-	AuthenticationRequiredCode  = 401
-	AuthenticationFailedCode    = 403
-	InvalidUsernamePasswordCode = 480
-)
-
-var retirableErrors = []int{
-	SegmentAlreadyExistsErrCode,
-	ToManyConnectionsErrCode,
-	CanNotJoinGroup,
-	ArticleNotFoundErrCode,
+// Error represents an NNTP protocol-level error with a status code.
+type Error struct {
+	Code    int
+	Message string
 }
 
-func isRetryableError(err error) bool {
-	if errors.Is(err, ErrNilNntpConn) ||
-		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.ETIMEDOUT) ||
-		errors.Is(err, io.ErrShortWrite) ||
-		errors.Is(err, io.EOF) ||
-		errors.Is(err, net.ErrClosed) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, transform.ErrShortSrc) {
-		return true
-	}
+func (e *Error) Error() string {
+	return fmt.Sprintf("nntp: %d %s", e.Code, e.Message)
+}
 
-	var netErr net.Error
-	if ok := errors.As(err, &netErr); ok {
-		return true
+// Is matches by semantic category so that, for example, both 430 ("no such article")
+// and 423 ("no article with that number") match ErrArticleNotFound.
+func (e *Error) Is(target error) bool {
+	var t *Error
+	if !errors.As(target, &t) {
+		return false
 	}
+	return errorCategory(e.Code) == errorCategory(t.Code)
+}
 
-	var protocolErr textproto.ProtocolError
-	if ok := errors.As(err, &protocolErr); ok {
-		return true
+func errorCategory(code int) int {
+	switch code {
+	case 423, 430:
+		return 430 // article not found
+	default:
+		return code
 	}
+}
 
-	var nntpErr *textproto.Error
-	if ok := errors.As(err, &nntpErr); ok {
-		for _, r := range retirableErrors {
-			if nntpErr.Code == r {
-				return true
-			}
-		}
+var (
+	ErrArticleNotFound    = &Error{Code: 430, Message: "no such article"}
+	ErrAuthRequired       = &Error{Code: 480, Message: "authentication required"}
+	ErrAuthRejected       = &Error{Code: 481, Message: "authentication rejected"}
+	ErrServiceUnavailable = &Error{Code: 502, Message: "service unavailable"}
+	ErrCRCMismatch        = errors.New("nntp: yEnc CRC mismatch")
+)
+
+// toError maps an NNTP status code to a sentinel error, or returns nil for success codes.
+func toError(code int, status string) error {
+	switch {
+	case code >= 200 && code < 400:
+		return nil
+	case code == 423 || code == 430:
+		return ErrArticleNotFound
+	case code == 480:
+		return ErrAuthRequired
+	case code == 481:
+		return ErrAuthRejected
+	case code == 502:
+		return ErrServiceUnavailable
+	default:
+		return &Error{Code: code, Message: status}
 	}
-
-	return false
 }
