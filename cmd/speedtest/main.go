@@ -126,7 +126,7 @@ func (pf *providerFlag) Set(val string) error {
 	}
 
 	if p.Host == "" {
-		return fmt.Errorf("provider must include host=...")
+		return fmt.Errorf("provider must include host")
 	}
 
 	*pf = append(*pf, p)
@@ -234,7 +234,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error creating client: %v\n", err)
 		os.Exit(1)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	fmt.Println("Ready (connections on demand).")
 	fmt.Println()
 
@@ -343,7 +343,7 @@ func loadNZB(source string) ([]nzb.Segment, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 200 {
 			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
@@ -353,7 +353,7 @@ func loadNZB(source string) ([]nzb.Segment, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		r = f
 	}
 

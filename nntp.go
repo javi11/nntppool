@@ -134,7 +134,7 @@ func newNetConn(ctx context.Context, addr string, tlsConfig *tls.Config, keepAli
 		}
 		tlsConn := tls.Client(conn, tlsConfig)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, err
 		}
 		return tlsConn, nil
@@ -212,7 +212,7 @@ func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, 
 
 func (c *NNTPConnection) auth(auth Auth) error {
 	// AUTHINFO USER
-	if _, err := c.conn.Write([]byte(fmt.Sprintf("AUTHINFO USER %s\r\n", auth.Username))); err != nil {
+	if _, err := fmt.Fprintf(c.conn, "AUTHINFO USER %s\r\n", auth.Username); err != nil {
 		return fmt.Errorf("authinfo user: %w", err)
 	}
 	resp, err := c.readOneResponse(io.Discard)
@@ -230,7 +230,7 @@ func (c *NNTPConnection) auth(auth Auth) error {
 	}
 
 	// AUTHINFO PASS
-	if _, err := c.conn.Write([]byte(fmt.Sprintf("AUTHINFO PASS %s\r\n", auth.Password))); err != nil {
+	if _, err := fmt.Fprintf(c.conn, "AUTHINFO PASS %s\r\n", auth.Password); err != nil {
 		return fmt.Errorf("authinfo pass: %w", err)
 	}
 	resp, err = c.readOneResponse(io.Discard)
