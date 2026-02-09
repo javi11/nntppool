@@ -15,6 +15,7 @@ import (
 )
 
 var ErrMaxConnections = errors.New("nntp: server max connections reached")
+var ErrConnectionDied = errors.New("nntp: connection died")
 
 const (
 	// inflightDrainTimeout is the maximum time to wait for in-flight
@@ -253,6 +254,15 @@ func safeClose[T any](ch chan T) {
 	close(ch)
 }
 
+func failRequest(ch chan Response, err error) {
+	defer func() { _ = recover() }()
+	select {
+	case ch <- Response{Err: err}:
+	default:
+	}
+	close(ch)
+}
+
 func (c *NNTPConnection) failOutstanding() {
 	c.failMu.Do(func() {
 		for {
@@ -261,7 +271,7 @@ func (c *NNTPConnection) failOutstanding() {
 				if req == nil {
 					continue
 				}
-				safeClose(req.RespCh)
+				failRequest(req.RespCh, ErrConnectionDied)
 				// Best-effort inflight release (not strictly needed once we're shutting down).
 				select {
 				case <-c.inflightSem:
@@ -442,7 +452,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, factory ConnFactory
 		// Check if the request is already cancelled.
 		select {
 		case <-firstReq.Ctx.Done():
-			safeClose(firstReq.RespCh)
+			failRequest(firstReq.RespCh, firstReq.Ctx.Err())
 			continue
 		default:
 		}
@@ -450,7 +460,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, factory ConnFactory
 		// GATE: block if we're at the throttled capacity limit.
 		if !gate.enter(ctx, firstReq.Ctx) {
 			// Slot or request context cancelled while waiting at the gate.
-			safeClose(firstReq.RespCh)
+			failRequest(firstReq.RespCh, context.Canceled)
 			continue
 		}
 
@@ -458,7 +468,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, factory ConnFactory
 		conn, err := factory(ctx)
 		if err != nil {
 			gate.exit()
-			safeClose(firstReq.RespCh)
+			failRequest(firstReq.RespCh, err)
 			// Backoff before retrying to avoid thrashing.
 			select {
 			case <-time.After(connFailureBackoff):
@@ -471,7 +481,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, factory ConnFactory
 		nc, err := newNNTPConnectionFromConn(ctx, conn, inflight, reqCh, auth, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
-			safeClose(firstReq.RespCh)
+			failRequest(firstReq.RespCh, err)
 
 			if errors.Is(err, ErrMaxConnections) {
 				// Server said "max connections" — throttle and use longer backoff.
@@ -569,7 +579,7 @@ func (c *NNTPConnection) Run() {
 		// Check cancellation.
 		select {
 		case <-req.Ctx.Done():
-			close(req.RespCh)
+			failRequest(req.RespCh, req.Ctx.Err())
 			// Connection is still good — fall through to main loop.
 			goto mainLoop
 		default:
@@ -579,7 +589,7 @@ func (c *NNTPConnection) Run() {
 		select {
 		case c.inflightSem <- struct{}{}:
 		case <-c.ctx.Done():
-			safeClose(req.RespCh)
+			failRequest(req.RespCh, c.ctx.Err())
 			return
 		}
 
@@ -590,7 +600,7 @@ func (c *NNTPConnection) Run() {
 
 		if _, err := bw.Write(req.Payload); err != nil {
 			<-c.inflightSem
-			safeClose(req.RespCh)
+			failRequest(req.RespCh, err)
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
@@ -680,7 +690,7 @@ mainLoop:
 		select {
 		case <-req.Ctx.Done():
 			<-c.inflightSem
-			close(req.RespCh)
+			failRequest(req.RespCh, req.Ctx.Err())
 			continue
 		default:
 		}
@@ -695,7 +705,7 @@ mainLoop:
 		// pipeline write (buffered; flushed at top of loop before blocking)
 		if _, err := bw.Write(req.Payload); err != nil {
 			<-c.inflightSem
-			safeClose(req.RespCh)
+			failRequest(req.RespCh, err)
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
@@ -1085,6 +1095,7 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 
 	var lastResp Response
 	hasResp := false
+	var lastErr error
 
 	// 1. Try all main providers in round-robin order.
 	mains := *c.mainGroups.Load()
@@ -1095,22 +1106,29 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 		idx := (start + attempt) % n
 		resp, ok, cancelled := tryGroup(mains[idx])
 		if cancelled {
+			err := ctx.Err()
+			if err == nil {
+				err = c.ctx.Err()
+			}
+			respCh <- Response{Err: err}
 			return
 		}
 		if !ok {
 			// Connection died — try next provider.
 			continue
 		}
-		if resp.StatusCode != 430 {
-			select {
-			case respCh <- resp:
-			default:
-			}
-			return
+		if resp.Err != nil {
+			lastErr = resp.Err
+			continue
 		}
-		// 430 — remember it and try next.
-		lastResp = resp
-		hasResp = true
+		if resp.StatusCode == 430 {
+			lastResp = resp
+			hasResp = true
+			continue
+		}
+		// Success.
+		respCh <- resp
+		return
 	}
 
 	// 2. All main providers returned 430 (or died) — try backup providers in order.
@@ -1118,25 +1136,32 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	for i := range backups {
 		resp, ok, cancelled := tryGroup(backups[i])
 		if cancelled {
+			err := ctx.Err()
+			if err == nil {
+				err = c.ctx.Err()
+			}
+			respCh <- Response{Err: err}
 			return
 		}
 		if !ok {
 			continue
 		}
-		// Deliver whatever backup returns (including 430).
-		select {
-		case respCh <- resp:
-		default:
+		if resp.Err != nil {
+			lastErr = resp.Err
+			continue
 		}
+		// Deliver whatever backup returns (including 430).
+		respCh <- resp
 		return
 	}
 
-	// 3. All providers exhausted — deliver the last 430 if we got one.
+	// 3. All providers exhausted — deliver the last 430, the last error, or a fallback.
 	if hasResp {
-		select {
-		case respCh <- lastResp:
-		default:
-		}
+		respCh <- lastResp
+	} else if lastErr != nil {
+		respCh <- Response{Err: lastErr}
+	} else {
+		respCh <- Response{Err: errors.New("nntp: all providers exhausted")}
 	}
 }
 

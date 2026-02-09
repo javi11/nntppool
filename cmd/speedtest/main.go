@@ -289,11 +289,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		for _, ch := range respChans {
-			resp, ok := <-ch
-			if !ok {
-				segsDone.Add(1)
-				continue
-			}
+			resp := <-ch
 			if resp.Err == nil && resp.StatusCode != 430 && resp.StatusCode != 423 {
 				bytesDecoded.Add(int64(resp.Meta.BytesDecoded))
 			}

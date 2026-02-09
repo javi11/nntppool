@@ -110,10 +110,7 @@ func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, erro
 	payload := []byte("HEAD <" + messageID + ">\r\n")
 	respCh := c.Send(ctx, payload, nil)
 
-	resp, ok := <-respCh
-	if !ok {
-		return nil, fmt.Errorf("nntp: connection closed")
-	}
+	resp := <-respCh
 	if resp.Err != nil {
 		return nil, resp.Err
 	}
@@ -132,10 +129,7 @@ func (c *Client) Stat(ctx context.Context, messageID string) (*StatResult, error
 	payload := []byte("STAT <" + messageID + ">\r\n")
 	respCh := c.Send(ctx, payload, nil)
 
-	resp, ok := <-respCh
-	if !ok {
-		return nil, fmt.Errorf("nntp: connection closed")
-	}
+	resp := <-respCh
 	if resp.Err != nil {
 		return nil, resp.Err
 	}
@@ -168,10 +162,7 @@ func (c *Client) doBody(ctx context.Context, messageID string, w io.Writer, onMe
 		respCh = c.Send(ctx, payload, w)
 	}
 
-	resp, ok := <-respCh
-	if !ok {
-		return nil, fmt.Errorf("nntp: connection closed")
-	}
+	resp := <-respCh
 	if resp.Err != nil {
 		return nil, resp.Err
 	}

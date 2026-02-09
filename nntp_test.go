@@ -888,6 +888,137 @@ func TestAddThenSend(t *testing.T) {
 	}
 }
 
+// --- Error propagation ---
+
+func TestSend_FactoryErrorPropagates(t *testing.T) {
+	dialErr := fmt.Errorf("dial tcp: connection refused")
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return nil, dialErr
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.Err == nil {
+		t.Fatal("expected error from Send when factory fails")
+	}
+	if resp.Err.Error() != dialErr.Error() {
+		t.Errorf("got error %q, want %q", resp.Err, dialErr)
+	}
+}
+
+func TestSend_ContextCancellationPropagates(t *testing.T) {
+	// Factory that blocks until context is cancelled.
+	factory := func(ctx context.Context) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	respCh := c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+
+	// Cancel the request context.
+	cancel()
+
+	select {
+	case resp := <-respCh:
+		if resp.Err == nil {
+			t.Fatal("expected error from Send on context cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for response after cancellation")
+	}
+}
+
+func TestSend_All430Propagates(t *testing.T) {
+	makeFactory := func(statusCode int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if len(cmd) >= 4 && cmd[:4] == "DATE" {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = fmt.Fprintf(server, "%d no such article\r\n", statusCode)
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(430), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("expected no Err for 430 response, got %v", resp.Err)
+	}
+	if resp.StatusCode != 430 {
+		t.Errorf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+}
+
+func TestFailRequest(t *testing.T) {
+	testErr := fmt.Errorf("test error")
+	ch := make(chan Response, 1)
+	failRequest(ch, testErr)
+
+	resp, ok := <-ch
+	if !ok {
+		t.Fatal("expected to receive response before channel closed")
+	}
+	if resp.Err != testErr {
+		t.Errorf("got error %v, want %v", resp.Err, testErr)
+	}
+
+	// Channel should now be closed.
+	_, ok = <-ch
+	if ok {
+		t.Error("channel should be closed after failRequest")
+	}
+}
+
+func TestFailRequest_DoubleClose(t *testing.T) {
+	ch := make(chan Response, 1)
+	failRequest(ch, fmt.Errorf("err1"))
+	// Second call should not panic (safeClose recovers).
+	failRequest(ch, fmt.Errorf("err2"))
+}
+
 // --- resolveProviderName ---
 
 func TestResolveProviderName(t *testing.T) {
