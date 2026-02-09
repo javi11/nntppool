@@ -830,23 +830,147 @@ type Provider struct {
 }
 
 type providerGroup struct {
-	name  string
-	reqCh chan *Request
-	gate  *connGate
-	stats providerStats
+	name   string
+	reqCh  chan *Request
+	gate   *connGate
+	stats  providerStats
+	cancel context.CancelFunc // cancels this group's slot goroutines
 }
 
 type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mainGroups   []*providerGroup
-	backupGroups []*providerGroup
+	mainGroups   atomic.Pointer[[]*providerGroup]
+	backupGroups atomic.Pointer[[]*providerGroup]
 	nextIdx      atomic.Uint64 // round-robin for mainGroups only
 
-	startTime time.Time
+	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
-	wg sync.WaitGroup
+	startTime time.Time
+	wg        sync.WaitGroup
+}
+
+// parseDateResponse parses an NNTP DATE response message.
+// message is the full status line, e.g. "111 20240315120000".
+func parseDateResponse(message string) (time.Time, error) {
+	// Skip "111 " prefix if present.
+	ts := message
+	if len(ts) > 4 && ts[3] == ' ' {
+		ts = ts[4:]
+	}
+	if len(ts) < 14 {
+		return time.Time{}, fmt.Errorf("nntp: DATE response too short: %q", message)
+	}
+	return time.Parse("20060102150405", ts[:14])
+}
+
+// pingProvider dials a temporary connection, authenticates, sends DATE, and
+// measures RTT. The connection is always closed before returning.
+func pingProvider(ctx context.Context, factory ConnFactory, auth Auth) PingResult {
+	conn, err := factory(ctx)
+	if err != nil {
+		return PingResult{Err: fmt.Errorf("ping dial: %w", err)}
+	}
+	if conn == nil {
+		return PingResult{Err: fmt.Errorf("ping dial: factory returned nil connection")}
+	}
+	defer func() { _ = conn.Close() }()
+
+	rb := readBuffer{buf: make([]byte, defaultReadBufSize)}
+	nc := &NNTPConnection{
+		conn: conn,
+		rb:   rb,
+	}
+
+	// Read greeting.
+	greeting, err := nc.readOneResponse(io.Discard)
+	if err != nil {
+		return PingResult{Err: fmt.Errorf("ping greeting: %w", err)}
+	}
+	if greeting.StatusCode != 200 && greeting.StatusCode != 201 {
+		return PingResult{Err: &greetingError{StatusCode: greeting.StatusCode, Message: greeting.Message}}
+	}
+
+	// Auth if needed.
+	if auth.Username != "" {
+		if err := nc.auth(auth); err != nil {
+			return PingResult{Err: fmt.Errorf("ping auth: %w", err)}
+		}
+	}
+
+	// Send DATE and measure RTT.
+	start := time.Now()
+	if _, err := conn.Write([]byte("DATE\r\n")); err != nil {
+		return PingResult{Err: fmt.Errorf("ping write DATE: %w", err)}
+	}
+	resp, err := nc.readOneResponse(io.Discard)
+	rtt := time.Since(start)
+	if err != nil {
+		return PingResult{Err: fmt.Errorf("ping read DATE: %w", err)}
+	}
+	if resp.StatusCode != 111 {
+		return PingResult{Err: fmt.Errorf("ping DATE unexpected status: %d %s", resp.StatusCode, resp.Message)}
+	}
+
+	serverTime, err := parseDateResponse(resp.Message)
+	if err != nil {
+		return PingResult{RTT: rtt, Err: err}
+	}
+	return PingResult{RTT: rtt, ServerTime: serverTime}
+}
+
+// resolveProviderName builds a unique name for a provider based on host and auth.
+func resolveProviderName(p Provider, index int) string {
+	if p.Host != "" {
+		if p.Auth.Username != "" {
+			return p.Host + "+" + p.Auth.Username
+		}
+		return p.Host
+	}
+	return fmt.Sprintf("provider-%d", index)
+}
+
+// startProviderGroup creates a providerGroup, pings the provider, and launches
+// connection slot goroutines. The caller is responsible for storing the group.
+func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
+	inflight := p.Inflight
+	if inflight <= 0 {
+		inflight = 1
+	}
+
+	factory := p.Factory
+	if factory == nil {
+		host := p.Host
+		tlsCfg := p.TLSConfig
+		keepAlive := p.KeepAlive
+		factory = func(ctx context.Context) (net.Conn, error) {
+			return newNetConn(ctx, host, tlsCfg, keepAlive)
+		}
+	}
+
+	name := resolveProviderName(p, index)
+	gate := newConnGate(p.Connections, p.ThrottleRestore)
+	gctx, gcancel := context.WithCancel(c.ctx)
+
+	g := &providerGroup{
+		name:   name,
+		reqCh:  make(chan *Request, p.Connections),
+		gate:   gate,
+		cancel: gcancel,
+	}
+
+	// Ping with a short timeout so we don't block forever.
+	pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
+	g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
+	pingCancel()
+
+	for range p.Connections {
+		c.wg.Add(1)
+		go runConnSlot(gctx, g.reqCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, &c.wg)
+	}
+
+	return g
 }
 
 func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
@@ -886,48 +1010,21 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 		cancel:    cancel,
 		startTime: time.Now(),
 	}
+	// Initialize empty slices.
+	c.mainGroups.Store(&[]*providerGroup{})
+	c.backupGroups.Store(&[]*providerGroup{})
 
+	var mainGs, backupGs []*providerGroup
 	for pi, p := range providers {
-		inflight := p.Inflight
-		if inflight <= 0 {
-			inflight = 1
-		}
-
-		factory := p.Factory
-		if factory == nil {
-			host := p.Host
-			tlsCfg := p.TLSConfig
-			keepAlive := p.KeepAlive
-			factory = func(ctx context.Context) (net.Conn, error) {
-				return newNetConn(ctx, host, tlsCfg, keepAlive)
-			}
-		}
-
-		name := p.Host
-		if name == "" {
-			name = fmt.Sprintf("provider-%d", pi)
-		}
-
-		gate := newConnGate(p.Connections, p.ThrottleRestore)
-
-		g := &providerGroup{
-			name:  name,
-			reqCh: make(chan *Request, p.Connections),
-			gate:  gate,
-		}
-
-		// Launch connection slot goroutines — each manages its own lifecycle.
-		for range p.Connections {
-			c.wg.Add(1)
-			go runConnSlot(c.ctx, g.reqCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, &c.wg)
-		}
-
+		g := c.startProviderGroup(p, pi)
 		if p.Backup {
-			c.backupGroups = append(c.backupGroups, g)
+			backupGs = append(backupGs, g)
 		} else {
-			c.mainGroups = append(c.mainGroups, g)
+			mainGs = append(mainGs, g)
 		}
 	}
+	c.mainGroups.Store(&mainGs)
+	c.backupGroups.Store(&backupGs)
 
 	return c, nil
 }
@@ -936,13 +1033,11 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 // connection slots to stop. Slots manage their own TCP connection cleanup.
 func (c *Client) Close() error {
 	c.cancel()
-	for _, g := range c.mainGroups {
-		g.gate.stop()
-		close(g.reqCh)
-	}
-	for _, g := range c.backupGroups {
-		g.gate.stop()
-		close(g.reqCh)
+	for _, gs := range []*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
+		for _, g := range *gs {
+			g.gate.stop()
+			close(g.reqCh)
+		}
 	}
 	c.wg.Wait()
 	return nil
@@ -992,12 +1087,13 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	hasResp := false
 
 	// 1. Try all main providers in round-robin order.
-	n := len(c.mainGroups)
+	mains := *c.mainGroups.Load()
+	n := len(mains)
 	start := int(c.nextIdx.Add(1) % uint64(n))
 
 	for attempt := range n {
 		idx := (start + attempt) % n
-		resp, ok, cancelled := tryGroup(c.mainGroups[idx])
+		resp, ok, cancelled := tryGroup(mains[idx])
 		if cancelled {
 			return
 		}
@@ -1018,8 +1114,9 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	}
 
 	// 2. All main providers returned 430 (or died) — try backup providers in order.
-	for i := range c.backupGroups {
-		resp, ok, cancelled := tryGroup(c.backupGroups[i])
+	backups := *c.backupGroups.Load()
+	for i := range backups {
+		resp, ok, cancelled := tryGroup(backups[i])
 		if cancelled {
 			return
 		}
@@ -1045,7 +1142,7 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 
 // NumProviders returns the number of configured providers (main + backup).
 func (c *Client) NumProviders() int {
-	return len(c.mainGroups) + len(c.backupGroups)
+	return len(*c.mainGroups.Load()) + len(*c.backupGroups.Load())
 }
 
 // Stats returns a snapshot of per-provider and aggregate metrics.
@@ -1055,8 +1152,8 @@ func (c *Client) Stats() ClientStats {
 	var cs ClientStats
 	cs.Elapsed = elapsed
 	var totalBytes int64
-	for _, groups := range [][]*providerGroup{c.mainGroups, c.backupGroups} {
-		for _, g := range groups {
+	for _, groups := range [...]*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
+		for _, g := range *groups {
 			consumed := g.stats.BytesConsumed.Load()
 			totalBytes += consumed
 			maxSlots, running := g.gate.snapshot()
@@ -1066,6 +1163,7 @@ func (c *Client) Stats() ClientStats {
 				Errors:            g.stats.Errors.Load(),
 				ActiveConnections: running,
 				MaxConnections:    maxSlots,
+				Ping:              g.stats.Ping,
 			}
 			if secs > 0 {
 				ps.AvgSpeed = float64(consumed) / secs
@@ -1077,4 +1175,75 @@ func (c *Client) Stats() ClientStats {
 		cs.AvgSpeed = float64(totalBytes) / secs
 	}
 	return cs
+}
+
+// AddProvider validates, pings, and registers a new provider at runtime.
+// Ping failures are recorded in the group's stats but do not cause an error return.
+func (c *Client) AddProvider(p Provider) error {
+	if p.Connections <= 0 {
+		return fmt.Errorf("nntp: provider connections must be > 0")
+	}
+	if p.Factory == nil && p.Host == "" {
+		return fmt.Errorf("nntp: provider must have Host or Factory")
+	}
+
+	idx := int(c.providerIdx.Add(1))
+	name := resolveProviderName(p, idx)
+
+	// Check for duplicate name.
+	for _, gs := range [...]*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
+		for _, g := range *gs {
+			if g.name == name {
+				return fmt.Errorf("nntp: provider %q already exists", name)
+			}
+		}
+	}
+
+	g := c.startProviderGroup(p, idx)
+
+	// Copy-on-write append.
+	if p.Backup {
+		old := c.backupGroups.Load()
+		updated := make([]*providerGroup, len(*old)+1)
+		copy(updated, *old)
+		updated[len(*old)] = g
+		c.backupGroups.Store(&updated)
+	} else {
+		old := c.mainGroups.Load()
+		updated := make([]*providerGroup, len(*old)+1)
+		copy(updated, *old)
+		updated[len(*old)] = g
+		c.mainGroups.Store(&updated)
+	}
+	return nil
+}
+
+// RemoveProvider stops and removes a provider by name.
+// Goroutines wind down asynchronously; Client.Close still waits for all via c.wg.
+func (c *Client) RemoveProvider(name string) error {
+	for _, pair := range [...]struct {
+		ptr *atomic.Pointer[[]*providerGroup]
+	}{
+		{&c.mainGroups},
+		{&c.backupGroups},
+	} {
+		old := pair.ptr.Load()
+		for i, g := range *old {
+			if g.name != name {
+				continue
+			}
+			// Found it — cancel, stop gate, close channel.
+			g.cancel()
+			g.gate.stop()
+			close(g.reqCh)
+
+			// Copy-on-write removal.
+			updated := make([]*providerGroup, 0, len(*old)-1)
+			updated = append(updated, (*old)[:i]...)
+			updated = append(updated, (*old)[i+1:]...)
+			pair.ptr.Store(&updated)
+			return nil
+		}
+	}
+	return fmt.Errorf("nntp: provider %q not found", name)
 }

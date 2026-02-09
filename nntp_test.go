@@ -2,6 +2,7 @@ package nntppool
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -437,4 +438,475 @@ func TestNewClient_DefaultInflight(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 	// The defaulting happens inside NewClient; we verify it didn't error.
+}
+
+// --- parseDateResponse ---
+
+func TestParseDateResponse(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		wantY   int
+		wantM   time.Month
+		wantD   int
+	}{
+		{"full status line", "111 20240315120000", false, 2024, time.March, 15},
+		{"timestamp only", "20240315120000", false, 2024, time.March, 15},
+		{"too short", "111 2024", true, 0, 0, 0},
+		{"empty", "", true, 0, 0, 0},
+		{"bad format", "111 not-a-date!!", true, 0, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseDateResponse(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseDateResponse(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				if got.Year() != tt.wantY || got.Month() != tt.wantM || got.Day() != tt.wantD {
+					t.Errorf("parseDateResponse(%q) = %v, want %d-%v-%d", tt.input, got, tt.wantY, tt.wantM, tt.wantD)
+				}
+			}
+		})
+	}
+}
+
+// --- pingProvider ---
+
+func TestPingProvider_Success(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return mockServer(t, func(s net.Conn) {
+			_, _ = s.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 1024)
+			_, _ = s.Read(buf) // DATE command
+			_, _ = s.Write([]byte("111 20240315120000\r\n"))
+		}), nil
+	}
+
+	result := pingProvider(context.Background(), factory, Auth{})
+	if result.Err != nil {
+		t.Fatalf("pingProvider() error = %v", result.Err)
+	}
+	if result.RTT <= 0 {
+		t.Errorf("RTT = %v, want > 0", result.RTT)
+	}
+	if result.ServerTime.IsZero() {
+		t.Error("ServerTime should not be zero")
+	}
+	if result.ServerTime.Year() != 2024 || result.ServerTime.Month() != time.March {
+		t.Errorf("ServerTime = %v, want 2024-03-15", result.ServerTime)
+	}
+}
+
+func TestPingProvider_WithAuth(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return mockServer(t, func(s net.Conn) {
+			_, _ = s.Write([]byte("200 server ready\r\n"))
+
+			buf := make([]byte, 1024)
+			_, _ = s.Read(buf) // AUTHINFO USER
+			_, _ = s.Write([]byte("381 password required\r\n"))
+			_, _ = s.Read(buf) // AUTHINFO PASS
+			_, _ = s.Write([]byte("281 authentication accepted\r\n"))
+
+			_, _ = s.Read(buf) // DATE
+			_, _ = s.Write([]byte("111 20240315120000\r\n"))
+		}), nil
+	}
+
+	result := pingProvider(context.Background(), factory, Auth{Username: "user", Password: "pass"})
+	if result.Err != nil {
+		t.Fatalf("pingProvider() error = %v", result.Err)
+	}
+	if result.RTT <= 0 {
+		t.Errorf("RTT = %v, want > 0", result.RTT)
+	}
+}
+
+func TestPingProvider_DialError(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	result := pingProvider(context.Background(), factory, Auth{})
+	if result.Err == nil {
+		t.Fatal("expected error for dial failure")
+	}
+}
+
+func TestPingProvider_BadGreeting(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return mockServer(t, func(s net.Conn) {
+			_, _ = s.Write([]byte("502 service unavailable\r\n"))
+		}), nil
+	}
+
+	result := pingProvider(context.Background(), factory, Auth{})
+	if result.Err == nil {
+		t.Fatal("expected error for bad greeting")
+	}
+}
+
+// --- AddProvider / RemoveProvider ---
+
+func TestAddProvider(t *testing.T) {
+	makeFactory := func(statusCode int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if len(cmd) >= 4 && cmd[:4] == "DATE" {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = fmt.Fprintf(server, "%d response\r\n", statusCode)
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(223), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.NumProviders() != 1 {
+		t.Fatalf("NumProviders() = %d, want 1", c.NumProviders())
+	}
+
+	// Add a second provider.
+	err = c.AddProvider(Provider{Factory: makeFactory(223), Connections: 1})
+	if err != nil {
+		t.Fatalf("AddProvider() error = %v", err)
+	}
+
+	if c.NumProviders() != 2 {
+		t.Errorf("NumProviders() = %d, want 2", c.NumProviders())
+	}
+
+	// Verify it shows up in Stats with ping data.
+	stats := c.Stats()
+	if len(stats.Providers) != 2 {
+		t.Fatalf("Stats().Providers = %d, want 2", len(stats.Providers))
+	}
+}
+
+func TestAddProvider_Backup(t *testing.T) {
+	makeFactory := func() ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if len(cmd) >= 4 && cmd[:4] == "DATE" {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = server.Write([]byte("223 exists\r\n"))
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	err = c.AddProvider(Provider{Factory: makeFactory(), Connections: 1, Backup: true})
+	if err != nil {
+		t.Fatalf("AddProvider(backup) error = %v", err)
+	}
+
+	if c.NumProviders() != 2 {
+		t.Errorf("NumProviders() = %d, want 2", c.NumProviders())
+	}
+}
+
+func TestAddProvider_Validation(t *testing.T) {
+	dummyFactory := func(ctx context.Context) (net.Conn, error) {
+		return nil, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: dummyFactory, Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Zero connections
+	if err := c.AddProvider(Provider{Host: "host:119", Connections: 0}); err == nil {
+		t.Error("expected error for zero connections")
+	}
+
+	// Missing host and factory
+	if err := c.AddProvider(Provider{Connections: 1}); err == nil {
+		t.Error("expected error for missing host and factory")
+	}
+}
+
+func TestAddProvider_DuplicateName(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "host:119", Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Same host should be rejected as duplicate.
+	if err := c.AddProvider(Provider{Host: "host:119", Connections: 1}); err == nil {
+		t.Error("expected error for duplicate provider name")
+	}
+}
+
+func TestRemoveProvider(t *testing.T) {
+	makeFactory := func() ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if len(cmd) >= 4 && cmd[:4] == "DATE" {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = server.Write([]byte("223 exists\r\n"))
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "main1:119", Factory: makeFactory(), Connections: 1},
+		{Host: "main2:119", Factory: makeFactory(), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.NumProviders() != 2 {
+		t.Fatalf("NumProviders() = %d, want 2", c.NumProviders())
+	}
+
+	err = c.RemoveProvider("main2:119")
+	if err != nil {
+		t.Fatalf("RemoveProvider() error = %v", err)
+	}
+
+	if c.NumProviders() != 1 {
+		t.Errorf("NumProviders() = %d, want 1", c.NumProviders())
+	}
+
+	// Verify it's gone from Stats.
+	stats := c.Stats()
+	for _, ps := range stats.Providers {
+		if ps.Name == "main2:119" {
+			t.Error("removed provider still in Stats")
+		}
+	}
+}
+
+func TestRemoveProvider_NotFound(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "host:119", Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	err = c.RemoveProvider("nonexistent:119")
+	if err == nil {
+		t.Error("expected error for not-found provider")
+	}
+}
+
+// --- NewClient ping integration ---
+
+func TestNewClient_PingResults(t *testing.T) {
+	makeFactory := func() ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if len(cmd) >= 4 && cmd[:4] == "DATE" {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = server.Write([]byte("223 exists\r\n"))
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(), Connections: 1},
+		{Factory: makeFactory(), Connections: 1, Backup: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	stats := c.Stats()
+	if len(stats.Providers) != 2 {
+		t.Fatalf("Providers = %d, want 2", len(stats.Providers))
+	}
+	for i, ps := range stats.Providers {
+		if ps.Ping.Err != nil {
+			t.Errorf("provider %d ping error = %v", i, ps.Ping.Err)
+		}
+		if ps.Ping.RTT <= 0 {
+			t.Errorf("provider %d RTT = %v, want > 0", i, ps.Ping.RTT)
+		}
+		if ps.Ping.ServerTime.IsZero() {
+			t.Errorf("provider %d ServerTime is zero", i)
+		}
+	}
+}
+
+func TestNewClient_PingFailureDoesNotBlock(t *testing.T) {
+	// Provider that fails to connect — ping should fail but client should still work.
+	failFactory := func(ctx context.Context) (net.Conn, error) {
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: failFactory, Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	stats := c.Stats()
+	if len(stats.Providers) != 1 {
+		t.Fatalf("Providers = %d, want 1", len(stats.Providers))
+	}
+	if stats.Providers[0].Ping.Err == nil {
+		t.Error("expected ping error for failing factory")
+	}
+}
+
+// --- AddProvider then Send integration ---
+
+func TestAddThenSend(t *testing.T) {
+	makeFactory := func(statusCode int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if len(cmd) >= 4 && cmd[:4] == "DATE" {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = fmt.Fprintf(server, "%d response\r\n", statusCode)
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	// Start with one main provider that returns 430.
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(430), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Request should return 430 (only provider).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	cancel()
+	if resp.StatusCode != 430 {
+		t.Fatalf("StatusCode = %d, want 430 before adding backup", resp.StatusCode)
+	}
+
+	// Add a backup provider that returns 223.
+	err = c.AddProvider(Provider{Factory: makeFactory(223), Connections: 1, Backup: true})
+	if err != nil {
+		t.Fatalf("AddProvider() error = %v", err)
+	}
+
+	// Now request should fallback to backup and return 223.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	resp = <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	cancel()
+	if resp.StatusCode != 223 {
+		t.Errorf("StatusCode = %d, want 223 after adding backup", resp.StatusCode)
+	}
+}
+
+// --- resolveProviderName ---
+
+func TestResolveProviderName(t *testing.T) {
+	tests := []struct {
+		name  string
+		p     Provider
+		index int
+		want  string
+	}{
+		{"host only", Provider{Host: "news.example.com:563"}, 0, "news.example.com:563"},
+		{"host with auth", Provider{Host: "news.example.com:563", Auth: Auth{Username: "myuser"}}, 0, "news.example.com:563+myuser"},
+		{"factory only", Provider{Factory: func(ctx context.Context) (net.Conn, error) { return nil, nil }}, 3, "provider-3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveProviderName(tt.p, tt.index)
+			if got != tt.want {
+				t.Errorf("resolveProviderName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
