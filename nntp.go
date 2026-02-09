@@ -1137,6 +1137,7 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 			continue
 		}
 		if resp.StatusCode == 430 {
+			c.nextIdx.Add(1) // bias next request away from this provider
 			lastResp = resp
 			hasResp = true
 			continue
