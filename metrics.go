@@ -30,6 +30,7 @@ type ProviderStats struct {
 	ActiveConnections int // currently running connections
 	MaxConnections    int // configured connection slots
 	Ping              PingResult
+	Demoted           bool // true if auto-demoted from main to backup
 }
 
 // ClientStats is an aggregate snapshot of all provider metrics.
