@@ -1041,3 +1041,66 @@ func TestResolveProviderName(t *testing.T) {
 		})
 	}
 }
+
+// --- TestProvider standalone function ---
+
+func TestTestProvider_Success(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return mockServer(t, func(s net.Conn) {
+			_, _ = s.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 1024)
+			_, _ = s.Read(buf) // DATE
+			_, _ = s.Write([]byte("111 20240315120000\r\n"))
+		}), nil
+	}
+
+	result := TestProvider(context.Background(), Provider{Factory: factory})
+	if result.Err != nil {
+		t.Fatalf("TestProvider() error = %v", result.Err)
+	}
+	if result.RTT <= 0 {
+		t.Errorf("RTT = %v, want > 0", result.RTT)
+	}
+	if result.ServerTime.IsZero() {
+		t.Error("ServerTime should not be zero")
+	}
+}
+
+func TestTestProvider_WithAuth(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return mockServer(t, func(s net.Conn) {
+			_, _ = s.Write([]byte("200 server ready\r\n"))
+
+			buf := make([]byte, 1024)
+			_, _ = s.Read(buf) // AUTHINFO USER
+			_, _ = s.Write([]byte("381 password required\r\n"))
+			_, _ = s.Read(buf) // AUTHINFO PASS
+			_, _ = s.Write([]byte("281 authentication accepted\r\n"))
+
+			_, _ = s.Read(buf) // DATE
+			_, _ = s.Write([]byte("111 20240315120000\r\n"))
+		}), nil
+	}
+
+	result := TestProvider(context.Background(), Provider{
+		Factory: factory,
+		Auth:    Auth{Username: "user", Password: "pass"},
+	})
+	if result.Err != nil {
+		t.Fatalf("TestProvider() error = %v", result.Err)
+	}
+	if result.RTT <= 0 {
+		t.Errorf("RTT = %v, want > 0", result.RTT)
+	}
+}
+
+func TestTestProvider_DialError(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	result := TestProvider(context.Background(), Provider{Factory: factory})
+	if result.Err == nil {
+		t.Fatal("expected error for dial failure")
+	}
+}

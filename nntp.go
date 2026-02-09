@@ -930,6 +930,21 @@ func pingProvider(ctx context.Context, factory ConnFactory, auth Auth) PingResul
 	return PingResult{RTT: rtt, ServerTime: serverTime}
 }
 
+// TestProvider dials the given provider, performs greeting + authentication +
+// DATE, and returns the result. It is completely independent of Client/pool.
+func TestProvider(ctx context.Context, p Provider) PingResult {
+	factory := p.Factory
+	if factory == nil {
+		host := p.Host
+		tlsCfg := p.TLSConfig
+		keepAlive := p.KeepAlive
+		factory = func(ctx context.Context) (net.Conn, error) {
+			return newNetConn(ctx, host, tlsCfg, keepAlive)
+		}
+	}
+	return pingProvider(ctx, factory, p.Auth)
+}
+
 // resolveProviderName builds a unique name for a provider based on host and auth.
 func resolveProviderName(p Provider, index int) string {
 	if p.Host != "" {
