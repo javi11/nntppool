@@ -519,17 +519,15 @@ func TestClient_DemoteToBackup(t *testing.T) {
 		}
 	}
 
+	const threshold int64 = 3
 	c, err := NewClient(context.Background(), []Provider{
 		{Factory: makeFactory(430), Connections: 1, Host: "bad"},
 		{Factory: makeFactory(223), Connections: 1, Host: "good"},
-	})
+	}, WithMissingThreshold(threshold))
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	defer func() { _ = c.Close() }()
-
-	const threshold int64 = 3
-	c.SetMissingThreshold(threshold)
 
 	// Send enough requests to trigger demotion.
 	// Each request that hits "bad" increments Missing; once >= threshold, demotion fires.
@@ -596,13 +594,11 @@ func TestClient_DemoteProtectsLastMain(t *testing.T) {
 
 	c, err := NewClient(context.Background(), []Provider{
 		{Factory: makeFactory430(), Connections: 1, Host: "sole"},
-	})
+	}, WithMissingThreshold(2))
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	defer func() { _ = c.Close() }()
-
-	c.SetMissingThreshold(2) // low threshold
 
 	// Drive requests — all will return 430.
 	for range 10 {

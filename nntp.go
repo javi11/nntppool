@@ -849,6 +849,17 @@ type providerGroup struct {
 	cancel  context.CancelFunc // cancels this group's slot goroutines
 }
 
+// ClientOption configures optional Client behavior.
+type ClientOption func(*Client)
+
+// WithMissingThreshold sets the 430 response count at which a main provider is
+// auto-demoted to backup. Default is 100. Set to 0 to disable.
+func WithMissingThreshold(n int64) ClientOption {
+	return func(c *Client) {
+		c.missingThreshold.Store(n)
+	}
+}
+
 type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -859,7 +870,7 @@ type Client struct {
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
-	missingThreshold atomic.Int64 // 0 = disabled (default)
+	missingThreshold atomic.Int64 // default 100; 0 = disabled
 	demoteMu         sync.Mutex   // serializes provider list mutations during demotion
 
 	startTime time.Time
@@ -1003,7 +1014,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	return g
 }
 
-func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
+func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) (*Client, error) {
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("nntp: at least one provider is required")
 	}
@@ -1039,6 +1050,10 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 		ctx:       ctx,
 		cancel:    cancel,
 		startTime: time.Now(),
+	}
+	c.missingThreshold.Store(100) // default: auto-demote after 100 missing responses
+	for _, o := range opts {
+		o(c)
 	}
 	// Initialize empty slices.
 	c.mainGroups.Store(&[]*providerGroup{})
@@ -1225,12 +1240,6 @@ func (c *Client) Stats() ClientStats {
 		cs.AvgSpeed = float64(totalBytes) / secs
 	}
 	return cs
-}
-
-// SetMissingThreshold sets the 430 response count at which a main provider is
-// automatically demoted to backup. A value of 0 (default) disables auto-demotion.
-func (c *Client) SetMissingThreshold(n int64) {
-	c.missingThreshold.Store(n)
 }
 
 // demoteToBackup moves a main provider group to the backup list.
