@@ -11,10 +11,10 @@ type NZB struct {
 }
 
 type File struct {
-	Poster   string   `xml:"poster,attr"`
-	Date     string   `xml:"date,attr"`
-	Subject  string   `xml:"subject,attr"`
-	Groups   []string `xml:"groups>group"`
+	Poster   string    `xml:"poster,attr"`
+	Date     string    `xml:"date,attr"`
+	Subject  string    `xml:"subject,attr"`
+	Groups   []string  `xml:"groups>group"`
 	Segments []Segment `xml:"segments>segment"`
 }
 

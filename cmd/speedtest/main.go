@@ -5,17 +5,12 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/javi11/nntppool/v4"
-	"github.com/javi11/nntppool/v4/cmd/speedtest/nzb"
 )
 
 const defaultNZBURL = "https://sabnzbd.org/tests/test_download_10GB.nzb"
@@ -146,8 +141,9 @@ func main() {
 	var providers providerFlag
 	flag.Var(&providers, "provider", `Provider spec: "host=h:563,tls,user=u,pass=p,conns=10,inflight=1,idle=30s,throttle=30s,keepalive=60s,backup" (repeatable)`)
 
-	nzbPath := flag.String("nzb", "", "Path or URL to NZB file (default: SABnzbd 1GB test)")
+	nzbPath := flag.String("nzb", "", "Path or URL to NZB file (default: SABnzbd 10GB test)")
 	maxSegs := flag.Int("max-segments", 0, "Limit segments (0 = all)")
+	providerName := flag.String("provider-name", "", "Test only this provider (by name from stats)")
 	flag.Parse()
 
 	// Build provider list from flags.
@@ -177,24 +173,7 @@ func main() {
 		providers = append(providers, p)
 	}
 
-	// Load NZB.
-	nzbSource := *nzbPath
-	if nzbSource == "" {
-		nzbSource = defaultNZBURL
-	}
-
-	segments, err := loadNZB(nzbSource)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error loading NZB: %v\n", err)
-		os.Exit(1)
-	}
-
-	if *maxSegs > 0 && *maxSegs < len(segments) {
-		segments = segments[:*maxSegs]
-	}
-
 	// Print configuration.
-	fmt.Printf("Segments:  %d\n", len(segments))
 	totalConns := 0
 	for i, p := range providers {
 		tlsStr := "no"
@@ -238,133 +217,61 @@ func main() {
 	fmt.Println("Ready (connections on demand).")
 	fmt.Println()
 
-	// Stats — segsDone counts caller-received responses (for ETA),
-	// bytesDecoded tracks decoded throughput (not in library metrics).
-	var bytesDecoded atomic.Int64
-	var segsDone atomic.Int64
-	totalSegs := int64(len(segments))
-
-	// Progress reporter.
-	progressDone := make(chan struct{})
-	go func() {
-		defer close(progressDone)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		var lastConsumed int64
-		for {
-			select {
-			case <-ticker.C:
-				stats := client.Stats()
-				done := segsDone.Load()
-				consumed := int64(stats.AvgSpeed * stats.Elapsed.Seconds())
-				elapsed := stats.Elapsed.Seconds()
-				speedMBps := float64(consumed-lastConsumed) / 1024 / 1024
-				lastConsumed = consumed
-				avgMBps := stats.AvgSpeed / 1024 / 1024
-
-				remaining := int64(0)
-				if done > 0 {
-					remaining = int64(float64(totalSegs-done) / float64(done) * elapsed)
-				}
-
-				fmt.Printf("\r\033[K[%5.1fs] %d/%d segs | %.1f MB/s (avg %.1f MB/s) | ETA %ds",
-					elapsed, done, totalSegs, speedMBps, avgMBps, remaining)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// Fan out: send all segment requests.
-	var wg sync.WaitGroup
-	respChans := make([]<-chan nntppool.Response, len(segments))
-
-	for i, seg := range segments {
-		payload := append(append([]byte("BODY <"), seg.MessageID...), ">\r\n"...)
-		respChans[i] = client.Send(ctx, payload, io.Discard)
+	// Build speed test options.
+	opts := nntppool.SpeedTestOptions{
+		MaxSegments:  *maxSegs,
+		ProviderName: *providerName,
+		OnProgress: func(p nntppool.SpeedTestProgress) {
+			speedMBps := p.WireSpeedBps / 1024 / 1024
+			avgMBps := p.AvgSpeedBps / 1024 / 1024
+			fmt.Printf("\r\033[K[%5.1fs] %d/%d segs | %.1f MB/s (avg %.1f MB/s) | ETA %.0fs",
+				p.Elapsed.Seconds(), p.SegmentsDone, p.SegmentsTotal, speedMBps, avgMBps, p.ETASeconds)
+		},
+	}
+	if *nzbPath != "" {
+		opts.NZBURL = *nzbPath
+	} else {
+		opts.NZBURL = defaultNZBURL
 	}
 
-	// Collect responses.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for _, ch := range respChans {
-			resp := <-ch
-			if resp.Err == nil && resp.StatusCode != 430 && resp.StatusCode != 423 {
-				bytesDecoded.Add(int64(resp.Meta.BytesDecoded))
-			}
-			segsDone.Add(1)
+	// If the path looks like a local file (not URL), open it and set NZBReader.
+	if opts.NZBURL != "" && !strings.HasPrefix(opts.NZBURL, "http://") && !strings.HasPrefix(opts.NZBURL, "https://") {
+		f, err := os.Open(opts.NZBURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error opening NZB file: %v\n", err)
+			os.Exit(1)
 		}
-	}()
+		defer func() { _ = f.Close() }()
+		opts.NZBReader = f
+		opts.NZBURL = "" // clear URL so NZBReader is used
+	} else {
+		fmt.Printf("Downloading NZB from %s...\n", opts.NZBURL)
+	}
 
-	wg.Wait()
-	cancel() // stop progress reporter
-	<-progressDone
+	result, err := client.SpeedTest(ctx, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Final summary.
-	stats := client.Stats()
-	decoded := bytesDecoded.Load()
 	fmt.Printf("\r\033[K")
 	fmt.Println("=== Speed Test Results ===")
-	fmt.Printf("Time:       %s\n", stats.Elapsed.Round(time.Millisecond))
-
-	var totalMissing, totalErrors int64
-	for _, ps := range stats.Providers {
-		totalMissing += ps.Missing
-		totalErrors += ps.Errors
-	}
+	fmt.Printf("Time:       %s\n", result.Elapsed.Round(time.Millisecond))
 	fmt.Printf("Segments:   %d done, %d missing, %d errors\n",
-		segsDone.Load()-totalMissing-totalErrors, totalMissing, totalErrors)
-
-	consumed := stats.AvgSpeed * stats.Elapsed.Seconds()
+		int64(result.SegmentsDone)-result.Missing-result.Errors, result.Missing, result.Errors)
 	fmt.Printf("Wire:       %.2f MB (%.2f MB/s)\n",
-		consumed/1024/1024, stats.AvgSpeed/1024/1024)
+		float64(result.WireBytes)/1024/1024, result.WireSpeedBps/1024/1024)
 	fmt.Printf("Decoded:    %.2f MB (%.2f MB/s)\n",
-		float64(decoded)/1024/1024,
-		float64(decoded)/1024/1024/stats.Elapsed.Seconds())
+		float64(result.DecodedBytes)/1024/1024, result.DecodedSpeedBps/1024/1024)
 
-	if len(stats.Providers) > 1 {
+	if len(result.Providers) > 1 {
 		fmt.Println()
 		fmt.Println("--- Per-Provider ---")
-		for _, ps := range stats.Providers {
+		for _, ps := range result.Providers {
 			fmt.Printf("  %-30s  %6.1f MB/s  conns %d/%d  missing %d  errors %d\n",
 				ps.Name, ps.AvgSpeed/1024/1024, ps.ActiveConnections, ps.MaxConnections,
 				ps.Missing, ps.Errors)
 		}
 	}
-}
-
-func loadNZB(source string) ([]nzb.Segment, error) {
-	var r io.ReadCloser
-
-	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-		fmt.Printf("Downloading NZB from %s...\n", source)
-		resp, err := http.Get(source)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode != 200 {
-			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-		}
-		r = resp.Body
-	} else {
-		f, err := os.Open(source)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = f.Close() }()
-		r = f
-	}
-
-	n, err := nzb.Parse(r)
-	if err != nil {
-		return nil, err
-	}
-
-	segments := n.AllSegments()
-	if len(segments) == 0 {
-		return nil, fmt.Errorf("no segments found in NZB")
-	}
-	return segments, nil
 }
