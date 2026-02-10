@@ -324,6 +324,7 @@ type connGate struct {
 	running      int // slots inside nc.Run()
 	restoreTimer *time.Timer
 	restoreDur   time.Duration
+	available    atomic.Int32 // allowed - held; updated under mu, read lock-free
 }
 
 func newConnGate(max int, restoreDur time.Duration) *connGate {
@@ -336,6 +337,7 @@ func newConnGate(max int, restoreDur time.Duration) *connGate {
 		restoreDur: restoreDur,
 	}
 	g.cond = sync.NewCond(&g.mu)
+	g.available.Store(int32(max))
 	return g
 }
 
@@ -365,12 +367,14 @@ func (g *connGate) enter(slotCtx, reqCtx context.Context) bool {
 		g.cond.Wait()
 	}
 	g.held++
+	g.available.Store(int32(g.allowed - g.held))
 	return true
 }
 
 func (g *connGate) exit() {
 	g.mu.Lock()
 	g.held--
+	g.available.Store(int32(g.allowed - g.held))
 	g.mu.Unlock()
 	g.cond.Broadcast()
 }
@@ -403,12 +407,14 @@ func (g *connGate) throttle() {
 		g.restoreTimer.Stop()
 	}
 	g.restoreTimer = time.AfterFunc(g.restoreDur, g.restore)
+	g.available.Store(int32(g.allowed - g.held))
 }
 
 func (g *connGate) restore() {
 	g.mu.Lock()
 	g.allowed = g.maxSlots
 	g.restoreTimer = nil
+	g.available.Store(int32(g.allowed - g.held))
 	g.mu.Unlock()
 	g.cond.Broadcast()
 }
@@ -858,31 +864,10 @@ type Client struct {
 	backupGroups atomic.Pointer[[]*providerGroup]
 	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
 
-	// Weighted round-robin: cumulative connection-count boundaries.
-	// For providers with maxConns [50, 10], mainWeights = [50, 60]
-	// and mainWeightTotal = 60. nextIdx % 60 maps to a provider via
-	// binary search over mainWeights.
-	mainWeights      atomic.Pointer[[]int]
-	mainWeightTotal  atomic.Uint64
-
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
 	startTime time.Time
 	wg        sync.WaitGroup
-}
-
-// updateMainWeights rebuilds the cumulative weight table from the current
-// mainGroups slice. Each provider's weight equals its maxConns value so that
-// requests are distributed proportionally to connection capacity.
-func (c *Client) updateMainWeights(groups []*providerGroup) {
-	cumulative := make([]int, len(groups))
-	total := 0
-	for i, g := range groups {
-		total += g.maxConns
-		cumulative[i] = total
-	}
-	c.mainWeights.Store(&cumulative)
-	c.mainWeightTotal.Store(uint64(total))
 }
 
 // parseDateResponse parses an NNTP DATE response message.
@@ -1076,7 +1061,6 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 	}
 	c.mainGroups.Store(&mainGs)
 	c.backupGroups.Store(&backupGs)
-	c.updateMainWeights(mainGs)
 
 	return c, nil
 }
@@ -1158,18 +1142,28 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	var skipHosts [4]string
 	skipCount := 0
 
-	// 1. Try all main providers in weighted round-robin order.
-	//    Providers with more connections receive proportionally more
-	//    first-attempt traffic (e.g. 50-conn provider gets 5x the
-	//    requests of a 10-conn provider).
+	// 1. Try all main providers in load-aware weighted round-robin order.
+	//    Each provider's weight equals its available capacity (allowed - held).
+	//    Providers with free slots absorb more traffic naturally.
 	mains := *c.mainGroups.Load()
 	n := len(mains)
-	weights := *c.mainWeights.Load()
-	totalW := int(c.mainWeightTotal.Load())
+	if n == 0 {
+		respCh <- Response{Err: errors.New("nntp: no main providers")}
+		return
+	}
+
+	// Compute dynamic weights from available capacity.
+	var cumWeights [8]int // stack-allocated; covers up to 8 providers
+	totalW := 0
+	for i, g := range mains {
+		avail := max(1, int(g.gate.available.Load()))
+		totalW += avail
+		cumWeights[i] = totalW
+	}
 
 	// Pick weighted start provider.
 	slot := int(c.nextIdx.Add(1) % uint64(totalW))
-	start := sort.SearchInts(weights, slot+1) // first index where cumulative > slot
+	start := sort.SearchInts(cumWeights[:n], slot+1)
 
 	for attempt := range n {
 		idx := (start + attempt) % n
@@ -1321,7 +1315,6 @@ func (c *Client) AddProvider(p Provider) error {
 		copy(updated, *old)
 		updated[len(*old)] = g
 		c.mainGroups.Store(&updated)
-		c.updateMainWeights(updated)
 	}
 	return nil
 }
@@ -1350,9 +1343,6 @@ func (c *Client) RemoveProvider(name string) error {
 			updated = append(updated, (*old)[:i]...)
 			updated = append(updated, (*old)[i+1:]...)
 			pair.ptr.Store(&updated)
-			if pair.ptr == &c.mainGroups {
-				c.updateMainWeights(updated)
-			}
 			return nil
 		}
 	}
