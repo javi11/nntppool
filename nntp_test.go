@@ -3,7 +3,9 @@ package nntppool
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1102,5 +1104,135 @@ func TestTestProvider_DialError(t *testing.T) {
 	result := TestProvider(context.Background(), Provider{Factory: factory})
 	if result.Err == nil {
 		t.Fatal("expected error for dial failure")
+	}
+}
+
+// --- weighted round-robin tests ---
+
+func TestUpdateMainWeights(t *testing.T) {
+	var c Client
+	c.mainGroups.Store(&[]*providerGroup{})
+	c.backupGroups.Store(&[]*providerGroup{})
+
+	groups := []*providerGroup{
+		{maxConns: 50},
+		{maxConns: 10},
+	}
+	c.updateMainWeights(groups)
+
+	weights := *c.mainWeights.Load()
+	total := int(c.mainWeightTotal.Load())
+
+	if total != 60 {
+		t.Fatalf("total = %d, want 60", total)
+	}
+	if len(weights) != 2 || weights[0] != 50 || weights[1] != 60 {
+		t.Fatalf("weights = %v, want [50 60]", weights)
+	}
+}
+
+func TestWeightedRoundRobin_Distribution(t *testing.T) {
+	// Verify that weighted round-robin distributes requests proportionally
+	// to connection counts.
+	weights := []int{50, 60} // cumulative: provider 0 = [0,49], provider 1 = [50,59]
+	totalW := 60
+	counts := [2]int{}
+
+	for slot := range totalW {
+		idx := sort.SearchInts(weights, slot+1)
+		counts[idx]++
+	}
+
+	if counts[0] != 50 {
+		t.Errorf("provider 0 got %d requests, want 50", counts[0])
+	}
+	if counts[1] != 10 {
+		t.Errorf("provider 1 got %d requests, want 10", counts[1])
+	}
+}
+
+func TestWeightedRoundRobin_ThreeProviders(t *testing.T) {
+	var c Client
+	c.mainGroups.Store(&[]*providerGroup{})
+	c.backupGroups.Store(&[]*providerGroup{})
+
+	groups := []*providerGroup{
+		{maxConns: 50},
+		{maxConns: 10},
+		{maxConns: 20},
+	}
+	c.updateMainWeights(groups)
+
+	weights := *c.mainWeights.Load()
+	totalW := int(c.mainWeightTotal.Load())
+
+	if totalW != 80 {
+		t.Fatalf("total = %d, want 80", totalW)
+	}
+
+	counts := [3]int{}
+	for slot := range totalW {
+		idx := sort.SearchInts(weights, slot+1)
+		counts[idx]++
+	}
+
+	if counts[0] != 50 || counts[1] != 10 || counts[2] != 20 {
+		t.Errorf("distribution = %v, want [50 10 20]", counts)
+	}
+}
+
+func TestWeightedRoundRobin_EqualWeights(t *testing.T) {
+	weights := []int{10, 20} // two providers, 10 conns each
+	totalW := 20
+	counts := [2]int{}
+
+	for slot := range totalW {
+		idx := sort.SearchInts(weights, slot+1)
+		counts[idx]++
+	}
+
+	if counts[0] != 10 || counts[1] != 10 {
+		t.Errorf("distribution = %v, want [10 10]", counts)
+	}
+}
+
+func TestWeightedRoundRobin_SingleProvider(t *testing.T) {
+	weights := []int{50}
+	totalW := 50
+
+	for slot := range totalW {
+		idx := sort.SearchInts(weights, slot+1)
+		if idx != 0 {
+			t.Fatalf("slot %d mapped to idx %d, want 0", slot, idx)
+		}
+	}
+}
+
+func TestWeightedRoundRobin_LargeN(t *testing.T) {
+	// Simulate 600 requests across 2 providers (50+10 conns).
+	// Expect ~83.3% to provider 0, ~16.7% to provider 1.
+	weights := []int{50, 60}
+	totalW := 60
+	const N = 6000
+	counts := [2]int{}
+
+	for i := range N {
+		slot := i % totalW
+		idx := sort.SearchInts(weights, slot+1)
+		counts[idx]++
+	}
+
+	// N is evenly divisible by totalW, so distribution is exact.
+	wantP0 := N * 50 / totalW
+	wantP1 := N * 10 / totalW
+	if counts[0] != wantP0 || counts[1] != wantP1 {
+		t.Errorf("over %d requests: provider 0 = %d (want %d), provider 1 = %d (want %d)",
+			N, counts[0], wantP0, counts[1], wantP1)
+	}
+
+	// Also check percentage is close to 83.3%/16.7%.
+	pct0 := float64(counts[0]) / float64(N) * 100
+	if math.Abs(pct0-83.33) > 1.0 {
+		t.Errorf("provider 0 percentage = %.2f%%, want ~83.33%%", pct0)
 	}
 }

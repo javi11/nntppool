@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -840,11 +841,12 @@ type Provider struct {
 }
 
 type providerGroup struct {
-	name    string
-	reqCh   chan *Request
-	gate    *connGate
-	stats   providerStats
-	cancel context.CancelFunc // cancels this group's slot goroutines
+	name     string
+	maxConns int
+	reqCh    chan *Request
+	gate     *connGate
+	stats    providerStats
+	cancel   context.CancelFunc // cancels this group's slot goroutines
 }
 
 type Client struct {
@@ -853,12 +855,33 @@ type Client struct {
 
 	mainGroups   atomic.Pointer[[]*providerGroup]
 	backupGroups atomic.Pointer[[]*providerGroup]
-	nextIdx      atomic.Uint64 // round-robin for mainGroups only
+	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
+
+	// Weighted round-robin: cumulative connection-count boundaries.
+	// For providers with maxConns [50, 10], mainWeights = [50, 60]
+	// and mainWeightTotal = 60. nextIdx % 60 maps to a provider via
+	// binary search over mainWeights.
+	mainWeights      atomic.Pointer[[]int]
+	mainWeightTotal  atomic.Uint64
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
 	startTime time.Time
 	wg        sync.WaitGroup
+}
+
+// updateMainWeights rebuilds the cumulative weight table from the current
+// mainGroups slice. Each provider's weight equals its maxConns value so that
+// requests are distributed proportionally to connection capacity.
+func (c *Client) updateMainWeights(groups []*providerGroup) {
+	cumulative := make([]int, len(groups))
+	total := 0
+	for i, g := range groups {
+		total += g.maxConns
+		cumulative[i] = total
+	}
+	c.mainWeights.Store(&cumulative)
+	c.mainWeightTotal.Store(uint64(total))
 }
 
 // parseDateResponse parses an NNTP DATE response message.
@@ -979,10 +1002,11 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
-		name:   name,
-		reqCh:  make(chan *Request, p.Connections),
-		gate:   gate,
-		cancel: gcancel,
+		name:     name,
+		maxConns: p.Connections,
+		reqCh:    make(chan *Request, p.Connections),
+		gate:     gate,
+		cancel:   gcancel,
 	}
 
 	// Ping with a short timeout so we don't block forever.
@@ -1050,6 +1074,7 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 	}
 	c.mainGroups.Store(&mainGs)
 	c.backupGroups.Store(&backupGs)
+	c.updateMainWeights(mainGs)
 
 	return c, nil
 }
@@ -1112,10 +1137,18 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	hasResp := false
 	var lastErr error
 
-	// 1. Try all main providers in round-robin order.
+	// 1. Try all main providers in weighted round-robin order.
+	//    Providers with more connections receive proportionally more
+	//    first-attempt traffic (e.g. 50-conn provider gets 5x the
+	//    requests of a 10-conn provider).
 	mains := *c.mainGroups.Load()
 	n := len(mains)
-	start := int(c.nextIdx.Add(1) % uint64(n))
+	weights := *c.mainWeights.Load()
+	totalW := int(c.mainWeightTotal.Load())
+
+	// Pick weighted start provider.
+	slot := int(c.nextIdx.Add(1) % uint64(totalW))
+	start := sort.SearchInts(weights, slot+1) // first index where cumulative > slot
 
 	for attempt := range n {
 		idx := (start + attempt) % n
@@ -1255,6 +1288,7 @@ func (c *Client) AddProvider(p Provider) error {
 		copy(updated, *old)
 		updated[len(*old)] = g
 		c.mainGroups.Store(&updated)
+		c.updateMainWeights(updated)
 	}
 	return nil
 }
@@ -1283,6 +1317,9 @@ func (c *Client) RemoveProvider(name string) error {
 			updated = append(updated, (*old)[:i]...)
 			updated = append(updated, (*old)[i+1:]...)
 			pair.ptr.Store(&updated)
+			if pair.ptr == &c.mainGroups {
+				c.updateMainWeights(updated)
+			}
 			return nil
 		}
 	}
