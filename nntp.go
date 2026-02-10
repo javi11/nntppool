@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -845,19 +844,7 @@ type providerGroup struct {
 	reqCh   chan *Request
 	gate    *connGate
 	stats   providerStats
-	demoted atomic.Bool         // set when auto-demoted to backup
-	cancel  context.CancelFunc // cancels this group's slot goroutines
-}
-
-// ClientOption configures optional Client behavior.
-type ClientOption func(*Client)
-
-// WithMissingThreshold sets the 430 response count at which a main provider is
-// auto-demoted to backup. Default is 100. Set to 0 to disable.
-func WithMissingThreshold(n int64) ClientOption {
-	return func(c *Client) {
-		c.missingThreshold.Store(n)
-	}
+	cancel context.CancelFunc // cancels this group's slot goroutines
 }
 
 type Client struct {
@@ -869,9 +856,6 @@ type Client struct {
 	nextIdx      atomic.Uint64 // round-robin for mainGroups only
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
-
-	missingThreshold atomic.Int64 // default 100; 0 = disabled
-	demoteMu         sync.Mutex   // serializes provider list mutations during demotion
 
 	startTime time.Time
 	wg        sync.WaitGroup
@@ -1014,7 +998,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	return g
 }
 
-func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) (*Client, error) {
+func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("nntp: at least one provider is required")
 	}
@@ -1050,10 +1034,6 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 		ctx:       ctx,
 		cancel:    cancel,
 		startTime: time.Now(),
-	}
-	c.missingThreshold.Store(100) // default: auto-demote after 100 missing responses
-	for _, o := range opts {
-		o(c)
 	}
 	// Initialize empty slices.
 	c.mainGroups.Store(&[]*providerGroup{})
@@ -1158,9 +1138,6 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 		}
 		if resp.StatusCode == 430 {
 			c.nextIdx.Add(1) // bias next request away from this provider
-			if t := c.missingThreshold.Load(); t > 0 && mains[idx].stats.Missing.Load() >= t {
-				c.demoteToBackup(mains[idx])
-			}
 			lastResp = resp
 			hasResp = true
 			continue
@@ -1228,7 +1205,6 @@ func (c *Client) Stats() ClientStats {
 				ActiveConnections: running,
 				MaxConnections:    maxSlots,
 				Ping:              g.stats.Ping,
-				Demoted:           g.demoted.Load(),
 			}
 			if secs > 0 {
 				ps.AvgSpeed = float64(consumed) / secs
@@ -1240,52 +1216,6 @@ func (c *Client) Stats() ClientStats {
 		cs.AvgSpeed = float64(totalBytes) / secs
 	}
 	return cs
-}
-
-// demoteToBackup moves a main provider group to the backup list.
-// It is safe to call concurrently; at least one main provider is always kept.
-func (c *Client) demoteToBackup(g *providerGroup) {
-	c.demoteMu.Lock()
-	defer c.demoteMu.Unlock()
-
-	mains := *c.mainGroups.Load()
-	if len(mains) <= 1 {
-		return // always keep at least one main
-	}
-
-	// Find g in the current mains (it may already be demoted).
-	found := -1
-	for i, m := range mains {
-		if m == g {
-			found = i
-			break
-		}
-	}
-	if found < 0 {
-		return // already demoted or removed
-	}
-
-	// Copy-on-write: build new slices.
-	newMains := make([]*providerGroup, 0, len(mains)-1)
-	newMains = append(newMains, mains[:found]...)
-	newMains = append(newMains, mains[found+1:]...)
-
-	backups := *c.backupGroups.Load()
-	newBackups := make([]*providerGroup, len(backups)+1)
-	copy(newBackups, backups)
-	newBackups[len(backups)] = g
-
-	g.demoted.Store(true)
-
-	// Store mains first so readers never see g in both lists.
-	c.mainGroups.Store(&newMains)
-	c.backupGroups.Store(&newBackups)
-
-	threshold := c.missingThreshold.Load()
-	slog.Info("nntp: provider demoted to backup",
-		"provider", g.name,
-		"missing", g.stats.Missing.Load(),
-		"threshold", threshold)
 }
 
 // AddProvider validates, pings, and registers a new provider at runtime.
