@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -387,6 +388,72 @@ func TestClient_SendRetryRoundRobin(t *testing.T) {
 	}
 }
 
+func TestClient_WeightedRoundRobin(t *testing.T) {
+	// Track which providers receive first-attempt requests.
+	var mu sync.Mutex
+	hits := make(map[string]int)
+
+	makeFactory := func(name string) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					mu.Lock()
+					hits[name]++
+					mu.Unlock()
+					_ = n
+					_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	// Provider "big" has weight 5, "small" has weight 1 → total 6.
+	// Over 60 requests (10 full cycles), big should get 50 and small 10.
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory("big"), Connections: 5},
+		{Factory: makeFactory("small"), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Reset counters after NewClient — provider ping during init adds a hit.
+	mu.Lock()
+	clear(hits)
+	mu.Unlock()
+
+	for range 60 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		cancel()
+		if resp.Err != nil {
+			t.Fatalf("Send() error = %v", resp.Err)
+		}
+		if resp.StatusCode != 223 {
+			t.Errorf("StatusCode = %d, want 223", resp.StatusCode)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if hits["big"] != 50 {
+		t.Errorf("big hits = %d, want 50 (5/6 of 60)", hits["big"])
+	}
+	if hits["small"] != 10 {
+		t.Errorf("small hits = %d, want 10 (1/6 of 60)", hits["small"])
+	}
+}
+
 func TestClient_SendRetryFallbackBackup(t *testing.T) {
 	makeFactory := func(statusCode int) ConnFactory {
 		return func(ctx context.Context) (net.Conn, error) {
@@ -464,6 +531,214 @@ func TestClient_SendRetryAll430(t *testing.T) {
 	if resp.StatusCode != 430 {
 		t.Errorf("StatusCode = %d, want 430 (all providers exhausted)", resp.StatusCode)
 	}
+}
+
+func TestClient_Skip430SameHost(t *testing.T) {
+	// Two main providers + one backup, all same host but different auth.
+	// First returns 430 → others should be skipped.
+	var counts [3]atomic.Int64
+	make430Factory := func(idx int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					if bytes.Contains(buf[:n], []byte("STAT")) {
+						counts[idx].Add(1)
+					}
+					_, _ = server.Write([]byte("430 no such article\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "news.example.com:563", Factory: make430Factory(0), Connections: 1},
+		{Host: "news.example.com:563", Factory: make430Factory(1), Connections: 1},
+		{Host: "news.example.com:563", Factory: make430Factory(2), Connections: 1, Backup: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.StatusCode != 430 {
+		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+
+	total := counts[0].Load() + counts[1].Load() + counts[2].Load()
+	if total != 1 {
+		t.Errorf("total requests = %d, want 1 (same-host providers should be skipped)", total)
+	}
+}
+
+func TestClient_Skip430DifferentHosts(t *testing.T) {
+	// Two providers on different hosts. Both should be tried.
+	var counts [2]atomic.Int64
+	make430Factory := func(idx int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					if bytes.Contains(buf[:n], []byte("STAT")) {
+						counts[idx].Add(1)
+					}
+					_, _ = server.Write([]byte("430 no such article\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "news1.example.com:563", Factory: make430Factory(0), Connections: 1},
+		{Host: "news2.example.com:563", Factory: make430Factory(1), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.StatusCode != 430 {
+		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+
+	if counts[0].Load() != 1 || counts[1].Load() != 1 {
+		t.Errorf("requests = [%d, %d], want [1, 1] (different hosts should both be tried)",
+			counts[0].Load(), counts[1].Load())
+	}
+}
+
+func TestClient_Skip430FactoryProviders(t *testing.T) {
+	// Factory-based providers (no Host) are never skipped.
+	var counts [2]atomic.Int64
+	make430Factory := func(idx int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					if bytes.Contains(buf[:n], []byte("STAT")) {
+						counts[idx].Add(1)
+					}
+					_, _ = server.Write([]byte("430 no such article\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: make430Factory(0), Connections: 1},
+		{Factory: make430Factory(1), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.StatusCode != 430 {
+		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+
+	if counts[0].Load() != 1 || counts[1].Load() != 1 {
+		t.Errorf("requests = [%d, %d], want [1, 1] (factory providers should never be skipped)",
+			counts[0].Load(), counts[1].Load())
+	}
+}
+
+// --- Benchmarks ---
+
+func benchSend(b *testing.B, providers []Provider) {
+	b.Helper()
+
+	c, err := NewClient(context.Background(), providers)
+	if err != nil {
+		b.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	payload := []byte("STAT <bench@test>\r\n")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp := <-c.Send(ctx, payload, nil)
+		cancel()
+		if resp.Err != nil {
+			b.Fatalf("Send() error = %v", resp.Err)
+		}
+	}
+}
+
+func BenchmarkSend(b *testing.B) {
+	benchFactory := func() ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	b.Run("EqualWeight_3_3", func(b *testing.B) {
+		benchSend(b, []Provider{
+			{Factory: benchFactory(), Connections: 3},
+			{Factory: benchFactory(), Connections: 3},
+		})
+	})
+
+	b.Run("Weighted_5_1", func(b *testing.B) {
+		benchSend(b, []Provider{
+			{Factory: benchFactory(), Connections: 5},
+			{Factory: benchFactory(), Connections: 1},
+		})
+	})
+
+	b.Run("SingleProvider", func(b *testing.B) {
+		benchSend(b, []Provider{
+			{Factory: benchFactory(), Connections: 6},
+		})
+	})
 }
 
 // --- readOneResponse helper (used in NNTPConnection setup) ---

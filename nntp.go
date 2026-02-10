@@ -842,6 +842,7 @@ type Provider struct {
 
 type providerGroup struct {
 	name     string
+	host     string // raw Provider.Host; empty for Factory-based providers
 	maxConns int
 	reqCh    chan *Request
 	gate     *connGate
@@ -1003,6 +1004,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	g := &providerGroup{
 		name:     name,
+		host:     p.Host,
 		maxConns: p.Connections,
 		reqCh:    make(chan *Request, p.Connections),
 		gate:     gate,
@@ -1108,6 +1110,20 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer,
 	return respCh
 }
 
+// hostSkipped reports whether host is already in the skip list.
+// Empty hosts (Factory-based providers) are never skipped.
+func hostSkipped(host string, skipHosts *[4]string, count int) bool {
+	if host == "" || count == 0 {
+		return false
+	}
+	for i := range count {
+		if skipHosts[i] == host {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
 	defer close(respCh)
 
@@ -1137,6 +1153,11 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	hasResp := false
 	var lastErr error
 
+	// Track hosts that returned 430 so we can skip other providers on
+	// the same server (different credentials won't help).
+	var skipHosts [4]string
+	skipCount := 0
+
 	// 1. Try all main providers in weighted round-robin order.
 	//    Providers with more connections receive proportionally more
 	//    first-attempt traffic (e.g. 50-conn provider gets 5x the
@@ -1152,7 +1173,11 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 
 	for attempt := range n {
 		idx := (start + attempt) % n
-		resp, ok, cancelled := tryGroup(mains[idx])
+		g := mains[idx]
+		if hostSkipped(g.host, &skipHosts, skipCount) {
+			continue
+		}
+		resp, ok, cancelled := tryGroup(g)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
@@ -1171,6 +1196,10 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 		}
 		if resp.StatusCode == 430 {
 			c.nextIdx.Add(1) // bias next request away from this provider
+			if g.host != "" && skipCount < len(skipHosts) {
+				skipHosts[skipCount] = g.host
+				skipCount++
+			}
 			lastResp = resp
 			hasResp = true
 			continue
@@ -1183,7 +1212,11 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	// 2. All main providers returned 430 (or died) — try backup providers in order.
 	backups := *c.backupGroups.Load()
 	for i := range backups {
-		resp, ok, cancelled := tryGroup(backups[i])
+		g := backups[i]
+		if hostSkipped(g.host, &skipHosts, skipCount) {
+			continue
+		}
+		resp, ok, cancelled := tryGroup(g)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
