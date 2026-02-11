@@ -233,6 +233,9 @@ func (c *Client) sendToGroup(ctx context.Context, g *providerGroup, payload []by
 		case <-c.ctx.Done():
 			outerCh <- Response{Err: c.ctx.Err()}
 			return
+		case <-g.ctx.Done():
+			outerCh <- Response{Err: context.Canceled}
+			return
 		case g.reqCh <- req:
 		}
 		resp, ok := <-innerCh

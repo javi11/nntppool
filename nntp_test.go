@@ -863,6 +863,36 @@ func TestNewClient_PingFailureDoesNotBlock(t *testing.T) {
 	}
 }
 
+// --- DispatchStrategy option wiring ---
+
+func TestNewClient_DefaultDispatchRoundRobin(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "host1:119", Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.dispatch != DispatchRoundRobin {
+		t.Errorf("dispatch = %d, want DispatchRoundRobin (%d)", c.dispatch, DispatchRoundRobin)
+	}
+}
+
+func TestNewClient_WithDispatchFIFO(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "host1:119", Connections: 1},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.dispatch != DispatchFIFO {
+		t.Errorf("dispatch = %d, want DispatchFIFO (%d)", c.dispatch, DispatchFIFO)
+	}
+}
+
 // --- AddProvider then Send integration ---
 
 func TestAddThenSend(t *testing.T) {

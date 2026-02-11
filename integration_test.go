@@ -682,6 +682,181 @@ func TestClient_Skip430FactoryProviders(t *testing.T) {
 	}
 }
 
+// --- FIFO dispatch tests ---
+
+func TestClient_FIFODispatch(t *testing.T) {
+	// With FIFO, provider #1 should get all requests when it has capacity.
+	var mu sync.Mutex
+	hits := make(map[string]int)
+
+	makeFactory := func(name string) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					mu.Lock()
+					hits[name]++
+					mu.Unlock()
+					_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory("p1"), Connections: 20},
+		{Factory: makeFactory("p2"), Connections: 20},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Reset counters after NewClient (ping adds hits).
+	mu.Lock()
+	clear(hits)
+	mu.Unlock()
+
+	// Send requests sequentially — p1 should absorb all of them since
+	// its available capacity is always > 0 with 20 slots.
+	const N = 10
+	for range N {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		cancel()
+		if resp.Err != nil {
+			t.Fatalf("Send() error = %v", resp.Err)
+		}
+		if resp.StatusCode != 223 {
+			t.Errorf("StatusCode = %d, want 223", resp.StatusCode)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if hits["p1"] != N {
+		t.Errorf("FIFO: p1=%d p2=%d, want p1=%d p2=0", hits["p1"], hits["p2"], N)
+	}
+}
+
+func TestClient_FIFOOverflow(t *testing.T) {
+	// Provider #1 has 1 connection, slow handler. Concurrent requests overflow to #2.
+	var mu sync.Mutex
+	hits := make(map[string]int)
+
+	makeFactory := func(name string, delay time.Duration) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					if delay > 0 {
+						time.Sleep(delay)
+					}
+					mu.Lock()
+					hits[name]++
+					mu.Unlock()
+					_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory("p1", 200*time.Millisecond), Connections: 1},
+		{Factory: makeFactory("p2", 0), Connections: 5},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	mu.Lock()
+	clear(hits)
+	mu.Unlock()
+
+	// Fire several requests concurrently — p1 can only hold 1,
+	// so the rest should overflow to p2.
+	const N = 5
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for range N {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+			if resp.Err != nil {
+				t.Errorf("Send() error = %v", resp.Err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	// p2 should have received some requests since p1 is saturated.
+	if hits["p2"] == 0 {
+		t.Errorf("FIFO overflow: p1=%d p2=%d, expected p2 > 0", hits["p1"], hits["p2"])
+	}
+	if hits["p1"]+hits["p2"] != N {
+		t.Errorf("total hits = %d, want %d", hits["p1"]+hits["p2"], N)
+	}
+}
+
+func TestClient_FIFO430Fallthrough(t *testing.T) {
+	// Provider #1 returns 430, provider #2 returns 223.
+	makeFactory := func(statusLine string) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = server.Write([]byte(statusLine))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory("430 No such article\r\n"), Connections: 2},
+		{Factory: makeFactory("223 1 <id@test> exists\r\n"), Connections: 2},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("Send() error = %v", resp.Err)
+	}
+	if resp.StatusCode != 223 {
+		t.Errorf("StatusCode = %d, want 223 (should fall through from 430 provider)", resp.StatusCode)
+	}
+}
+
 // --- Benchmarks ---
 
 func benchSend(b *testing.B, providers []Provider) {

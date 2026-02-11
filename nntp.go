@@ -832,6 +832,32 @@ func (c *NNTPConnection) readOneResponse(out io.Writer) (NNTPResponse, error) {
 	return resp, nil
 }
 
+// DispatchStrategy controls how the client distributes requests across main providers.
+type DispatchStrategy int
+
+const (
+	// DispatchRoundRobin distributes requests using dynamic weighted round-robin
+	// based on each provider's available capacity. This is the default.
+	DispatchRoundRobin DispatchStrategy = iota
+
+	// DispatchFIFO sends all requests to the first provider that has capacity.
+	// Overflow cascades to subsequent providers in declaration order.
+	DispatchFIFO
+)
+
+// ClientOption configures optional Client behavior.
+type ClientOption func(*clientConfig)
+
+type clientConfig struct {
+	dispatch DispatchStrategy
+}
+
+// WithDispatchStrategy sets the request distribution strategy for main providers.
+// The default is DispatchRoundRobin.
+func WithDispatchStrategy(s DispatchStrategy) ClientOption {
+	return func(cfg *clientConfig) { cfg.dispatch = s }
+}
+
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
 	Host            string
@@ -850,6 +876,7 @@ type providerGroup struct {
 	name     string
 	host     string // raw Provider.Host; empty for Factory-based providers
 	maxConns int
+	ctx      context.Context    // cancelled on removal/close
 	reqCh    chan *Request
 	gate     *connGate
 	stats    providerStats
@@ -863,6 +890,8 @@ type Client struct {
 	mainGroups   atomic.Pointer[[]*providerGroup]
 	backupGroups atomic.Pointer[[]*providerGroup]
 	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
+
+	dispatch DispatchStrategy // set once by NewClient, read-only after
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
@@ -991,6 +1020,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		name:     name,
 		host:     p.Host,
 		maxConns: p.Connections,
+		ctx:      gctx,
 		reqCh:    make(chan *Request, p.Connections),
 		gate:     gate,
 		cancel:   gcancel,
@@ -1009,7 +1039,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	return g
 }
 
-func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
+func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) (*Client, error) {
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("nntp: at least one provider is required")
 	}
@@ -1041,9 +1071,15 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
+	var cfg clientConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	c := &Client{
 		ctx:       ctx,
 		cancel:    cancel,
+		dispatch:  cfg.dispatch,
 		startTime: time.Now(),
 	}
 	// Initialize empty slices.
@@ -1065,14 +1101,15 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 	return c, nil
 }
 
-// Close cancels the client, closes all provider channels, and waits for all
+// Close cancels the client, stops all provider gates, and waits for all
 // connection slots to stop. Slots manage their own TCP connection cleanup.
+// Context cancellation (c.cancel) cascades to all group contexts, so closing
+// reqCh is unnecessary and avoids a race with stale-snapshot senders.
 func (c *Client) Close() error {
 	c.cancel()
 	for _, gs := range []*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
 		for _, g := range *gs {
 			g.gate.stop()
-			close(g.reqCh)
 		}
 	}
 	c.wg.Wait()
@@ -1126,6 +1163,8 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 			return Response{}, false, true
 		case <-ctx.Done():
 			return Response{}, false, true
+		case <-g.ctx.Done():
+			return Response{}, false, false
 		case g.reqCh <- req:
 		}
 
@@ -1142,9 +1181,7 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	var skipHosts [4]string
 	skipCount := 0
 
-	// 1. Try all main providers in load-aware weighted round-robin order.
-	//    Each provider's weight equals its available capacity (allowed - held).
-	//    Providers with free slots absorb more traffic naturally.
+	// 1. Try all main providers.
 	mains := *c.mainGroups.Load()
 	n := len(mains)
 	if n == 0 {
@@ -1152,18 +1189,31 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 		return
 	}
 
-	// Compute dynamic weights from available capacity.
-	var cumWeights [8]int // stack-allocated; covers up to 8 providers
-	totalW := 0
-	for i, g := range mains {
-		avail := max(1, int(g.gate.available.Load()))
-		totalW += avail
-		cumWeights[i] = totalW
+	// Pick start index based on dispatch strategy.
+	var start int
+	switch c.dispatch {
+	case DispatchFIFO:
+		// Priority order: first provider with available capacity,
+		// falling back to provider 0 if all are saturated.
+		for i, g := range mains {
+			if g.gate.available.Load() > 0 {
+				start = i
+				break
+			}
+		}
+	default: // DispatchRoundRobin
+		// Dynamic weighted round-robin: each provider's weight equals
+		// its available capacity (allowed - held).
+		var cumWeights [8]int // stack-allocated; covers up to 8 providers
+		totalW := 0
+		for i, g := range mains {
+			avail := max(1, int(g.gate.available.Load()))
+			totalW += avail
+			cumWeights[i] = totalW
+		}
+		slot := int(c.nextIdx.Add(1) % uint64(totalW))
+		start = sort.SearchInts(cumWeights[:n], slot+1)
 	}
-
-	// Pick weighted start provider.
-	slot := int(c.nextIdx.Add(1) % uint64(totalW))
-	start := sort.SearchInts(cumWeights[:n], slot+1)
 
 	for attempt := range n {
 		idx := (start + attempt) % n
@@ -1333,10 +1383,11 @@ func (c *Client) RemoveProvider(name string) error {
 			if g.name != name {
 				continue
 			}
-			// Found it — cancel, stop gate, close channel.
+			// Found it — cancel context and stop gate. Context cancellation
+			// is sufficient; runConnSlot goroutines exit via ctx.Done() and
+			// tryGroup detects removal via g.ctx.Done().
 			g.cancel()
 			g.gate.stop()
-			close(g.reqCh)
 
 			// Copy-on-write removal.
 			updated := make([]*providerGroup, 0, len(*old)-1)
