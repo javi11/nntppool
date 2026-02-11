@@ -3,7 +3,9 @@ package nntppool
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -16,15 +18,25 @@ func TestConnGate_EnterExit(t *testing.T) {
 	defer g.stop()
 	ctx := context.Background()
 
+	if avail := g.available.Load(); avail != 3 {
+		t.Fatalf("initial available = %d, want 3", avail)
+	}
+
 	// Enter max times
-	for range 3 {
+	for i := range 3 {
 		if !g.enter(ctx, ctx) {
 			t.Fatal("enter() should succeed")
+		}
+		if avail := g.available.Load(); avail != int32(2-i) {
+			t.Fatalf("available after enter %d = %d, want %d", i+1, avail, 2-i)
 		}
 	}
 
 	// Exit one
 	g.exit()
+	if avail := g.available.Load(); avail != 1 {
+		t.Fatalf("available after exit = %d, want 1", avail)
+	}
 
 	// Re-enter
 	if !g.enter(ctx, ctx) {
@@ -34,6 +46,9 @@ func TestConnGate_EnterExit(t *testing.T) {
 	// Clean up
 	for range 3 {
 		g.exit()
+	}
+	if avail := g.available.Load(); avail != 3 {
+		t.Fatalf("available after all exits = %d, want 3", avail)
 	}
 }
 
@@ -175,10 +190,14 @@ func TestConnGate_Throttle(t *testing.T) {
 
 	g.mu.Lock()
 	allowed := g.allowed
+	held := g.held
 	g.mu.Unlock()
 
 	if allowed != 3 {
 		t.Errorf("allowed = %d, want 3 (max(1, running))", allowed)
+	}
+	if avail := g.available.Load(); avail != int32(allowed-held) {
+		t.Errorf("available = %d, want %d", avail, allowed-held)
 	}
 
 	// Throttle with 0 running → should go to 1
@@ -191,10 +210,14 @@ func TestConnGate_Throttle(t *testing.T) {
 
 	g.mu.Lock()
 	allowed = g.allowed
+	held = g.held
 	g.mu.Unlock()
 
 	if allowed != 1 {
 		t.Errorf("allowed = %d, want 1 (max(1, 0))", allowed)
+	}
+	if avail := g.available.Load(); avail != int32(allowed-held) {
+		t.Errorf("available = %d, want %d", avail, allowed-held)
 	}
 
 	// Throttle should only tighten, not loosen
@@ -207,10 +230,14 @@ func TestConnGate_Throttle(t *testing.T) {
 
 	g.mu.Lock()
 	allowed = g.allowed
+	held = g.held
 	g.mu.Unlock()
 
 	if allowed != 2 {
 		t.Errorf("allowed = %d, want 2 (should not loosen)", allowed)
+	}
+	if avail := g.available.Load(); avail != int32(allowed-held) {
+		t.Errorf("available = %d, want %d", avail, allowed-held)
 	}
 }
 
@@ -229,6 +256,9 @@ func TestConnGate_Restore(t *testing.T) {
 	if allowed != 1 {
 		t.Fatalf("allowed = %d, want 1 after throttle", allowed)
 	}
+	if avail := g.available.Load(); avail != 1 {
+		t.Fatalf("available = %d, want 1 after throttle (allowed=1, held=0)", avail)
+	}
 
 	// Wait for restore
 	time.Sleep(100 * time.Millisecond)
@@ -238,6 +268,9 @@ func TestConnGate_Restore(t *testing.T) {
 	g.mu.Unlock()
 	if allowed != 10 {
 		t.Errorf("allowed = %d, want 10 after restore", allowed)
+	}
+	if avail := g.available.Load(); avail != 10 {
+		t.Errorf("available = %d, want 10 after restore", avail)
 	}
 }
 
@@ -830,6 +863,36 @@ func TestNewClient_PingFailureDoesNotBlock(t *testing.T) {
 	}
 }
 
+// --- DispatchStrategy option wiring ---
+
+func TestNewClient_DefaultDispatchRoundRobin(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "host1:119", Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.dispatch != DispatchRoundRobin {
+		t.Errorf("dispatch = %d, want DispatchRoundRobin (%d)", c.dispatch, DispatchRoundRobin)
+	}
+}
+
+func TestNewClient_WithDispatchFIFO(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "host1:119", Connections: 1},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.dispatch != DispatchFIFO {
+		t.Errorf("dispatch = %d, want DispatchFIFO (%d)", c.dispatch, DispatchFIFO)
+	}
+}
+
 // --- AddProvider then Send integration ---
 
 func TestAddThenSend(t *testing.T) {
@@ -1102,5 +1165,170 @@ func TestTestProvider_DialError(t *testing.T) {
 	result := TestProvider(context.Background(), Provider{Factory: factory})
 	if result.Err == nil {
 		t.Fatal("expected error for dial failure")
+	}
+}
+
+// --- dynamic weighted round-robin tests ---
+
+// dynamicWeightedSelect mirrors the inline weight computation in sendWithRetry.
+// It returns the selected provider index for a given slot value.
+func dynamicWeightedSelect(groups []*providerGroup, slot int) int {
+	var cumWeights [8]int
+	totalW := 0
+	for i, g := range groups {
+		avail := max(1, int(g.gate.available.Load()))
+		totalW += avail
+		cumWeights[i] = totalW
+	}
+	s := slot % totalW
+	return sort.SearchInts(cumWeights[:len(groups)], s+1)
+}
+
+func TestDynamicWeights_Available(t *testing.T) {
+	// Provider 0: 50 available, Provider 1: 10 available.
+	// Distribution should be 50:10 = 5:1.
+	g0 := &providerGroup{gate: newConnGate(50, time.Minute)}
+	g1 := &providerGroup{gate: newConnGate(10, time.Minute)}
+	groups := []*providerGroup{g0, g1}
+
+	counts := [2]int{}
+	totalW := 60 // 50 + 10
+	for slot := range totalW {
+		idx := dynamicWeightedSelect(groups, slot)
+		counts[idx]++
+	}
+
+	if counts[0] != 50 {
+		t.Errorf("provider 0 got %d requests, want 50", counts[0])
+	}
+	if counts[1] != 10 {
+		t.Errorf("provider 1 got %d requests, want 10", counts[1])
+	}
+}
+
+func TestDynamicWeights_Saturated(t *testing.T) {
+	// All providers at available=0 → each gets weight 1 → equal distribution.
+	g0 := &providerGroup{gate: newConnGate(10, time.Minute)}
+	g1 := &providerGroup{gate: newConnGate(10, time.Minute)}
+	ctx := context.Background()
+
+	// Saturate both gates.
+	for range 10 {
+		g0.gate.enter(ctx, ctx)
+		g1.gate.enter(ctx, ctx)
+	}
+
+	if g0.gate.available.Load() != 0 {
+		t.Fatalf("g0.available = %d, want 0", g0.gate.available.Load())
+	}
+	if g1.gate.available.Load() != 0 {
+		t.Fatalf("g1.available = %d, want 0", g1.gate.available.Load())
+	}
+
+	groups := []*providerGroup{g0, g1}
+	counts := [2]int{}
+	totalW := 2 // weight 1 each
+	for slot := range totalW {
+		idx := dynamicWeightedSelect(groups, slot)
+		counts[idx]++
+	}
+
+	if counts[0] != 1 || counts[1] != 1 {
+		t.Errorf("saturated distribution = %v, want [1 1]", counts)
+	}
+}
+
+func TestDynamicWeights_Throttled(t *testing.T) {
+	// Provider 0: 50 max, not throttled → available=50.
+	// Provider 1: 50 max, throttled to 5 → available=5.
+	g0 := &providerGroup{gate: newConnGate(50, time.Minute)}
+	g1 := &providerGroup{gate: newConnGate(50, time.Minute)}
+
+	// Simulate throttle on g1: set running=5, then throttle.
+	g1.gate.mu.Lock()
+	g1.gate.running = 5
+	g1.gate.mu.Unlock()
+	g1.gate.throttle()
+
+	avail0 := int(g0.gate.available.Load())
+	avail1 := int(g1.gate.available.Load())
+	if avail0 != 50 {
+		t.Fatalf("g0 available = %d, want 50", avail0)
+	}
+	if avail1 != 5 {
+		t.Fatalf("g1 available = %d, want 5", avail1)
+	}
+
+	groups := []*providerGroup{g0, g1}
+	counts := [2]int{}
+	totalW := avail0 + avail1 // 55
+	for slot := range totalW {
+		idx := dynamicWeightedSelect(groups, slot)
+		counts[idx]++
+	}
+
+	if counts[0] != 50 {
+		t.Errorf("provider 0 got %d requests, want 50", counts[0])
+	}
+	if counts[1] != 5 {
+		t.Errorf("provider 1 got %d requests, want 5", counts[1])
+	}
+}
+
+func TestDynamicWeights_ThreeProviders(t *testing.T) {
+	g0 := &providerGroup{gate: newConnGate(50, time.Minute)}
+	g1 := &providerGroup{gate: newConnGate(10, time.Minute)}
+	g2 := &providerGroup{gate: newConnGate(20, time.Minute)}
+	groups := []*providerGroup{g0, g1, g2}
+
+	counts := [3]int{}
+	totalW := 80
+	for slot := range totalW {
+		idx := dynamicWeightedSelect(groups, slot)
+		counts[idx]++
+	}
+
+	if counts[0] != 50 || counts[1] != 10 || counts[2] != 20 {
+		t.Errorf("distribution = %v, want [50 10 20]", counts)
+	}
+}
+
+func TestDynamicWeights_SingleProvider(t *testing.T) {
+	g0 := &providerGroup{gate: newConnGate(50, time.Minute)}
+	groups := []*providerGroup{g0}
+
+	for slot := range 50 {
+		idx := dynamicWeightedSelect(groups, slot)
+		if idx != 0 {
+			t.Fatalf("slot %d mapped to idx %d, want 0", slot, idx)
+		}
+	}
+}
+
+func TestDynamicWeights_LargeN(t *testing.T) {
+	// Simulate 6000 requests across 2 providers (50+10 available).
+	g0 := &providerGroup{gate: newConnGate(50, time.Minute)}
+	g1 := &providerGroup{gate: newConnGate(10, time.Minute)}
+	groups := []*providerGroup{g0, g1}
+
+	const N = 6000
+	totalW := 60
+	counts := [2]int{}
+
+	for i := range N {
+		idx := dynamicWeightedSelect(groups, i%totalW)
+		counts[idx]++
+	}
+
+	wantP0 := N * 50 / totalW
+	wantP1 := N * 10 / totalW
+	if counts[0] != wantP0 || counts[1] != wantP1 {
+		t.Errorf("over %d requests: provider 0 = %d (want %d), provider 1 = %d (want %d)",
+			N, counts[0], wantP0, counts[1], wantP1)
+	}
+
+	pct0 := float64(counts[0]) / float64(N) * 100
+	if math.Abs(pct0-83.33) > 1.0 {
+		t.Errorf("provider 0 percentage = %.2f%%, want ~83.33%%", pct0)
 	}
 }

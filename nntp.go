@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -323,6 +324,7 @@ type connGate struct {
 	running      int // slots inside nc.Run()
 	restoreTimer *time.Timer
 	restoreDur   time.Duration
+	available    atomic.Int32 // allowed - held; updated under mu, read lock-free
 }
 
 func newConnGate(max int, restoreDur time.Duration) *connGate {
@@ -335,6 +337,7 @@ func newConnGate(max int, restoreDur time.Duration) *connGate {
 		restoreDur: restoreDur,
 	}
 	g.cond = sync.NewCond(&g.mu)
+	g.available.Store(int32(max))
 	return g
 }
 
@@ -364,12 +367,14 @@ func (g *connGate) enter(slotCtx, reqCtx context.Context) bool {
 		g.cond.Wait()
 	}
 	g.held++
+	g.available.Store(int32(g.allowed - g.held))
 	return true
 }
 
 func (g *connGate) exit() {
 	g.mu.Lock()
 	g.held--
+	g.available.Store(int32(g.allowed - g.held))
 	g.mu.Unlock()
 	g.cond.Broadcast()
 }
@@ -402,12 +407,14 @@ func (g *connGate) throttle() {
 		g.restoreTimer.Stop()
 	}
 	g.restoreTimer = time.AfterFunc(g.restoreDur, g.restore)
+	g.available.Store(int32(g.allowed - g.held))
 }
 
 func (g *connGate) restore() {
 	g.mu.Lock()
 	g.allowed = g.maxSlots
 	g.restoreTimer = nil
+	g.available.Store(int32(g.allowed - g.held))
 	g.mu.Unlock()
 	g.cond.Broadcast()
 }
@@ -825,6 +832,32 @@ func (c *NNTPConnection) readOneResponse(out io.Writer) (NNTPResponse, error) {
 	return resp, nil
 }
 
+// DispatchStrategy controls how the client distributes requests across main providers.
+type DispatchStrategy int
+
+const (
+	// DispatchRoundRobin distributes requests using dynamic weighted round-robin
+	// based on each provider's available capacity. This is the default.
+	DispatchRoundRobin DispatchStrategy = iota
+
+	// DispatchFIFO sends all requests to the first provider that has capacity.
+	// Overflow cascades to subsequent providers in declaration order.
+	DispatchFIFO
+)
+
+// ClientOption configures optional Client behavior.
+type ClientOption func(*clientConfig)
+
+type clientConfig struct {
+	dispatch DispatchStrategy
+}
+
+// WithDispatchStrategy sets the request distribution strategy for main providers.
+// The default is DispatchRoundRobin.
+func WithDispatchStrategy(s DispatchStrategy) ClientOption {
+	return func(cfg *clientConfig) { cfg.dispatch = s }
+}
+
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
 	Host            string
@@ -840,11 +873,14 @@ type Provider struct {
 }
 
 type providerGroup struct {
-	name   string
-	reqCh  chan *Request
-	gate   *connGate
-	stats  providerStats
-	cancel context.CancelFunc // cancels this group's slot goroutines
+	name     string
+	host     string // raw Provider.Host; empty for Factory-based providers
+	maxConns int
+	ctx      context.Context    // cancelled on removal/close
+	reqCh    chan *Request
+	gate     *connGate
+	stats    providerStats
+	cancel   context.CancelFunc // cancels this group's slot goroutines
 }
 
 type Client struct {
@@ -853,7 +889,9 @@ type Client struct {
 
 	mainGroups   atomic.Pointer[[]*providerGroup]
 	backupGroups atomic.Pointer[[]*providerGroup]
-	nextIdx      atomic.Uint64 // round-robin for mainGroups only
+	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
+
+	dispatch DispatchStrategy // set once by NewClient, read-only after
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
@@ -979,10 +1017,13 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
-		name:   name,
-		reqCh:  make(chan *Request, p.Connections),
-		gate:   gate,
-		cancel: gcancel,
+		name:     name,
+		host:     p.Host,
+		maxConns: p.Connections,
+		ctx:      gctx,
+		reqCh:    make(chan *Request, p.Connections),
+		gate:     gate,
+		cancel:   gcancel,
 	}
 
 	// Ping with a short timeout so we don't block forever.
@@ -998,7 +1039,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	return g
 }
 
-func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
+func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) (*Client, error) {
 	if len(providers) == 0 {
 		return nil, fmt.Errorf("nntp: at least one provider is required")
 	}
@@ -1030,9 +1071,15 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 
+	var cfg clientConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	c := &Client{
 		ctx:       ctx,
 		cancel:    cancel,
+		dispatch:  cfg.dispatch,
 		startTime: time.Now(),
 	}
 	// Initialize empty slices.
@@ -1054,14 +1101,15 @@ func NewClient(ctx context.Context, providers []Provider) (*Client, error) {
 	return c, nil
 }
 
-// Close cancels the client, closes all provider channels, and waits for all
+// Close cancels the client, stops all provider gates, and waits for all
 // connection slots to stop. Slots manage their own TCP connection cleanup.
+// Context cancellation (c.cancel) cascades to all group contexts, so closing
+// reqCh is unnecessary and avoids a race with stale-snapshot senders.
 func (c *Client) Close() error {
 	c.cancel()
 	for _, gs := range []*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
 		for _, g := range *gs {
 			g.gate.stop()
-			close(g.reqCh)
 		}
 	}
 	c.wg.Wait()
@@ -1083,6 +1131,20 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer,
 	return respCh
 }
 
+// hostSkipped reports whether host is already in the skip list.
+// Empty hosts (Factory-based providers) are never skipped.
+func hostSkipped(host string, skipHosts *[4]string, count int) bool {
+	if host == "" || count == 0 {
+		return false
+	}
+	for i := range count {
+		if skipHosts[i] == host {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
 	defer close(respCh)
 
@@ -1101,6 +1163,8 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 			return Response{}, false, true
 		case <-ctx.Done():
 			return Response{}, false, true
+		case <-g.ctx.Done():
+			return Response{}, false, false
 		case g.reqCh <- req:
 		}
 
@@ -1112,14 +1176,52 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	hasResp := false
 	var lastErr error
 
-	// 1. Try all main providers in round-robin order.
+	// Track hosts that returned 430 so we can skip other providers on
+	// the same server (different credentials won't help).
+	var skipHosts [4]string
+	skipCount := 0
+
+	// 1. Try all main providers.
 	mains := *c.mainGroups.Load()
 	n := len(mains)
-	start := int(c.nextIdx.Add(1) % uint64(n))
+	if n == 0 {
+		respCh <- Response{Err: errors.New("nntp: no main providers")}
+		return
+	}
+
+	// Pick start index based on dispatch strategy.
+	var start int
+	switch c.dispatch {
+	case DispatchFIFO:
+		// Priority order: first provider with available capacity,
+		// falling back to provider 0 if all are saturated.
+		for i, g := range mains {
+			if g.gate.available.Load() > 0 {
+				start = i
+				break
+			}
+		}
+	default: // DispatchRoundRobin
+		// Dynamic weighted round-robin: each provider's weight equals
+		// its available capacity (allowed - held).
+		var cumWeights [8]int // stack-allocated; covers up to 8 providers
+		totalW := 0
+		for i, g := range mains {
+			avail := max(1, int(g.gate.available.Load()))
+			totalW += avail
+			cumWeights[i] = totalW
+		}
+		slot := int(c.nextIdx.Add(1) % uint64(totalW))
+		start = sort.SearchInts(cumWeights[:n], slot+1)
+	}
 
 	for attempt := range n {
 		idx := (start + attempt) % n
-		resp, ok, cancelled := tryGroup(mains[idx])
+		g := mains[idx]
+		if hostSkipped(g.host, &skipHosts, skipCount) {
+			continue
+		}
+		resp, ok, cancelled := tryGroup(g)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
@@ -1137,6 +1239,11 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 			continue
 		}
 		if resp.StatusCode == 430 {
+			c.nextIdx.Add(1) // bias next request away from this provider
+			if g.host != "" && skipCount < len(skipHosts) {
+				skipHosts[skipCount] = g.host
+				skipCount++
+			}
 			lastResp = resp
 			hasResp = true
 			continue
@@ -1149,7 +1256,11 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	// 2. All main providers returned 430 (or died) — try backup providers in order.
 	backups := *c.backupGroups.Load()
 	for i := range backups {
-		resp, ok, cancelled := tryGroup(backups[i])
+		g := backups[i]
+		if hostSkipped(g.host, &skipHosts, skipCount) {
+			continue
+		}
+		resp, ok, cancelled := tryGroup(g)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
@@ -1272,10 +1383,11 @@ func (c *Client) RemoveProvider(name string) error {
 			if g.name != name {
 				continue
 			}
-			// Found it — cancel, stop gate, close channel.
+			// Found it — cancel context and stop gate. Context cancellation
+			// is sufficient; runConnSlot goroutines exit via ctx.Done() and
+			// tryGroup detects removal via g.ctx.Done().
 			g.cancel()
 			g.gate.stop()
-			close(g.reqCh)
 
 			// Copy-on-write removal.
 			updated := make([]*providerGroup, 0, len(*old)-1)
