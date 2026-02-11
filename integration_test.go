@@ -24,7 +24,7 @@ func TestNNTPConnection_Greeting(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
 	if err != nil {
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
@@ -39,7 +39,7 @@ func TestNNTPConnection_GreetingReject(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{}, nil, nil)
+	_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for 502 greeting")
 	}
@@ -72,7 +72,7 @@ func TestNNTPConnection_Auth(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{
 		Username: "testuser",
 		Password: "testpass",
 	}, nil, nil)
@@ -97,7 +97,7 @@ func TestNNTPConnection_AuthReject(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{
+	_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{
 		Username: "testuser",
 		Password: "wrongpass",
 	}, nil, nil)
@@ -120,7 +120,7 @@ func TestNNTPConnection_RunSingleRequest(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -162,7 +162,7 @@ func TestNNTPConnection_RunBodyRequest(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -224,7 +224,7 @@ func TestNNTPConnection_RunPipelined(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 3)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 3, reqCh, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 3, reqCh, nil, Auth{}, nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -269,7 +269,7 @@ func TestNNTPConnection_CancelledRequest(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -311,7 +311,7 @@ func TestNNTPConnection_IdleTimeout(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -937,7 +937,7 @@ func TestReadOneResponse(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -951,6 +951,53 @@ func TestReadOneResponse(t *testing.T) {
 	}
 	if len(resp.Lines) != 2 {
 		t.Errorf("Lines = %d, want 2", len(resp.Lines))
+	}
+}
+
+func TestClient_BodyPriority(t *testing.T) {
+	original := []byte("Hello priority body content for testing.")
+
+	factory := func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				if bytes.Contains(buf[:n], []byte("BODY")) {
+					_, _ = server.Write(yencSinglePart(original, "test.bin"))
+				} else {
+					// Respond to DATE and other commands so ping doesn't hang.
+					_, _ = server.Write([]byte("111 20260101120000\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	body, err := c.BodyPriority(ctx, "test@example.com")
+	if err != nil {
+		t.Fatalf("BodyPriority() error = %v", err)
+	}
+	if !bytes.Equal(body.Bytes, original) {
+		t.Errorf("BodyPriority() decoded %d bytes, want %d", len(body.Bytes), len(original))
+	}
+	if body.Encoding != EncodingYEnc {
+		t.Errorf("Encoding = %d, want %d (yEnc)", body.Encoding, EncodingYEnc)
 	}
 }
 
