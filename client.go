@@ -73,6 +73,24 @@ func (c *Client) Body(ctx context.Context, messageID string, onMeta ...func(YEnc
 	return body, err
 }
 
+// BodyPriority is like Body but enqueues on the priority channel so idle
+// connections pick it up before normal requests.
+func (c *Client) BodyPriority(ctx context.Context, messageID string, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
+	payload := []byte("BODY <" + messageID + ">\r\n")
+	var respCh <-chan Response
+	if len(onMeta) > 0 {
+		respCh = c.SendPriority(ctx, payload, nil, onMeta[0])
+	} else {
+		respCh = c.SendPriority(ctx, payload, nil)
+	}
+	body, err := c.finishBody(messageID, nil, respCh)
+	if body != nil {
+		body.Bytes = body.byteBuf
+		body.byteBuf = nil
+	}
+	return body, err
+}
+
 // BodyStream retrieves and decodes an article body, streaming decoded bytes to w.
 // The returned ArticleBody contains metadata but Bytes will be nil.
 // An optional onMeta callback is invoked with yEnc metadata before body decoding begins.
@@ -161,7 +179,11 @@ func (c *Client) doBody(ctx context.Context, messageID string, w io.Writer, onMe
 	} else {
 		respCh = c.Send(ctx, payload, w)
 	}
+	return c.finishBody(messageID, w, respCh)
+}
 
+// finishBody waits on respCh and builds the ArticleBody result.
+func (c *Client) finishBody(messageID string, w io.Writer, respCh <-chan Response) (*ArticleBody, error) {
 	resp := <-respCh
 	if resp.Err != nil {
 		return nil, resp.Err

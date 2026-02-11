@@ -102,6 +102,7 @@ type NNTPConnection struct {
 	cancel context.CancelFunc
 
 	reqCh   <-chan *Request
+	prioCh  <-chan *Request // priority channel; nil for standalone connections
 	pending chan *Request
 
 	inflightSem chan struct{}
@@ -147,7 +148,7 @@ func newNetConn(ctx context.Context, addr string, tlsConfig *tls.Config, keepAli
 	return conn, nil
 }
 
-func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, auth Auth, sharedBuf *readBuffer, stats *providerStats) (*NNTPConnection, error) {
+func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, prioCh <-chan *Request, auth Auth, sharedBuf *readBuffer, stats *providerStats) (*NNTPConnection, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -166,6 +167,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		ctx:         cctx,
 		cancel:      cancel,
 		reqCh:       reqCh,
+		prioCh:      prioCh,
 		pending:     make(chan *Request, inflightLimit),
 		inflightSem: make(chan struct{}, inflightLimit),
 		rb:          rb,
@@ -203,7 +205,7 @@ func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, 
 		return nil, err
 	}
 
-	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, auth, nil, nil)
+	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, nil, auth, nil, nil)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -437,7 +439,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, idleTimeout time.Duration, gate *connGate, stats *providerStats, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, idleTimeout time.Duration, gate *connGate, stats *providerStats, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -445,15 +447,27 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, factory ConnFactory
 
 	for {
 		// IDLE: wait for a request (zero TCP resources).
+		// Prefer priority requests over normal ones.
 		var firstReq *Request
 		var ok bool
 		select {
-		case firstReq, ok = <-reqCh:
+		case firstReq, ok = <-prioCh:
 			if !ok {
-				return // channel closed, shut down
+				return
 			}
-		case <-ctx.Done():
-			return
+		default:
+			select {
+			case firstReq, ok = <-prioCh:
+				if !ok {
+					return
+				}
+			case firstReq, ok = <-reqCh:
+				if !ok {
+					return // channel closed, shut down
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 
 		// Check if the request is already cancelled.
@@ -485,7 +499,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, factory ConnFactory
 			continue
 		}
 
-		nc, err := newNNTPConnectionFromConn(ctx, conn, inflight, reqCh, auth, &sharedBuf, stats)
+		nc, err := newNNTPConnectionFromConn(ctx, conn, inflight, reqCh, prioCh, auth, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
 			failRequest(firstReq.RespCh, err)
@@ -661,18 +675,36 @@ mainLoop:
 		}
 
 		// pull next request (with idle timeout)
+		// Prefer priority requests over normal ones when prioCh is set.
 		var req *Request
 		var ok bool
-		select {
-		case req, ok = <-c.reqCh:
-		case <-c.ctx.Done():
-			<-c.inflightSem
-			return
-		case <-idleCh:
-			// Idle timeout: release sem slot, drain in-flight, return.
-			<-c.inflightSem
-			c.waitForInflightDrain()
-			return
+		if c.prioCh != nil {
+			select {
+			case req, ok = <-c.prioCh:
+			default:
+				select {
+				case req, ok = <-c.prioCh:
+				case req, ok = <-c.reqCh:
+				case <-c.ctx.Done():
+					<-c.inflightSem
+					return
+				case <-idleCh:
+					<-c.inflightSem
+					c.waitForInflightDrain()
+					return
+				}
+			}
+		} else {
+			select {
+			case req, ok = <-c.reqCh:
+			case <-c.ctx.Done():
+				<-c.inflightSem
+				return
+			case <-idleCh:
+				<-c.inflightSem
+				c.waitForInflightDrain()
+				return
+			}
 		}
 		if !ok {
 			<-c.inflightSem
@@ -878,6 +910,7 @@ type providerGroup struct {
 	maxConns int
 	ctx      context.Context    // cancelled on removal/close
 	reqCh    chan *Request
+	prioCh   chan *Request // priority requests; connections prefer this over reqCh
 	gate     *connGate
 	stats    providerStats
 	cancel   context.CancelFunc // cancels this group's slot goroutines
@@ -1022,6 +1055,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		maxConns: p.Connections,
 		ctx:      gctx,
 		reqCh:    make(chan *Request, p.Connections),
+		prioCh:   make(chan *Request, p.Connections),
 		gate:     gate,
 		cancel:   gcancel,
 	}
@@ -1033,7 +1067,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, &c.wg)
 	}
 
 	return g
@@ -1131,6 +1165,23 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer,
 	return respCh
 }
 
+// SendPriority is like Send but enqueues the request on the priority channel,
+// so idle connections will pick it up before normal requests.
+func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response {
+	respCh := make(chan Response, 1)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var metaFn func(YEncMeta)
+	if len(onMeta) > 0 {
+		metaFn = onMeta[0]
+	}
+
+	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, true)
+	return respCh
+}
+
 // hostSkipped reports whether host is already in the skip list.
 // Empty hosts (Factory-based providers) are never skipped.
 func hostSkipped(host string, skipHosts *[4]string, count int) bool {
@@ -1146,6 +1197,10 @@ func hostSkipped(host string, skipHosts *[4]string, count int) bool {
 }
 
 func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
+	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, false)
+}
+
+func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool) {
 	defer close(respCh)
 
 	tryGroup := func(g *providerGroup) (resp Response, ok bool, done bool) {
@@ -1158,6 +1213,11 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 			OnMeta:     onMeta,
 		}
 
+		ch := g.reqCh
+		if priority {
+			ch = g.prioCh
+		}
+
 		select {
 		case <-c.ctx.Done():
 			return Response{}, false, true
@@ -1165,7 +1225,7 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 			return Response{}, false, true
 		case <-g.ctx.Done():
 			return Response{}, false, false
-		case g.reqCh <- req:
+		case ch <- req:
 		}
 
 		resp, ok = <-innerCh
