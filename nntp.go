@@ -101,9 +101,11 @@ type NNTPConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	reqCh   <-chan *Request
-	prioCh  <-chan *Request // priority channel; nil for standalone connections
-	pending chan *Request
+	reqCh      <-chan *Request
+	prioCh     <-chan *Request // priority channel; nil for standalone connections
+	hotReqCh   <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotPrioCh  <-chan *Request // unbuffered; set by runConnSlot before Run()
+	pending    chan *Request
 
 	inflightSem chan struct{}
 
@@ -439,7 +441,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, idleTimeout time.Duration, gate *connGate, stats *providerStats, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, idleTimeout time.Duration, gate *connGate, stats *providerStats, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -527,6 +529,8 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// ACTIVE: run the connection with the bootstrap request.
 		nc.firstReq = firstReq
 		nc.idleTimeout = idleTimeout
+		nc.hotReqCh = hotReqCh
+		nc.hotPrioCh = hotPrioCh
 		gate.markRunning()
 		nc.Run() // blocks until death or idle timeout
 		gate.markNotRunning()
@@ -675,23 +679,35 @@ mainLoop:
 		}
 
 		// pull next request (with idle timeout)
-		// Prefer priority requests over normal ones when prioCh is set.
+		// Hot channels are tried first (non-blocking) so that requests
+		// prefer already-connected connections over waking cold slots.
+		// When hotReqCh/hotPrioCh are nil (standalone path), receives
+		// from nil channels block forever in select and are excluded.
 		var req *Request
 		var ok bool
 		if c.prioCh != nil {
+			// Try hot priority (non-blocking).
 			select {
-			case req, ok = <-c.prioCh:
+			case req, ok = <-c.hotPrioCh:
 			default:
+				// Try hot normal (non-blocking).
 				select {
-				case req, ok = <-c.prioCh:
-				case req, ok = <-c.reqCh:
-				case <-c.ctx.Done():
-					<-c.inflightSem
-					return
-				case <-idleCh:
-					<-c.inflightSem
-					c.waitForInflightDrain()
-					return
+				case req, ok = <-c.hotReqCh:
+				default:
+					// Blocking: wait on all channels.
+					select {
+					case req, ok = <-c.hotPrioCh:
+					case req, ok = <-c.hotReqCh:
+					case req, ok = <-c.prioCh:
+					case req, ok = <-c.reqCh:
+					case <-c.ctx.Done():
+						<-c.inflightSem
+						return
+					case <-idleCh:
+						<-c.inflightSem
+						c.waitForInflightDrain()
+						return
+					}
 				}
 			}
 		} else {
@@ -911,6 +927,8 @@ type providerGroup struct {
 	ctx      context.Context    // cancelled on removal/close
 	reqCh    chan *Request
 	prioCh   chan *Request // priority requests; connections prefer this over reqCh
+	hotReqCh  chan *Request // unbuffered; hot (connected) connections read this
+	hotPrioCh chan *Request // unbuffered; hot priority connections read this
 	gate     *connGate
 	stats    providerStats
 	cancel   context.CancelFunc // cancels this group's slot goroutines
@@ -1050,14 +1068,16 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
-		name:     name,
-		host:     p.Host,
-		maxConns: p.Connections,
-		ctx:      gctx,
-		reqCh:    make(chan *Request, p.Connections),
-		prioCh:   make(chan *Request, p.Connections),
-		gate:     gate,
-		cancel:   gcancel,
+		name:      name,
+		host:      p.Host,
+		maxConns:  p.Connections,
+		ctx:       gctx,
+		reqCh:     make(chan *Request, p.Connections),
+		prioCh:    make(chan *Request, p.Connections),
+		hotReqCh:  make(chan *Request),
+		hotPrioCh: make(chan *Request),
+		gate:      gate,
+		cancel:    gcancel,
 	}
 
 	// Ping with a short timeout so we don't block forever.
@@ -1067,7 +1087,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, &c.wg)
 	}
 
 	return g
@@ -1213,19 +1233,31 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			OnMeta:     onMeta,
 		}
 
-		ch := g.reqCh
+		var hotCh chan *Request
+		var coldCh chan *Request
 		if priority {
-			ch = g.prioCh
+			hotCh = g.hotPrioCh
+			coldCh = g.prioCh
+		} else {
+			hotCh = g.hotReqCh
+			coldCh = g.reqCh
 		}
 
+		// Try hot channel first (non-blocking): succeeds only if a
+		// hot connection is already waiting with inflight capacity.
 		select {
-		case <-c.ctx.Done():
-			return Response{}, false, true
-		case <-ctx.Done():
-			return Response{}, false, true
-		case <-g.ctx.Done():
-			return Response{}, false, false
-		case ch <- req:
+		case hotCh <- req:
+		default:
+			// No hot connection available — send to cold channel.
+			select {
+			case <-c.ctx.Done():
+				return Response{}, false, true
+			case <-ctx.Done():
+				return Response{}, false, true
+			case <-g.ctx.Done():
+				return Response{}, false, false
+			case coldCh <- req:
+			}
 		}
 
 		resp, ok = <-innerCh
