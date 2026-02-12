@@ -954,6 +954,145 @@ func TestReadOneResponse(t *testing.T) {
 	}
 }
 
+func TestClient_HotConnectionPreference(t *testing.T) {
+	// With Connections: 4, after establishing one hot connection all
+	// subsequent sequential requests should reuse it (no new dials).
+	var dials atomic.Int64
+
+	factory := func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				cmd := string(buf[:n])
+				if bytes.HasPrefix(buf[:n], []byte("DATE")) {
+					_, _ = server.Write([]byte("111 20260101120000\r\n"))
+				} else {
+					_ = cmd
+					_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 4},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Ping uses 1 dial. Record the baseline after client creation.
+	baseline := dials.Load()
+
+	// First request: establishes 1 hot connection (cold slot wakeup).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	cancel()
+	if resp.Err != nil {
+		t.Fatalf("Send() error = %v", resp.Err)
+	}
+	afterFirst := dials.Load() - baseline
+	if afterFirst != 1 {
+		t.Fatalf("after first request: new dials = %d, want 1", afterFirst)
+	}
+
+	// Five more sequential requests — should all reuse the hot connection.
+	for i := range 5 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		cancel()
+		if resp.Err != nil {
+			t.Fatalf("Send()[%d] error = %v", i, resp.Err)
+		}
+	}
+
+	if got := dials.Load() - baseline; got != 1 {
+		t.Errorf("after 6 sequential requests: new dials = %d, want 1", got)
+	}
+}
+
+func TestClient_ColdWakeupOnSaturation(t *testing.T) {
+	// With Connections: 4, Inflight: 1, concurrent requests that exceed
+	// a single connection's inflight capacity must wake cold slots.
+	var dials atomic.Int64
+
+	// slowServer blocks STAT requests until released via gate.
+	// DATE (ping) and other commands respond immediately.
+	gate := make(chan struct{}, 4)
+	factory := func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				if bytes.HasPrefix(buf[:n], []byte("DATE")) {
+					_, _ = server.Write([]byte("111 20260101120000\r\n"))
+				} else {
+					// Wait for the gate before responding to STAT.
+					<-gate
+					_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 4, Inflight: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Ping uses 1 dial. Record baseline.
+	baseline := dials.Load()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Send 2 concurrent requests.
+	ch1 := c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	// Small delay so the first request is picked up and the connection
+	// becomes hot before we send the second one.
+	time.Sleep(50 * time.Millisecond)
+	ch2 := c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+
+	// Give time for cold slot to wake and dial.
+	time.Sleep(200 * time.Millisecond)
+
+	if got := dials.Load() - baseline; got < 2 {
+		t.Errorf("concurrent requests: new dials = %d, want >= 2", got)
+	}
+
+	// Release both.
+	gate <- struct{}{}
+	gate <- struct{}{}
+
+	resp1 := <-ch1
+	resp2 := <-ch2
+	if resp1.Err != nil {
+		t.Fatalf("Send()[0] error = %v", resp1.Err)
+	}
+	if resp2.Err != nil {
+		t.Fatalf("Send()[1] error = %v", resp2.Err)
+	}
+}
+
 func TestClient_BodyPriority(t *testing.T) {
 	original := []byte("Hello priority body content for testing.")
 
