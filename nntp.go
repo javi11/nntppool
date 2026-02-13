@@ -1249,14 +1249,29 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		case hotCh <- req:
 		default:
 			// No hot connection available — send to cold channel.
-			select {
-			case <-c.ctx.Done():
-				return Response{}, false, true
-			case <-ctx.Done():
-				return Response{}, false, true
-			case <-g.ctx.Done():
-				return Response{}, false, false
-			case coldCh <- req:
+			if c.dispatch == DispatchFIFO {
+				// FIFO: non-blocking so full channels overflow to next provider.
+				select {
+				case <-c.ctx.Done():
+					return Response{}, false, true
+				case <-ctx.Done():
+					return Response{}, false, true
+				case <-g.ctx.Done():
+					return Response{}, false, false
+				case coldCh <- req:
+				default:
+					return Response{}, false, false
+				}
+			} else {
+				select {
+				case <-c.ctx.Done():
+					return Response{}, false, true
+				case <-ctx.Done():
+					return Response{}, false, true
+				case <-g.ctx.Done():
+					return Response{}, false, false
+				case coldCh <- req:
+				}
 			}
 		}
 
