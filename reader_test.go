@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,6 +47,38 @@ func TestFeed_SingleLineResponse(t *testing.T) {
 				t.Errorf("consumed = %d, want %d", consumed, len(tt.input))
 			}
 		})
+	}
+}
+
+func TestFeed_BinaryData(t *testing.T) {
+	// Simulate TLS/plaintext mismatch: binary garbage instead of a text response.
+	binary := []byte{0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01,
+		0xfc, 0x03, 0x03, 0xab, 0xcd, 0xef, 0x12, 0x34,
+		0x56, 0x78, 0x9a, 0xbc}
+	input := append(binary, []byte("\r\n")...)
+
+	r := &NNTPResponse{}
+	consumed, done, err := r.Feed(input, io.Discard)
+	if err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if !done {
+		t.Error("expected done=true for unparseable response")
+	}
+	if r.StatusCode != 0 {
+		t.Errorf("StatusCode = %d, want 0", r.StatusCode)
+	}
+	if consumed != len(input) {
+		t.Errorf("consumed = %d, want %d", consumed, len(input))
+	}
+	if !strings.Contains(r.Message, "unexpected binary data") {
+		t.Errorf("Message = %q, should contain 'unexpected binary data'", r.Message)
+	}
+	if !strings.Contains(r.Message, "hex:") {
+		t.Errorf("Message = %q, should contain hex dump", r.Message)
+	}
+	if !strings.Contains(r.Message, "TLS/plaintext mismatch") {
+		t.Errorf("Message = %q, should contain diagnostic hint", r.Message)
 	}
 }
 

@@ -1327,7 +1327,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			continue
 		}
 		if resp.Err != nil {
-			lastErr = resp.Err
+			lastErr = fmt.Errorf("%s: %w", g.name, resp.Err)
 			continue
 		}
 		if resp.StatusCode == 430 {
@@ -1365,7 +1365,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			continue
 		}
 		if resp.Err != nil {
-			lastErr = resp.Err
+			lastErr = fmt.Errorf("%s: %w", g.name, resp.Err)
 			continue
 		}
 		// Deliver whatever backup returns (including 430).
