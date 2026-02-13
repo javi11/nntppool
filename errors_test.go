@@ -123,7 +123,7 @@ func TestToError(t *testing.T) {
 
 func TestGreetingError_Error(t *testing.T) {
 	e := &greetingError{StatusCode: 502, Message: "service permanently unavailable"}
-	want := "unexpected nntp greeting: service permanently unavailable"
+	want := "nntp greeting: 502 service permanently unavailable"
 	if got := e.Error(); got != want {
 		t.Errorf("greetingError.Error() = %q, want %q", got, want)
 	}
