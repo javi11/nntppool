@@ -846,6 +846,11 @@ func (c *NNTPConnection) readerLoop() {
 			}
 		}
 
+		// Release inflight slot BEFORE delivering the response so the
+		// writer goroutine can loop back to the hot-channel select before
+		// the caller (unblocked by the delivery below) sends the next request.
+		<-c.inflightSem
+
 		if deliver {
 			// Best effort: don't block forever if the receiver abandoned the channel.
 			select {
@@ -854,9 +859,6 @@ func (c *NNTPConnection) readerLoop() {
 			}
 		}
 		safeClose(req.RespCh)
-
-		// release inflight slot
-		<-c.inflightSem
 
 		// If we hit a timeout or cancellation-related network error, close the connection.
 		if resp.Err != nil {
