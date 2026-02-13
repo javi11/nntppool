@@ -99,9 +99,14 @@ func (r *NNTPResponse) decode(buf []byte, out io.Writer) (read int, err error) {
 
 			if r.Format == rapidyenc.FormatUnknown {
 				if r.StatusCode == 0 && len(line) >= 3 {
-					r.Message = string(line)
 					r.StatusCode, err = strconv.Atoi(string(line[:3]))
-					if err != nil || !isMultiline(r.StatusCode) {
+					if err != nil {
+						r.Message = formatBinaryHint(line)
+						r.eof = true
+						break
+					}
+					r.Message = string(line)
+					if !isMultiline(r.StatusCode) {
 						r.eof = true
 						break
 					}
@@ -255,6 +260,14 @@ func decodeUUChar(c byte) int {
 
 func isMultiline(code int) bool {
 	return code == nntpBody || code == nntpArtiicle || code == nntpHead || code == nntpCapabilities
+}
+
+func formatBinaryHint(line []byte) string {
+	n := min(len(line), 16)
+	return fmt.Sprintf(
+		"unexpected binary data (%d bytes, hex: %x); likely TLS/plaintext mismatch or wrong port",
+		len(line), line[:n],
+	)
 }
 
 func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error) {
