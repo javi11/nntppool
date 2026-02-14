@@ -1007,6 +1007,9 @@ func TestClient_HotConnectionPreference(t *testing.T) {
 
 	// Five more sequential requests — should all reuse the hot connection.
 	for i := range 5 {
+		// Small yield so the writer loop re-enters its hot channel select
+		// after completing the previous response cycle.
+		time.Sleep(10 * time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
 		cancel()
