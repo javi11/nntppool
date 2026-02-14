@@ -2,10 +2,12 @@ package nntppool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -974,8 +976,11 @@ func TestSend_FactoryErrorPropagates(t *testing.T) {
 	if resp.Err == nil {
 		t.Fatal("expected error from Send when factory fails")
 	}
-	if resp.Err.Error() != dialErr.Error() {
-		t.Errorf("got error %q, want %q", resp.Err, dialErr)
+	if !errors.Is(resp.Err, dialErr) {
+		t.Errorf("got error %q, want it to wrap %q", resp.Err, dialErr)
+	}
+	if !strings.Contains(resp.Err.Error(), "provider-0") {
+		t.Errorf("error %q should contain provider name", resp.Err)
 	}
 }
 

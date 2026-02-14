@@ -50,7 +50,7 @@ type greetingError struct {
 }
 
 func (e *greetingError) Error() string {
-	return fmt.Sprintf("unexpected nntp greeting: %s", e.Message)
+	return fmt.Sprintf("nntp greeting: %d %s", e.StatusCode, e.Message)
 }
 
 func (e *greetingError) Is(target error) bool {
@@ -113,8 +113,9 @@ type NNTPConnection struct {
 
 	Greeting NNTPResponse
 
-	firstReq    *Request      // bootstrap request from connection slot
-	idleTimeout time.Duration // 0 = no idle timeout
+	firstReq     *Request      // bootstrap request from connection slot
+	idleTimeout  time.Duration // 0 = no idle timeout
+	providerName string        // set by runConnSlot; used for error context
 
 	stats *providerStats // nil for standalone connections
 
@@ -190,7 +191,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	// Optional AUTHINFO handshake.
 	if auth.Username != "" {
 		if auth.Password == "" {
-			return nil, fmt.Errorf("password required when username is set")
+			return nil, fmt.Errorf("nntp auth: password required when username is set")
 		}
 
 		if err := c.auth(auth); err != nil {
@@ -218,11 +219,11 @@ func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, 
 func (c *NNTPConnection) auth(auth Auth) error {
 	// AUTHINFO USER
 	if _, err := fmt.Fprintf(c.conn, "AUTHINFO USER %s\r\n", auth.Username); err != nil {
-		return fmt.Errorf("authinfo user: %w", err)
+		return fmt.Errorf("nntp auth: AUTHINFO USER: %w", err)
 	}
 	resp, err := c.readOneResponse(io.Discard)
 	if err != nil {
-		return fmt.Errorf("authinfo user response: %w", err)
+		return fmt.Errorf("nntp auth: AUTHINFO USER: %w", err)
 	}
 
 	switch resp.StatusCode {
@@ -231,19 +232,19 @@ func (c *NNTPConnection) auth(auth Auth) error {
 	case 381:
 		// need pass
 	default:
-		return fmt.Errorf("authinfo user unexpected response: %s", resp.Message)
+		return fmt.Errorf("nntp auth: unexpected response to AUTHINFO USER: %s", resp.Message)
 	}
 
 	// AUTHINFO PASS
 	if _, err := fmt.Fprintf(c.conn, "AUTHINFO PASS %s\r\n", auth.Password); err != nil {
-		return fmt.Errorf("authinfo pass: %w", err)
+		return fmt.Errorf("nntp auth: AUTHINFO PASS: %w", err)
 	}
 	resp, err = c.readOneResponse(io.Discard)
 	if err != nil {
-		return fmt.Errorf("authinfo pass response: %w", err)
+		return fmt.Errorf("nntp auth: AUTHINFO PASS: %w", err)
 	}
 	if resp.StatusCode != 281 {
-		return fmt.Errorf("authinfo pass unexpected response: %s", resp.Message)
+		return fmt.Errorf("nntp auth: unexpected response to AUTHINFO PASS: %s", resp.Message)
 	}
 	return nil
 }
@@ -270,13 +271,17 @@ func failRequest(ch chan Response, err error) {
 
 func (c *NNTPConnection) failOutstanding() {
 	c.failMu.Do(func() {
+		connErr := error(ErrConnectionDied)
+		if c.providerName != "" {
+			connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
+		}
 		for {
 			select {
 			case req := <-c.pending:
 				if req == nil {
 					continue
 				}
-				failRequest(req.RespCh, ErrConnectionDied)
+				failRequest(req.RespCh, connErr)
 				// Best-effort inflight release (not strictly needed once we're shutting down).
 				select {
 				case <-c.inflightSem:
@@ -441,7 +446,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, idleTimeout time.Duration, gate *connGate, stats *providerStats, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, idleTimeout time.Duration, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -491,7 +496,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		conn, err := factory(ctx)
 		if err != nil {
 			gate.exit()
-			failRequest(firstReq.RespCh, err)
+			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
 			// Backoff before retrying to avoid thrashing.
 			select {
 			case <-time.After(connFailureBackoff):
@@ -504,7 +509,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc, err := newNNTPConnectionFromConn(ctx, conn, inflight, reqCh, prioCh, auth, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
-			failRequest(firstReq.RespCh, err)
+			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
 
 			if errors.Is(err, ErrMaxConnections) {
 				// Server said "max connections" — throttle and use longer backoff.
@@ -529,6 +534,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// ACTIVE: run the connection with the bootstrap request.
 		nc.firstReq = firstReq
 		nc.idleTimeout = idleTimeout
+		nc.providerName = providerName
 		nc.hotReqCh = hotReqCh
 		nc.hotPrioCh = hotPrioCh
 		gate.markRunning()
@@ -1087,7 +1093,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.IdleTimeout, gate, &g.stats, name, &c.wg)
 	}
 
 	return g
@@ -1377,7 +1383,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	if hasResp {
 		respCh <- lastResp
 	} else if lastErr != nil {
-		respCh <- Response{Err: lastErr}
+		respCh <- Response{Err: fmt.Errorf("nntp: all providers exhausted: %w", lastErr)}
 	} else {
 		respCh <- Response{Err: errors.New("nntp: all providers exhausted")}
 	}
