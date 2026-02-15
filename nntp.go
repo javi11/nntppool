@@ -68,6 +68,13 @@ type Request struct {
 
 	// Optional: called with yEnc metadata once =ybegin/=ypart headers are parsed, before body decoding.
 	OnMeta func(YEncMeta)
+
+	// PayloadBody is an optional reader streamed to the connection after Payload.
+	// Used by POST to stream article content without buffering in memory.
+	PayloadBody io.Reader
+
+	// PostMode signals readerLoop to expect two NNTP responses (340 + 240/441).
+	PostMode bool
 }
 
 type Response struct {
@@ -636,6 +643,15 @@ func (c *NNTPConnection) Run() {
 			c.failOutstanding()
 			return
 		}
+		if req.PayloadBody != nil {
+			if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+				<-c.inflightSem
+				failRequest(req.RespCh, err)
+				_ = c.conn.Close()
+				c.failOutstanding()
+				return
+			}
+		}
 	}
 
 mainLoop:
@@ -771,6 +787,15 @@ mainLoop:
 			c.failOutstanding()
 			return
 		}
+		if req.PayloadBody != nil {
+			if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+				<-c.inflightSem
+				failRequest(req.RespCh, err)
+				_ = c.conn.Close()
+				c.failOutstanding()
+				return
+			}
+		}
 	}
 }
 
@@ -840,6 +865,27 @@ func (c *NNTPConnection) readerLoop() {
 		resp.Status = decoder.Message
 		resp.Lines = decoder.Lines
 		resp.Meta = decoder
+
+		// Two-phase POST: if server accepted with 340, read the final response (240/441).
+		if req.PostMode && decoder.StatusCode == 340 {
+			decoder2 := NNTPResponse{}
+			err2 := c.rb.feedUntilDone(c.conn, &decoder2, io.Discard, func() (time.Time, bool) {
+				if deliver {
+					select {
+					case <-req.Ctx.Done():
+						deliver = false
+					default:
+					}
+				}
+				return req.Ctx.Deadline()
+			})
+			if err2 != nil {
+				resp.Err = err2
+			}
+			resp.StatusCode = decoder2.StatusCode
+			resp.Status = decoder2.Message
+			resp.Meta = decoder2
+		}
 
 		if c.stats != nil {
 			c.stats.BytesConsumed.Add(int64(decoder.BytesConsumed))
