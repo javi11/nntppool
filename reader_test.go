@@ -367,6 +367,38 @@ func TestDetectFormat_ArticleVsBody(t *testing.T) {
 	// With hasEmptyline, detection should work the same as BODY
 }
 
+func TestDetectFormat_BacktickFirstChar(t *testing.T) {
+	// Test that a line starting with backtick (which encodes length 0)
+	// doesn't panic and correctly skips UU detection
+	r := &NNTPResponse{
+		StatusCode:   nntpBody,
+		hasEmptyline: false,
+	}
+
+	// Backtick character (ASCII 96) - decodeUUChar returns 0
+	line := []byte("`hello world")
+
+	// Should not panic
+	r.detectFormat(line)
+
+	// Should not detect as UU format (length 0 is invalid for UU body)
+	if r.Format == rapidyenc.FormatUU {
+		t.Error("line starting with backtick should not be detected as UU format")
+	}
+}
+
+func TestDetectFormat_EmptyLine(t *testing.T) {
+	// Test empty line doesn't panic
+	r := &NNTPResponse{
+		StatusCode:   nntpBody,
+		hasEmptyline: false,
+	}
+
+	// Should not panic (protected by len(line) <= 1 check at line 193)
+	r.detectFormat([]byte{})
+	r.detectFormat([]byte{' '})
+}
+
 // --- processYencHeader ---
 
 func TestProcessYencHeader(t *testing.T) {
