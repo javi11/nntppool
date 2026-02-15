@@ -206,7 +206,7 @@ func (r *NNTPResponse) detectFormat(line []byte) {
 		decodeUUCharWorkaround(first),
 		decodeUUChar(first),
 	} {
-		if n < length {
+		if n < length || length <= 0 {
 			continue
 		}
 
