@@ -2,6 +2,7 @@ package nntppool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -265,4 +266,120 @@ func parseHeaders(lines []string) map[string][]string {
 	}
 
 	return headers
+}
+
+// PostYenc sends a yEnc-encoded article to the server using the NNTP POST command.
+// The body is yEnc-encoded on the fly using the provided metadata. yEnc encoding
+// avoids '.' at start of lines, so no dot-stuffing is needed.
+// The body reader is consumed exactly once; on failure, the caller must retry
+// with a fresh reader.
+func (c *Client) PostYenc(ctx context.Context, headers PostHeaders, body io.Reader, meta rapidyenc.Meta) (*PostResult, error) {
+	pr, pw := io.Pipe()
+	go func() {
+		var err error
+		defer func() { _ = pw.CloseWithError(err) }()
+
+		if _, err = headers.WriteTo(pw); err != nil {
+			return
+		}
+		var enc *rapidyenc.Encoder
+		enc, err = rapidyenc.NewEncoder(pw, meta)
+		if err != nil {
+			return
+		}
+		if _, err = io.Copy(enc, body); err != nil {
+			return
+		}
+		if err = enc.Close(); err != nil {
+			return
+		}
+		_, err = pw.Write([]byte("\r\n.\r\n"))
+	}()
+
+	respCh := c.sendPost(ctx, pr)
+	return c.finishPost(respCh)
+}
+
+// sendPost dispatches a POST request to the first available main provider.
+// POST uses FIFO dispatch (no backup fallback, no retry on protocol errors).
+func (c *Client) sendPost(ctx context.Context, payloadBody io.Reader) <-chan Response {
+	respCh := make(chan Response, 1)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go c.doSendPost(ctx, payloadBody, respCh)
+	return respCh
+}
+
+func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh chan Response) {
+	defer close(respCh)
+
+	mains := *c.mainGroups.Load()
+	if len(mains) == 0 {
+		respCh <- Response{Err: errors.New("nntp: no main providers")}
+		return
+	}
+
+	// FIFO: try providers in order until one accepts.
+	var lastErr error
+	for _, g := range mains {
+		innerCh := make(chan Response, 1)
+		req := &Request{
+			Ctx:         ctx,
+			Payload:     []byte("POST\r\n"),
+			RespCh:      innerCh,
+			PayloadBody: payloadBody,
+			PostMode:    true,
+		}
+
+		// Try hot channel first (non-blocking), then cold channel.
+		select {
+		case g.hotReqCh <- req:
+		default:
+			select {
+			case <-c.ctx.Done():
+				respCh <- Response{Err: c.ctx.Err()}
+				return
+			case <-ctx.Done():
+				respCh <- Response{Err: ctx.Err()}
+				return
+			case <-g.ctx.Done():
+				continue
+			case g.reqCh <- req:
+			}
+		}
+
+		resp, ok := <-innerCh
+		if !ok {
+			continue
+		}
+		if resp.Err != nil {
+			lastErr = resp.Err
+			continue
+		}
+		// Deliver whatever status we got (240, 440, 441, etc.).
+		respCh <- resp
+		return
+	}
+
+	if lastErr != nil {
+		respCh <- Response{Err: fmt.Errorf("nntp: post failed: %w", lastErr)}
+	} else {
+		respCh <- Response{Err: errors.New("nntp: post failed: all providers exhausted")}
+	}
+}
+
+// finishPost waits for the POST response and maps status codes to errors.
+func (c *Client) finishPost(respCh <-chan Response) (*PostResult, error) {
+	resp := <-respCh
+	if resp.Err != nil {
+		return nil, resp.Err
+	}
+	if err := toError(resp.StatusCode, resp.Status); err != nil {
+		return nil, err
+	}
+	return &PostResult{
+		StatusCode: resp.StatusCode,
+		Status:     resp.Status,
+	}, nil
 }

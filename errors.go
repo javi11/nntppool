@@ -36,6 +36,8 @@ func errorCategory(code int) int {
 
 var (
 	ErrArticleNotFound    = &Error{Code: 430, Message: "no such article"}
+	ErrPostingNotPermitted = &Error{Code: 440, Message: "posting not permitted"}
+	ErrPostingFailed       = &Error{Code: 441, Message: "posting failed"}
 	ErrAuthRequired       = &Error{Code: 480, Message: "authentication required"}
 	ErrAuthRejected       = &Error{Code: 481, Message: "authentication rejected"}
 	ErrServiceUnavailable = &Error{Code: 502, Message: "service unavailable"}
@@ -49,6 +51,10 @@ func toError(code int, status string) error {
 		return nil
 	case code == 423 || code == 430:
 		return ErrArticleNotFound
+	case code == 440:
+		return ErrPostingNotPermitted
+	case code == 441:
+		return ErrPostingFailed
 	case code == 480:
 		return ErrAuthRequired
 	case code == 481:
