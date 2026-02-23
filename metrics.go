@@ -25,17 +25,18 @@ type providerStats struct {
 type ProviderStats struct {
 	Name              string
 	AvgSpeed          float64 // bytes/sec average since client start
+	BytesConsumed     int64   // raw wire bytes consumed since client start
 	Missing           int64
 	Errors            int64
 	ActiveConnections int // currently running connections
 	MaxConnections    int // configured connection slots
 	Ping              PingResult
-
 }
 
 // ClientStats is an aggregate snapshot of all provider metrics.
 type ClientStats struct {
-	Providers []ProviderStats
-	AvgSpeed  float64       // total bytes/sec across all providers
-	Elapsed   time.Duration // time since client creation
+	Providers     []ProviderStats
+	AvgSpeed      float64       // total bytes/sec across all providers
+	BytesConsumed int64         // raw wire bytes consumed across all providers
+	Elapsed       time.Duration // time since client creation
 }
