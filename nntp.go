@@ -1488,6 +1488,7 @@ func (c *Client) Stats() ClientStats {
 			maxSlots, running := g.gate.snapshot()
 			ps := ProviderStats{
 				Name:              g.name,
+				BytesConsumed:     consumed,
 				Missing:           g.stats.Missing.Load(),
 				Errors:            g.stats.Errors.Load(),
 				ActiveConnections: running,
@@ -1500,6 +1501,7 @@ func (c *Client) Stats() ClientStats {
 			cs.Providers = append(cs.Providers, ps)
 		}
 	}
+	cs.BytesConsumed = totalBytes
 	if secs > 0 {
 		cs.AvgSpeed = float64(totalBytes) / secs
 	}

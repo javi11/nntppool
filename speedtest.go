@@ -131,6 +131,7 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 	}()
 
 	// Fan-out: dispatch all segment requests.
+	testStart := time.Now()
 	respChans := make([]<-chan Response, totalSegs)
 	for i, seg := range segments {
 		payload := append(append([]byte("BODY <"), seg.MessageID...), ">\r\n"...)
@@ -149,13 +150,14 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 		}
 		segsDone.Add(1)
 	}
+	testElapsed := time.Since(testStart)
 
 	stCancel() // stop progress goroutine
 	<-progressDone
 
 	// Snapshot stats at end for delta computation.
 	endStats := c.Stats()
-	elapsed := endStats.Elapsed - startStats.Elapsed
+	elapsed := testElapsed
 	wireBytes := totalWireBytes(endStats) - totalWireBytes(startStats)
 
 	var wireSpeed float64
@@ -300,18 +302,16 @@ func loadSpeedTestSegments(ctx context.Context, opts SpeedTestOptions) ([]nzb.Se
 	return n.AllSegments(), nil
 }
 
-// totalWireBytes sums BytesConsumed from the raw atomic counters via Stats snapshot.
-// We compute it from the per-provider stats in the snapshot.
+// totalWireBytes returns the raw BytesConsumed counter from a stats snapshot.
 func totalWireBytes(s ClientStats) int64 {
-	// Stats.AvgSpeed * Elapsed gives total wire bytes.
-	return int64(s.AvgSpeed * s.Elapsed.Seconds())
+	return s.BytesConsumed
 }
 
-// providerWireBytes returns the wire bytes for a named provider from a stats snapshot.
+// providerWireBytes returns the raw BytesConsumed for a named provider from a stats snapshot.
 func providerWireBytes(s ClientStats, name string) int64 {
 	for _, ps := range s.Providers {
 		if ps.Name == name {
-			return int64(ps.AvgSpeed * s.Elapsed.Seconds())
+			return ps.BytesConsumed
 		}
 	}
 	return 0
