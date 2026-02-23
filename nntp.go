@@ -933,6 +933,14 @@ func (c *NNTPConnection) readerLoop() {
 				return
 			}
 		}
+
+		// 502 "service unavailable" mid-session: close the connection so
+		// all pending requests fail fast instead of waiting in the pipeline.
+		if decoder.StatusCode == 502 {
+			_ = c.conn.Close()
+			c.failOutstanding()
+			return
+		}
 	}
 }
 
@@ -1396,6 +1404,13 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			lastErr = resp.Err
 			continue
 		}
+		if resp.StatusCode == 502 {
+			// Provider returned "service unavailable" — remove it from the
+			// pool immediately so no further requests are routed to it.
+			_ = c.RemoveProvider(g.name)
+			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+			continue
+		}
 		if resp.StatusCode == 430 {
 			c.nextIdx.Add(1) // bias next request away from this provider
 			if g.host != "" && skipCount < len(skipHosts) {
@@ -1432,6 +1447,11 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 		if resp.Err != nil {
 			lastErr = resp.Err
+			continue
+		}
+		if resp.StatusCode == 502 {
+			_ = c.RemoveProvider(g.name)
+			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 			continue
 		}
 		// Deliver whatever backup returns (including 430).
