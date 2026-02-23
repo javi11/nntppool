@@ -661,3 +661,50 @@ func TestIsMultiline(t *testing.T) {
 		}
 	}
 }
+
+// --- Protocol desync detection ---
+
+func TestFeed_ProtocolDesync(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"binary garbage", "\x89PNG\r\n\x1a\n\r\n"},
+		{"non-numeric status", "abc garbage data\r\n"},
+		{"partial binary", "\x00\xff\xfe rest of line\r\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &NNTPResponse{}
+			_, _, err := r.Feed([]byte(tt.input), io.Discard)
+			if err != ErrProtocolDesync {
+				t.Fatalf("Feed() error = %v, want ErrProtocolDesync", err)
+			}
+		})
+	}
+}
+
+func TestFeed_ProtocolDesyncReaderLoop(t *testing.T) {
+	// Simulate what readerLoop sees: feedUntilDone calls Feed repeatedly.
+	// After desync, the connection should be considered broken.
+	// Verify that ErrProtocolDesync propagates through feedUntilDone.
+	garbage := []byte("\x89PNG\r\n\x1a\n\r\n")
+
+	server, client := net.Pipe()
+	defer func() { _ = server.Close() }()
+	defer func() { _ = client.Close() }()
+
+	go func() {
+		_, _ = server.Write(garbage)
+		_ = server.Close()
+	}()
+
+	rb := readBuffer{}
+	resp := NNTPResponse{}
+	err := rb.feedUntilDone(client, &resp, io.Discard, func() (time.Time, bool) {
+		return time.Time{}, false
+	})
+	if err != ErrProtocolDesync {
+		t.Fatalf("feedUntilDone() error = %v, want ErrProtocolDesync", err)
+	}
+}

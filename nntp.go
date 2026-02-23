@@ -858,7 +858,11 @@ func (c *NNTPConnection) readerLoop() {
 			return req.Ctx.Deadline()
 		})
 		if err != nil {
-			resp.Err = err
+			if c.providerName != "" {
+				resp.Err = fmt.Errorf("%s: %w", c.providerName, err)
+			} else {
+				resp.Err = err
+			}
 		}
 
 		resp.StatusCode = decoder.StatusCode
@@ -880,7 +884,11 @@ func (c *NNTPConnection) readerLoop() {
 				return req.Ctx.Deadline()
 			})
 			if err2 != nil {
-				resp.Err = err2
+				if c.providerName != "" {
+					resp.Err = fmt.Errorf("%s: %w", c.providerName, err2)
+				} else {
+					resp.Err = err2
+				}
 			}
 			resp.StatusCode = decoder2.StatusCode
 			resp.Status = decoder2.Message
@@ -910,10 +918,16 @@ func (c *NNTPConnection) readerLoop() {
 		// release inflight slot
 		<-c.inflightSem
 
-		// If we hit a timeout or cancellation-related network error, close the connection.
+		// If we hit a timeout, cancellation-related network error, or protocol
+		// desync, close the connection so the pool replaces it with a fresh one.
 		if resp.Err != nil {
 			var ne net.Error
 			if errors.As(resp.Err, &ne) && ne.Timeout() {
+				_ = c.conn.Close()
+				c.failOutstanding()
+				return
+			}
+			if errors.Is(resp.Err, ErrProtocolDesync) {
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return

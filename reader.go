@@ -101,7 +101,10 @@ func (r *NNTPResponse) decode(buf []byte, out io.Writer) (read int, err error) {
 				if r.StatusCode == 0 && len(line) >= 3 {
 					r.Message = string(line)
 					r.StatusCode, err = strconv.Atoi(string(line[:3]))
-					if err != nil || !isMultiline(r.StatusCode) {
+					if err != nil {
+						return read, ErrProtocolDesync
+					}
+					if !isMultiline(r.StatusCode) {
 						r.eof = true
 						break
 					}
