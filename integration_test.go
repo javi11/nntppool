@@ -1073,3 +1073,94 @@ func TestClient_BodyPriority(t *testing.T) {
 	}
 }
 
+func TestClient_502CommandRemovesProvider(t *testing.T) {
+	makeFactory := func(statusCode int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = fmt.Fprintf(server, "%d response\r\n", statusCode)
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(502), Connections: 1},               // main: always 502
+		{Factory: makeFactory(502), Connections: 1, Backup: true}, // backup: also 502
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if c.NumProviders() != 2 {
+		t.Fatalf("NumProviders() = %d, want 2", c.NumProviders())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	// Both providers returned 502 and were removed — all providers exhausted.
+	if !errors.Is(resp.Err, ErrServiceUnavailable) {
+		t.Fatalf("Send() error = %v, want ErrServiceUnavailable", resp.Err)
+	}
+	if c.NumProviders() != 0 {
+		t.Errorf("NumProviders() = %d, want 0 (both removed)", c.NumProviders())
+	}
+}
+
+func TestClient_502CommandFallsBackToBackup(t *testing.T) {
+	makeFactory := func(statusCode int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = fmt.Fprintf(server, "%d response\r\n", statusCode)
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(502), Connections: 1},                // main: always 502
+		{Factory: makeFactory(223), Connections: 1, Backup: true},  // backup: success
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("Send() error = %v", resp.Err)
+	}
+	if resp.StatusCode != 223 {
+		t.Errorf("StatusCode = %d, want 223 (from backup)", resp.StatusCode)
+	}
+	// Main provider should have been removed, backup stays.
+	if c.NumProviders() != 1 {
+		t.Errorf("NumProviders() = %d, want 1 (main removed)", c.NumProviders())
+	}
+}
+
