@@ -631,8 +631,6 @@ func (c *NNTPConnection) Run() {
 			return
 		}
 
-		c.pending <- req
-
 		dl, hasDL := req.Ctx.Deadline()
 		setWriteDeadline(dl, hasDL)
 
@@ -652,6 +650,7 @@ func (c *NNTPConnection) Run() {
 				return
 			}
 		}
+		c.pending <- req
 	}
 
 mainLoop:
@@ -772,9 +771,6 @@ mainLoop:
 		default:
 		}
 
-		// track FIFO ordering
-		c.pending <- req
-
 		// per-request write deadline (cached to avoid redundant syscalls)
 		dl, hasDL := req.Ctx.Deadline()
 		setWriteDeadline(dl, hasDL)
@@ -796,6 +792,8 @@ mainLoop:
 				return
 			}
 		}
+		// track FIFO ordering (after writes succeed to avoid send on closed channel)
+		c.pending <- req
 	}
 }
 
