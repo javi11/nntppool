@@ -987,6 +987,7 @@ type Provider struct {
 	Inflight        int           // 0 defaults to 1
 	Factory         ConnFactory   // overrides Host/TLSConfig when set
 	Backup          bool          // if true, only used when main providers return 430
+	SkipPing        bool          // if true, skip the DATE ping on startup (for providers that don't support DATE)
 	IdleTimeout     time.Duration // 0 means no idle disconnect
 	ThrottleRestore time.Duration // 0 defaults to 30s
 	KeepAlive       time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
@@ -1153,9 +1154,11 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	}
 
 	// Ping with a short timeout so we don't block forever.
-	pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
-	g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
-	pingCancel()
+	if !p.SkipPing {
+		pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
+		g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
+		pingCancel()
+	}
 
 	for range p.Connections {
 		c.wg.Add(1)
