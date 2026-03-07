@@ -1426,7 +1426,15 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			}
 		}
 
-		resp, ok = <-innerCh
+		select {
+		case resp, ok = <-innerCh:
+		case <-c.ctx.Done():
+			return Response{}, false, true
+		case <-ctx.Done():
+			return Response{}, false, true
+		case <-g.ctx.Done():
+			return Response{}, false, false // provider removed; try others
+		}
 		return resp, ok, false
 	}
 
