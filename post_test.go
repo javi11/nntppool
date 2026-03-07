@@ -115,16 +115,41 @@ func makePostFactory(t *testing.T, postResponses []string, receivedArticle *byte
 				}
 			}), nil
 		}
-		// POST connection.
+		// POST connection: correct NNTP two-phase protocol.
 		return mockServer(t, func(s net.Conn) {
 			_, _ = s.Write([]byte("200 server ready\r\n"))
 
-			buf := make([]byte, 8192)
+			// Read "POST\r\n" command.
+			cmdBuf := make([]byte, 256)
+			var cmdRecv bytes.Buffer
+			for {
+				nr, err := s.Read(cmdBuf)
+				if nr > 0 {
+					cmdRecv.Write(cmdBuf[:nr])
+				}
+				if bytes.Contains(cmdRecv.Bytes(), []byte("POST\r\n")) {
+					break
+				}
+				if err != nil {
+					return
+				}
+			}
+
+			// Send first response (340 or 440).
+			if len(postResponses) > 0 {
+				_, _ = fmt.Fprintf(s, "%s\r\n", postResponses[0])
+			}
+			if len(postResponses) == 0 || !strings.HasPrefix(postResponses[0], "340") {
+				return // posting not allowed — no body expected
+			}
+
+			// Read the article body.
+			bodyBuf := make([]byte, 8192)
 			var recv bytes.Buffer
 			for {
-				nr, err := s.Read(buf)
+				nr, err := s.Read(bodyBuf)
 				if nr > 0 {
-					recv.Write(buf[:nr])
+					recv.Write(bodyBuf[:nr])
 				}
 				if bytes.Contains(recv.Bytes(), []byte("\r\n.\r\n")) {
 					break
@@ -138,7 +163,7 @@ func makePostFactory(t *testing.T, postResponses []string, receivedArticle *byte
 				receivedArticle.Write(recv.Bytes())
 			}
 
-			for _, resp := range postResponses {
+			for _, resp := range postResponses[1:] {
 				_, _ = fmt.Fprintf(s, "%s\r\n", resp)
 			}
 		}), nil
@@ -258,12 +283,32 @@ func TestNNTPConnection_PostTwoPhase(t *testing.T) {
 	conn := mockServer(t, func(s net.Conn) {
 		_, _ = s.Write([]byte("200 server ready\r\n"))
 
-		buf := make([]byte, 8192)
+		// Read "POST\r\n" command.
+		buf := make([]byte, 256)
 		var recv bytes.Buffer
 		for {
 			n, err := s.Read(buf)
 			if n > 0 {
 				recv.Write(buf[:n])
+			}
+			if bytes.Contains(recv.Bytes(), []byte("POST\r\n")) {
+				break
+			}
+			if err != nil {
+				return
+			}
+		}
+
+		// Send 340 before reading the body (correct NNTP protocol order).
+		_, _ = s.Write([]byte("340 send article\r\n"))
+
+		// Now read the article body.
+		recv.Reset()
+		bodyBuf := make([]byte, 8192)
+		for {
+			n, err := s.Read(bodyBuf)
+			if n > 0 {
+				recv.Write(bodyBuf[:n])
 			}
 			if bytes.Contains(recv.Bytes(), []byte("\r\n.\r\n")) {
 				break
@@ -273,7 +318,6 @@ func TestNNTPConnection_PostTwoPhase(t *testing.T) {
 			}
 		}
 
-		_, _ = s.Write([]byte("340 send article\r\n"))
 		_, _ = s.Write([]byte("240 article posted\r\n"))
 	})
 
@@ -311,6 +355,86 @@ func TestNNTPConnection_PostTwoPhase(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout waiting for response")
+	}
+
+	_ = nc.Close()
+}
+
+// TestNNTPConnection_PostRejected verifies that a 440 "posting not allowed"
+// response does not cause protocol desync: the article body must NOT be sent
+// to the server, and the pipe-writer goroutine must be unblocked cleanly.
+func TestNNTPConnection_PostRejected(t *testing.T) {
+	conn := mockServer(t, func(s net.Conn) {
+		_, _ = s.Write([]byte("200 server ready\r\n"))
+
+		// Read "POST\r\n".
+		buf := make([]byte, 256)
+		var recv bytes.Buffer
+		for {
+			n, err := s.Read(buf)
+			if n > 0 {
+				recv.Write(buf[:n])
+			}
+			if bytes.Contains(recv.Bytes(), []byte("POST\r\n")) {
+				break
+			}
+			if err != nil {
+				return
+			}
+		}
+
+		// Reject posting immediately — no body should follow.
+		_, _ = s.Write([]byte("440 posting not allowed\r\n"))
+
+		// Ensure no stray bytes arrive (give the client a moment to potentially
+		// misbehave before we close).
+		_ = s.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		extra := make([]byte, 256)
+		n, _ := s.Read(extra)
+		if n > 0 {
+			t.Errorf("unexpected bytes after 440: %q", extra[:n])
+		}
+	})
+
+	reqCh := make(chan *Request, 1)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
+	if err != nil {
+		t.Fatalf("connection error = %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	// Writer goroutine must unblock even though the body is rejected.
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		_, _ = pw.Write([]byte("From: test@example.com\r\nSubject: Test\r\nNewsgroups: alt.test\r\n\r\nBody text\r\n.\r\n"))
+		_ = pw.Close()
+	}()
+
+	respCh := make(chan Response, 1)
+	reqCh <- &Request{
+		Ctx:         context.Background(),
+		Payload:     []byte("POST\r\n"),
+		RespCh:      respCh,
+		PayloadBody: pr,
+		PostMode:    true,
+	}
+
+	go nc.Run()
+
+	select {
+	case resp := <-respCh:
+		if resp.StatusCode != 440 {
+			t.Errorf("StatusCode = %d, want 440", resp.StatusCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for response")
+	}
+
+	select {
+	case <-writerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pipe-writer goroutine not unblocked after 440")
 	}
 
 	_ = nc.Close()
