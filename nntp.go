@@ -1277,13 +1277,19 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	}
 
 	// Validation only — no TCP connections are created here.
-	for _, p := range providers {
+	seen := make(map[string]struct{}, len(providers))
+	for i, p := range providers {
 		if p.Connections <= 0 {
 			return nil, fmt.Errorf("nntp: provider connections must be > 0")
 		}
 		if p.Factory == nil && p.Host == "" {
 			return nil, fmt.Errorf("nntp: provider must have Host or Factory")
 		}
+		name := resolveProviderName(p, i)
+		if _, dup := seen[name]; dup {
+			return nil, fmt.Errorf("nntp: provider %q already exists", name)
+		}
+		seen[name] = struct{}{}
 	}
 
 	if ctx == nil {

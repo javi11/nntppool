@@ -406,6 +406,14 @@ func TestNewClient_Validation(t *testing.T) {
 	}
 }
 
+func TestNewClient_DuplicateProvider(t *testing.T) {
+	p := Provider{Host: "news.example.com:119", Auth: Auth{Username: "user"}, Connections: 1}
+	_, err := NewClient(context.Background(), []Provider{p, p}, nil)
+	if err == nil {
+		t.Fatal("expected error for duplicate provider")
+	}
+}
+
 func TestNewClient_NilContext(t *testing.T) {
 	// Nil context should default to Background
 	c, err := NewClient(context.TODO(), []Provider{
