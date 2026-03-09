@@ -554,6 +554,10 @@ func TestClient_Skip430SameHost(t *testing.T) {
 					if err != nil {
 						return
 					}
+					if bytes.Contains(buf[:n], []byte("AUTHINFO")) {
+						_, _ = server.Write([]byte("281 authentication accepted\r\n"))
+						continue
+					}
 					if bytes.Contains(buf[:n], []byte("STAT")) {
 						counts[idx].Add(1)
 					}
@@ -565,9 +569,9 @@ func TestClient_Skip430SameHost(t *testing.T) {
 	}
 
 	c, err := NewClient(context.Background(), []Provider{
-		{Host: "news.example.com:563", Factory: make430Factory(0), Connections: 1},
-		{Host: "news.example.com:563", Factory: make430Factory(1), Connections: 1},
-		{Host: "news.example.com:563", Factory: make430Factory(2), Connections: 1, Backup: true},
+		{Host: "news.example.com:563", Auth: Auth{Username: "user1", Password: "pass"}, Factory: make430Factory(0), Connections: 1},
+		{Host: "news.example.com:563", Auth: Auth{Username: "user2", Password: "pass"}, Factory: make430Factory(1), Connections: 1},
+		{Host: "news.example.com:563", Auth: Auth{Username: "user3", Password: "pass"}, Factory: make430Factory(2), Connections: 1, Backup: true},
 	})
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
