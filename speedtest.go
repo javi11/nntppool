@@ -240,9 +240,17 @@ func (c *Client) sendToGroup(ctx context.Context, g *providerGroup, payload []by
 			return
 		case g.reqCh <- req:
 		}
-		resp, ok := <-innerCh
-		if ok {
-			outerCh <- resp
+		select {
+		case resp, ok := <-innerCh:
+			if ok {
+				outerCh <- resp
+			}
+		case <-ctx.Done():
+			outerCh <- Response{Err: ctx.Err()}
+		case <-c.ctx.Done():
+			outerCh <- Response{Err: c.ctx.Err()}
+		case <-g.ctx.Done():
+			outerCh <- Response{Err: context.Canceled}
 		}
 	}()
 	return outerCh

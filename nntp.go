@@ -75,6 +75,11 @@ type Request struct {
 
 	// PostMode signals readerLoop to expect two NNTP responses (340 + 240/441).
 	PostMode bool
+
+	// postReadyCh is set by writeLoop for PostMode requests. The readerLoop
+	// sends nil after reading 340 (proceed to write body) or a non-nil error
+	// otherwise (e.g. 440 posting not allowed). Buffered with capacity 1.
+	postReadyCh chan error
 }
 
 type Response struct {
@@ -641,16 +646,54 @@ func (c *NNTPConnection) Run() {
 			c.failOutstanding()
 			return
 		}
-		if req.PayloadBody != nil {
-			if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+		if req.PostMode {
+			// Two-phase POST: flush "POST\r\n" immediately so the server can
+			// respond with 340/440 before we send the article body.
+			if err := bw.Flush(); err != nil {
 				<-c.inflightSem
 				failRequest(req.RespCh, err)
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
 			}
+			req.postReadyCh = make(chan error, 1)
+			c.pending <- req
+			// Block here — no other request can be written while we wait.
+			select {
+			case postErr := <-req.postReadyCh:
+				if postErr != nil {
+					// 440 or error: drain body to unblock the pipe-writer goroutine.
+					if req.PayloadBody != nil {
+						_, _ = io.Copy(io.Discard, req.PayloadBody)
+					}
+					goto mainLoop
+				}
+			case <-c.ctx.Done():
+				if req.PayloadBody != nil {
+					_, _ = io.Copy(io.Discard, req.PayloadBody)
+				}
+				return
+			}
+			// 340 received: send the article body.
+			if req.PayloadBody != nil {
+				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+					_ = c.conn.Close()
+					c.failOutstanding()
+					return
+				}
+			}
+		} else {
+			if req.PayloadBody != nil {
+				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+					<-c.inflightSem
+					failRequest(req.RespCh, err)
+					_ = c.conn.Close()
+					c.failOutstanding()
+					return
+				}
+			}
+			c.pending <- req
 		}
-		c.pending <- req
 	}
 
 mainLoop:
@@ -783,17 +826,55 @@ mainLoop:
 			c.failOutstanding()
 			return
 		}
-		if req.PayloadBody != nil {
-			if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+		if req.PostMode {
+			// Two-phase POST: flush "POST\r\n" immediately so the server can
+			// respond with 340/440 before we send the article body. Blocking
+			// here also prevents pipelining other requests during POST.
+			if err := bw.Flush(); err != nil {
 				<-c.inflightSem
 				failRequest(req.RespCh, err)
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
 			}
+			req.postReadyCh = make(chan error, 1)
+			c.pending <- req
+			select {
+			case postErr := <-req.postReadyCh:
+				if postErr != nil {
+					// 440 or error: drain body to unblock the pipe-writer goroutine.
+					if req.PayloadBody != nil {
+						_, _ = io.Copy(io.Discard, req.PayloadBody)
+					}
+					continue
+				}
+			case <-c.ctx.Done():
+				if req.PayloadBody != nil {
+					_, _ = io.Copy(io.Discard, req.PayloadBody)
+				}
+				return
+			}
+			// 340 received: send the article body.
+			if req.PayloadBody != nil {
+				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+					_ = c.conn.Close()
+					c.failOutstanding()
+					return
+				}
+			}
+		} else {
+			if req.PayloadBody != nil {
+				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
+					<-c.inflightSem
+					failRequest(req.RespCh, err)
+					_ = c.conn.Close()
+					c.failOutstanding()
+					return
+				}
+			}
+			// track FIFO ordering (after writes succeed to avoid send on closed channel)
+			c.pending <- req
 		}
-		// track FIFO ordering (after writes succeed to avoid send on closed channel)
-		c.pending <- req
 	}
 }
 
@@ -868,29 +949,39 @@ func (c *NNTPConnection) readerLoop() {
 		resp.Lines = decoder.Lines
 		resp.Meta = decoder
 
-		// Two-phase POST: if server accepted with 340, read the final response (240/441).
-		if req.PostMode && decoder.StatusCode == 340 {
-			decoder2 := NNTPResponse{}
-			err2 := c.rb.feedUntilDone(c.conn, &decoder2, io.Discard, func() (time.Time, bool) {
-				if deliver {
-					select {
-					case <-req.Ctx.Done():
-						deliver = false
-					default:
+		// Two-phase POST: coordinate with writeLoop via postReadyCh.
+		if req.PostMode {
+			if decoder.StatusCode == 340 {
+				// Signal writeLoop to send the article body, then read the
+				// final response (240/441) once the server acknowledges it.
+				if req.postReadyCh != nil {
+					req.postReadyCh <- nil
+				}
+				decoder2 := NNTPResponse{}
+				err2 := c.rb.feedUntilDone(c.conn, &decoder2, io.Discard, func() (time.Time, bool) {
+					if deliver {
+						select {
+						case <-req.Ctx.Done():
+							deliver = false
+						default:
+						}
+					}
+					return req.Ctx.Deadline()
+				})
+				if err2 != nil {
+					if c.providerName != "" {
+						resp.Err = fmt.Errorf("%s: %w", c.providerName, err2)
+					} else {
+						resp.Err = err2
 					}
 				}
-				return req.Ctx.Deadline()
-			})
-			if err2 != nil {
-				if c.providerName != "" {
-					resp.Err = fmt.Errorf("%s: %w", c.providerName, err2)
-				} else {
-					resp.Err = err2
-				}
+				resp.StatusCode = decoder2.StatusCode
+				resp.Status = decoder2.Message
+				resp.Meta = decoder2
+			} else if req.postReadyCh != nil {
+				// 440 or other rejection: tell writeLoop not to send the body.
+				req.postReadyCh <- fmt.Errorf("post rejected: %d %s", decoder.StatusCode, decoder.Message)
 			}
-			resp.StatusCode = decoder2.StatusCode
-			resp.Status = decoder2.Message
-			resp.Meta = decoder2
 		}
 
 		if c.stats != nil {
@@ -1335,7 +1426,15 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			}
 		}
 
-		resp, ok = <-innerCh
+		select {
+		case resp, ok = <-innerCh:
+		case <-c.ctx.Done():
+			return Response{}, false, true
+		case <-ctx.Done():
+			return Response{}, false, true
+		case <-g.ctx.Done():
+			return Response{}, false, false // provider removed; try others
+		}
 		return resp, ok, false
 	}
 
