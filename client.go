@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -300,8 +301,9 @@ func (c *Client) PostYenc(ctx context.Context, headers PostHeaders, body io.Read
 	return c.finishPost(respCh)
 }
 
-// sendPost dispatches a POST request to the first available main provider.
-// POST uses FIFO dispatch (no backup fallback, no retry on protocol errors).
+// sendPost dispatches a POST request using the configured dispatch strategy
+// so concurrent calls are spread across all provider connections.
+// No backup fallback, no retry on protocol errors.
 func (c *Client) sendPost(ctx context.Context, payloadBody io.Reader) <-chan Response {
 	respCh := make(chan Response, 1)
 	if ctx == nil {
@@ -315,14 +317,39 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh c
 	defer close(respCh)
 
 	mains := *c.mainGroups.Load()
-	if len(mains) == 0 {
+	n := len(mains)
+	if n == 0 {
 		respCh <- Response{Err: errors.New("nntp: no main providers")}
 		return
 	}
 
-	// FIFO: try providers in order until one accepts.
+	// Pick start index using the same dispatch strategy as normal requests so
+	// concurrent POST calls are spread across all provider connections.
+	var start int
+	switch c.dispatch {
+	case DispatchFIFO:
+		for i, g := range mains {
+			if g.gate.available.Load() > 0 {
+				start = i
+				break
+			}
+		}
+	default: // DispatchRoundRobin
+		var cumWeights [8]int
+		totalW := 0
+		for i, g := range mains {
+			avail := max(1, int(g.gate.available.Load()))
+			totalW += avail
+			cumWeights[i] = totalW
+		}
+		slot := int(c.nextIdx.Add(1) % uint64(totalW))
+		start = sort.SearchInts(cumWeights[:n], slot+1)
+	}
+
 	var lastErr error
-	for _, g := range mains {
+	for attempt := range n {
+		idx := (start + attempt) % n
+		g := mains[idx]
 		innerCh := make(chan Response, 1)
 		req := &Request{
 			Ctx:         ctx,

@@ -360,6 +360,130 @@ func TestNNTPConnection_PostTwoPhase(t *testing.T) {
 	_ = nc.Close()
 }
 
+// TestPostYenc_RoundRobinDispatch verifies that concurrent PostYenc calls are
+// spread across all provider connections rather than serialised on provider 0.
+func TestPostYenc_RoundRobinDispatch(t *testing.T) {
+	const providers = 3
+	const postsPerProvider = 4
+	const total = providers * postsPerProvider
+
+	// One atomic counter per provider to track how many POSTs it handled.
+	postCounts := make([]atomic.Int32, providers)
+
+	makeFactory := func(idx int) ConnFactory {
+		var connCount atomic.Int32
+		return func(ctx context.Context) (net.Conn, error) {
+			n := connCount.Add(1)
+			if n == 1 {
+				// Ping connection.
+				return mockServer(t, func(s net.Conn) {
+					_, _ = s.Write([]byte("200 server ready\r\n"))
+					buf := make([]byte, 256)
+					for {
+						nr, err := s.Read(buf)
+						if err != nil {
+							return
+						}
+						if strings.HasPrefix(string(buf[:nr]), "DATE") {
+							_, _ = s.Write([]byte("111 20240315120000\r\n"))
+						}
+					}
+				}), nil
+			}
+			// POST connection: accept and count each article.
+			return mockServer(t, func(s net.Conn) {
+				_, _ = s.Write([]byte("200 server ready\r\n"))
+				for {
+					var recv bytes.Buffer
+					buf := make([]byte, 256)
+					for {
+						nr, err := s.Read(buf)
+						if nr > 0 {
+							recv.Write(buf[:nr])
+						}
+						if bytes.Contains(recv.Bytes(), []byte("POST\r\n")) {
+							break
+						}
+						if err != nil {
+							return
+						}
+					}
+					_, _ = fmt.Fprintf(s, "340 send article\r\n")
+
+					var body bytes.Buffer
+					bodyBuf := make([]byte, 8192)
+					for {
+						nr, err := s.Read(bodyBuf)
+						if nr > 0 {
+							body.Write(bodyBuf[:nr])
+						}
+						if bytes.Contains(body.Bytes(), []byte("\r\n.\r\n")) {
+							break
+						}
+						if err != nil {
+							return
+						}
+					}
+					postCounts[idx].Add(1)
+					_, _ = fmt.Fprintf(s, "240 article posted ok\r\n")
+				}
+			}), nil
+		}
+	}
+
+	provs := make([]Provider, providers)
+	for i := range provs {
+		provs[i] = Provider{Factory: makeFactory(i), Connections: 2}
+	}
+
+	c, err := NewClient(context.Background(), provs)
+	if err != nil {
+		t.Fatalf("NewClient error: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	headers := PostHeaders{
+		From:       "user@example.com",
+		Subject:    "dispatch test",
+		Newsgroups: []string{"alt.test"},
+	}
+	meta := rapidyenc.Meta{
+		FileName:   "test.bin",
+		FileSize:   100,
+		PartNumber: 1,
+		TotalParts: 1,
+		PartSize:   100,
+	}
+	data := bytes.Repeat([]byte("A"), 100)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type result struct{ err error }
+	results := make(chan result, total)
+	for range total {
+		go func() {
+			_, err := c.PostYenc(ctx, headers, bytes.NewReader(data), meta)
+			results <- result{err}
+		}()
+	}
+	for range total {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("PostYenc error: %v", r.err)
+		}
+	}
+
+	// Every provider must have handled at least one POST.
+	for i := range postCounts {
+		if got := postCounts[i].Load(); got == 0 {
+			t.Errorf("provider %d received 0 POST requests; posts were not distributed", i)
+		} else {
+			t.Logf("provider %d received %d POST requests", i, got)
+		}
+	}
+}
+
 // TestNNTPConnection_PostRejected verifies that a 440 "posting not allowed"
 // response does not cause protocol desync: the article body must NOT be sent
 // to the server, and the pipe-writer goroutine must be unblocked cleanly.
