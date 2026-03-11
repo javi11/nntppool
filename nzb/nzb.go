@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"strings"
 )
 
 type NZB struct {
@@ -30,6 +31,22 @@ func Parse(r io.Reader) (*NZB, error) {
 		return nil, fmt.Errorf("nzb parse: %w", err)
 	}
 	return &n, nil
+}
+
+// FileName extracts the filename from the NZB subject line.
+// It returns the first token enclosed in double quotes that precedes " yEnc",
+// or an empty string if the subject does not match that pattern.
+func (f *File) FileName() string {
+	s := f.Subject
+	start := strings.Index(s, `"`)
+	if start == -1 {
+		return ""
+	}
+	end := strings.Index(s[start+1:], `"`)
+	if end == -1 {
+		return ""
+	}
+	return s[start+1 : start+1+end]
 }
 
 // AllSegments returns a flat list of all segments across all files.
