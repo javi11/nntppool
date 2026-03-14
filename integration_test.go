@@ -1123,6 +1123,72 @@ func TestClient_502CommandRemovesProvider(t *testing.T) {
 	}
 }
 
+func TestClient_502ReconnectDelay(t *testing.T) {
+	var attempt atomic.Int32
+	factory := func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				_, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				if attempt.Add(1) == 1 {
+					// First command: return 502 to trigger removal.
+					_, _ = server.Write([]byte("502 service unavailable\r\n"))
+				} else {
+					// Subsequent commands: succeed.
+					_, _ = server.Write([]byte("223 article exists\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 1, SkipPing: true, ReconnectDelay: 50 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// First request: hits 502, provider is removed.
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if !errors.Is(resp.Err, ErrServiceUnavailable) {
+		t.Fatalf("first Send() error = %v, want ErrServiceUnavailable", resp.Err)
+	}
+	if c.NumProviders() != 0 {
+		t.Errorf("NumProviders() = %d, want 0 after 502", c.NumProviders())
+	}
+
+	// Wait for reconnect goroutine to re-add the provider.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.NumProviders() == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if c.NumProviders() != 1 {
+		t.Fatalf("NumProviders() = %d, want 1 after reconnect", c.NumProviders())
+	}
+
+	// Second request: should succeed via the re-added provider.
+	resp = <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("second Send() error = %v", resp.Err)
+	}
+	if resp.StatusCode != 223 {
+		t.Errorf("StatusCode = %d, want 223", resp.StatusCode)
+	}
+}
+
 func TestClient_502CommandFallsBackToBackup(t *testing.T) {
 	makeFactory := func(statusCode int) ConnFactory {
 		return func(ctx context.Context) (net.Conn, error) {

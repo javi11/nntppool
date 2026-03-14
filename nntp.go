@@ -1082,6 +1082,7 @@ type Provider struct {
 	IdleTimeout     time.Duration // 0 means no idle disconnect
 	ThrottleRestore time.Duration // 0 defaults to 30s
 	KeepAlive       time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
+	ReconnectDelay  time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
 }
 
 type providerGroup struct {
@@ -1096,6 +1097,7 @@ type providerGroup struct {
 	gate     *connGate
 	stats    providerStats
 	cancel   context.CancelFunc // cancels this group's slot goroutines
+	p        Provider           // original config; used for auto-reconnect
 }
 
 type Client struct {
@@ -1242,6 +1244,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		hotPrioCh: make(chan *Request),
 		gate:      gate,
 		cancel:    gcancel,
+		p:         p,
 	}
 
 	// Ping with a short timeout so we don't block forever.
@@ -1514,6 +1517,9 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			// Provider returned "service unavailable" — remove it from the
 			// pool immediately so no further requests are routed to it.
 			_ = c.RemoveProvider(g.name)
+			if g.p.ReconnectDelay > 0 {
+				c.scheduleReconnect(g)
+			}
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 			continue
 		}
@@ -1557,6 +1563,9 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 		if resp.StatusCode == 502 {
 			_ = c.RemoveProvider(g.name)
+			if g.p.ReconnectDelay > 0 {
+				c.scheduleReconnect(g)
+			}
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 			continue
 		}
@@ -1657,6 +1666,17 @@ func (c *Client) AddProvider(p Provider) error {
 
 // RemoveProvider stops and removes a provider by name.
 // Goroutines wind down asynchronously; Client.Close still waits for all via c.wg.
+func (c *Client) scheduleReconnect(g *providerGroup) {
+	go func() {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(g.p.ReconnectDelay):
+		}
+		_ = c.AddProvider(g.p) // no-op if client closed or duplicate
+	}()
+}
+
 func (c *Client) RemoveProvider(name string) error {
 	for _, pair := range [...]struct {
 		ptr *atomic.Pointer[[]*providerGroup]
