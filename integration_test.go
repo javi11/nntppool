@@ -1234,3 +1234,112 @@ func TestClient_502CommandFallsBackToBackup(t *testing.T) {
 	}
 }
 
+// --- Keepalive tests ---
+
+// TestKeepalive_KeepsConnectionAlive verifies that the keepalive probe is sent
+// and, when the server responds correctly, the connection remains alive and can
+// serve subsequent real requests.
+func TestKeepalive_KeepsConnectionAlive(t *testing.T) {
+	keepaliveSeen := make(chan struct{}, 1)
+
+	conn := mockServer(t, func(s net.Conn) {
+		_, _ = s.Write([]byte("200 server ready\r\n"))
+
+		buf := make([]byte, 256)
+		for {
+			n, err := s.Read(buf)
+			if err != nil {
+				return
+			}
+			cmd := string(buf[:n])
+			switch {
+			case cmd == "DATE\r\n":
+				select {
+				case keepaliveSeen <- struct{}{}:
+				default:
+				}
+				_, _ = s.Write([]byte("111 20060102150405\r\n"))
+			case len(cmd) > 4 && cmd[:4] == "STAT":
+				_, _ = s.Write([]byte("223 1 <id@test> exists\r\n"))
+			}
+		}
+	})
+
+	reqCh := make(chan *Request, 1)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	nc.keepaliveInterval = 20 * time.Millisecond
+	nc.keepaliveCommand = "DATE"
+
+	go nc.Run()
+	t.Cleanup(func() { _ = nc.Close() })
+
+	// Wait for at least one keepalive probe.
+	select {
+	case <-keepaliveSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: keepalive probe not sent")
+	}
+
+	// Verify the connection is still alive by sending a real request.
+	respCh := make(chan Response, 1)
+	reqCh <- &Request{
+		Ctx:     context.Background(),
+		Payload: []byte("STAT <id@test>\r\n"),
+		RespCh:  respCh,
+	}
+	select {
+	case resp := <-respCh:
+		if resp.Err != nil {
+			t.Fatalf("real request after keepalive: error = %v", resp.Err)
+		}
+		if resp.StatusCode != 223 {
+			t.Errorf("real request: StatusCode = %d, want 223", resp.StatusCode)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: real request after keepalive timed out")
+	}
+}
+
+// TestKeepalive_DeadConnection verifies that when the server drops the connection
+// in response to a keepalive probe, Run() returns (allowing runConnSlot to reconnect).
+func TestKeepalive_DeadConnection(t *testing.T) {
+	conn := mockServer(t, func(s net.Conn) {
+		_, _ = s.Write([]byte("200 server ready\r\n"))
+
+		buf := make([]byte, 256)
+		// Wait for the keepalive command, then close without responding.
+		for {
+			n, err := s.Read(buf)
+			if err != nil {
+				return
+			}
+			if string(buf[:n]) == "DATE\r\n" {
+				// Drop connection without responding.
+				_ = s.Close()
+				return
+			}
+		}
+	})
+
+	reqCh := make(chan *Request)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	nc.keepaliveInterval = 20 * time.Millisecond
+	nc.keepaliveCommand = "DATE"
+
+	go nc.Run()
+
+	// Run() should return once the keepalive detects the dead connection.
+	select {
+	case <-nc.Done():
+		// Good: connection was detected dead and Run() returned.
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: Run() should have returned after keepalive detected dead connection")
+	}
+}
+
