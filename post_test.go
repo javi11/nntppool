@@ -322,7 +322,7 @@ func TestNNTPConnection_PostTwoPhase(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -521,7 +521,7 @@ func TestNNTPConnection_PostRejected(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}

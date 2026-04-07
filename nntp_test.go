@@ -1345,3 +1345,54 @@ func TestDynamicWeights_LargeN(t *testing.T) {
 		t.Errorf("provider 0 percentage = %.2f%%, want ~83.33%%", pct0)
 	}
 }
+
+func TestUserAgent_StoredOnConnection(t *testing.T) {
+	srv, cli := net.Pipe()
+	defer func() { _ = srv.Close() }()
+	defer func() { _ = cli.Close() }()
+
+	go func() {
+		_, _ = srv.Write([]byte("200 server ready\r\n"))
+		buf := make([]byte, 256)
+		for {
+			if _, err := srv.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	reqCh := make(chan *Request)
+	nc, err := newNNTPConnectionFromConn(context.Background(), cli, 1, reqCh, nil, Auth{}, "TestAgent/1.0", nil, nil)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+
+	if nc.userAgent != "TestAgent/1.0" {
+		t.Errorf("userAgent = %q, want %q", nc.userAgent, "TestAgent/1.0")
+	}
+}
+
+func TestUserAgent_EmptyIsAccepted(t *testing.T) {
+	srv, cli := net.Pipe()
+	defer func() { _ = srv.Close() }()
+	defer func() { _ = cli.Close() }()
+
+	go func() {
+		_, _ = srv.Write([]byte("200 server ready\r\n"))
+		buf := make([]byte, 256)
+		for {
+			if _, err := srv.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	reqCh := make(chan *Request)
+	nc, err := newNNTPConnectionFromConn(context.Background(), cli, 1, reqCh, nil, Auth{}, "", nil, nil)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	if nc.userAgent != "" {
+		t.Errorf("userAgent = %q, want empty", nc.userAgent)
+	}
+}

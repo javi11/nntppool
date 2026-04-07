@@ -130,6 +130,7 @@ type NNTPConnection struct {
 	keepaliveInterval time.Duration // 0 = no keepalive
 	keepaliveCommand  string        // NNTP command for keepalive probe (e.g. "DATE")
 	providerName      string        // set by runConnSlot; used for error context
+	userAgent string
 
 	stats *providerStats // nil for standalone connections
 
@@ -165,7 +166,7 @@ func newNetConn(ctx context.Context, addr string, tlsConfig *tls.Config, keepAli
 	return conn, nil
 }
 
-func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, prioCh <-chan *Request, auth Auth, sharedBuf *readBuffer, stats *providerStats) (*NNTPConnection, error) {
+func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit int, reqCh <-chan *Request, prioCh <-chan *Request, auth Auth, userAgent string, sharedBuf *readBuffer, stats *providerStats) (*NNTPConnection, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -180,16 +181,17 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 
 	c := &NNTPConnection{
-		conn:        conn,
-		ctx:         cctx,
-		cancel:      cancel,
-		reqCh:       reqCh,
-		prioCh:      prioCh,
-		pending:     make(chan *Request, inflightLimit),
-		inflightSem: make(chan struct{}, inflightLimit),
-		rb:          rb,
-		stats:       stats,
-		done:        make(chan struct{}),
+		conn:              conn,
+		ctx:               cctx,
+		cancel:            cancel,
+		reqCh:             reqCh,
+		prioCh:            prioCh,
+		pending:           make(chan *Request, inflightLimit),
+		inflightSem:       make(chan struct{}, inflightLimit),
+		rb:                rb,
+		stats:             stats,
+		done:              make(chan struct{}),
+		userAgent: userAgent,
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -216,13 +218,13 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	return c, nil
 }
 
-func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth) (*NNTPConnection, error) {
+func NewNNTPConnection(ctx context.Context, addr string, tlsConfig *tls.Config, inflightLimit int, reqCh <-chan *Request, auth Auth, userAgent string) (*NNTPConnection, error) {
 	conn, err := newNetConn(ctx, addr, tlsConfig, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, nil, auth, nil, nil)
+	c, err := newNNTPConnectionFromConn(ctx, conn, inflightLimit, reqCh, nil, auth, userAgent, nil, nil)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -473,7 +475,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, idleTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, userAgent string, idleTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -533,7 +535,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 			continue
 		}
 
-		nc, err := newNNTPConnectionFromConn(ctx, conn, inflight, reqCh, prioCh, auth, &sharedBuf, stats)
+		nc, err := newNNTPConnectionFromConn(ctx, conn, inflight, reqCh, prioCh, auth, userAgent, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
 			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
@@ -1158,6 +1160,9 @@ type Provider struct {
 	// "CAPABILITIES" (response 101) for providers that do not support DATE.
 	// Ignored when KeepaliveInterval is 0.
 	KeepaliveCommand string
+
+	// UserAgent identifies this client to the NNTP server. Empty string disables it.
+	UserAgent string
 }
 
 type providerGroup struct {
@@ -1345,7 +1350,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.IdleTimeout, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.UserAgent, p.IdleTimeout, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
 	}
 
 	return g
