@@ -1346,46 +1346,7 @@ func TestDynamicWeights_LargeN(t *testing.T) {
 	}
 }
 
-// mockUserAgentProvider is a test implementation of UserAgentPeerProvider.
-type mockUserAgentProvider struct {
-	userAgent string
-}
-
-func (m *mockUserAgentProvider) GetUserAgent() string { return m.userAgent }
-
-func TestUserAgentPeerProvider_StoredOnConnection(t *testing.T) {
-	srv, cli := net.Pipe()
-	defer func() { _ = srv.Close() }()
-	defer func() { _ = cli.Close() }()
-
-	go func() {
-		_, _ = srv.Write([]byte("200 server ready\r\n"))
-		// Drain any bytes the client sends so the pipe doesn't block.
-		buf := make([]byte, 256)
-		for {
-			if _, err := srv.Read(buf); err != nil {
-				return
-			}
-		}
-	}()
-
-	reqCh := make(chan *Request)
-	uap := &mockUserAgentProvider{userAgent: "TestAgent/1.0"}
-
-	nc, err := newNNTPConnectionFromConn(context.Background(), cli, 1, reqCh, nil, Auth{}, uap, nil, nil)
-	if err != nil {
-		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
-	}
-
-	if nc.userAgentProvider == nil {
-		t.Fatal("userAgentProvider is nil, want non-nil")
-	}
-	if got := nc.userAgentProvider.GetUserAgent(); got != "TestAgent/1.0" {
-		t.Errorf("GetUserAgent() = %q, want %q", got, "TestAgent/1.0")
-	}
-}
-
-func TestUserAgentPeerProvider_NilIsAccepted(t *testing.T) {
+func TestUserAgent_StoredOnConnection(t *testing.T) {
 	srv, cli := net.Pipe()
 	defer func() { _ = srv.Close() }()
 	defer func() { _ = cli.Close() }()
@@ -1401,11 +1362,37 @@ func TestUserAgentPeerProvider_NilIsAccepted(t *testing.T) {
 	}()
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), cli, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), cli, 1, reqCh, nil, Auth{}, "TestAgent/1.0", nil, nil)
 	if err != nil {
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
-	if nc.userAgentProvider != nil {
-		t.Errorf("userAgentProvider = %v, want nil", nc.userAgentProvider)
+
+	if nc.userAgent != "TestAgent/1.0" {
+		t.Errorf("userAgent = %q, want %q", nc.userAgent, "TestAgent/1.0")
+	}
+}
+
+func TestUserAgent_EmptyIsAccepted(t *testing.T) {
+	srv, cli := net.Pipe()
+	defer func() { _ = srv.Close() }()
+	defer func() { _ = cli.Close() }()
+
+	go func() {
+		_, _ = srv.Write([]byte("200 server ready\r\n"))
+		buf := make([]byte, 256)
+		for {
+			if _, err := srv.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	reqCh := make(chan *Request)
+	nc, err := newNNTPConnectionFromConn(context.Background(), cli, 1, reqCh, nil, Auth{}, "", nil, nil)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	if nc.userAgent != "" {
+		t.Errorf("userAgent = %q, want empty", nc.userAgent)
 	}
 }

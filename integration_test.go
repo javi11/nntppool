@@ -24,7 +24,7 @@ func TestNNTPConnection_Greeting(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
@@ -39,7 +39,7 @@ func TestNNTPConnection_GreetingReject(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err == nil {
 		t.Fatal("expected error for 502 greeting")
 	}
@@ -75,7 +75,7 @@ func TestNNTPConnection_Auth(t *testing.T) {
 	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{
 		Username: "testuser",
 		Password: "testpass",
-	}, nil, nil, nil)
+	}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("auth error = %v", err)
 	}
@@ -100,7 +100,7 @@ func TestNNTPConnection_AuthReject(t *testing.T) {
 	_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{
 		Username: "testuser",
 		Password: "wrongpass",
-	}, nil, nil, nil)
+	}, "", nil, nil)
 	if err == nil {
 		t.Fatal("expected auth rejection error")
 	}
@@ -120,7 +120,7 @@ func TestNNTPConnection_RunSingleRequest(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -162,7 +162,7 @@ func TestNNTPConnection_RunBodyRequest(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -224,7 +224,7 @@ func TestNNTPConnection_RunPipelined(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 3)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 3, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 3, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -269,7 +269,7 @@ func TestNNTPConnection_CancelledRequest(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -311,7 +311,7 @@ func TestNNTPConnection_IdleTimeout(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -871,7 +871,7 @@ func TestReadOneResponse(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("connection error = %v", err)
 	}
@@ -1266,7 +1266,7 @@ func TestKeepalive_KeepsConnectionAlive(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
@@ -1325,7 +1325,7 @@ func TestKeepalive_DeadConnection(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, nil, nil, nil)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
 	if err != nil {
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
