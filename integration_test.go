@@ -791,6 +791,55 @@ func TestClient_FIFO430Fallthrough(t *testing.T) {
 	}
 }
 
+// TestClient_RoundRobinMoreThan8Providers verifies that weighted round-robin
+// dispatch does not panic when more than 8 providers are configured.
+// Previously a fixed-size [8]int array caused an index-out-of-range panic.
+func TestClient_RoundRobinMoreThan8Providers(t *testing.T) {
+	const numProviders = 9 // one more than the old hard-coded limit
+
+	makeFactory := func() ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	providers := make([]Provider, numProviders)
+	for i := range providers {
+		providers[i] = Provider{Factory: makeFactory(), Connections: 2}
+	}
+
+	c, err := NewClient(context.Background(), providers, WithDispatchStrategy(DispatchRoundRobin))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Send several requests — any panic in the dispatch path will surface here.
+	for range 10 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		cancel()
+		if resp.Err != nil {
+			t.Fatalf("Send() error = %v", resp.Err)
+		}
+		if resp.StatusCode != 223 {
+			t.Errorf("StatusCode = %d, want 223", resp.StatusCode)
+		}
+	}
+}
+
 // --- Benchmarks ---
 
 func benchSend(b *testing.B, providers []Provider) {
