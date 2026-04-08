@@ -1573,7 +1573,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	default: // DispatchRoundRobin
 		// Dynamic weighted round-robin: each provider's weight equals
 		// its available capacity (allowed - held).
-		var cumWeights [8]int // stack-allocated; covers up to 8 providers
+		cumWeights := make([]int, n)
 		totalW := 0
 		for i, g := range mains {
 			avail := max(1, int(g.gate.available.Load()))
@@ -1581,7 +1581,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			cumWeights[i] = totalW
 		}
 		slot := int(c.nextIdx.Add(1) % uint64(totalW))
-		start = sort.SearchInts(cumWeights[:n], slot+1)
+		start = sort.SearchInts(cumWeights, slot+1)
 	}
 
 	for attempt := range n {
