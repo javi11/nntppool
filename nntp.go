@@ -1178,6 +1178,17 @@ type Provider struct {
 	// 0 means the quota never resets (lifetime cap).
 	// Typical value: 30 * 24 * time.Hour  (≈ monthly)
 	QuotaPeriod time.Duration
+
+	// QuotaUsed is the number of bytes already consumed at startup.
+	// Set this on restart to restore quota state from a previous run.
+	// Read the current value from [ProviderStats.QuotaUsed] before shutting down.
+	QuotaUsed int64
+
+	// QuotaResetAt, if non-zero, overrides the quota period reset deadline on startup.
+	// Set this on restart to restore the reset deadline from a previous run.
+	// Read the current value from [ProviderStats.QuotaResetAt] before shutting down.
+	// Ignored when QuotaPeriod is 0 or the time is in the past.
+	QuotaResetAt time.Time
 }
 
 type providerGroup struct {
@@ -1374,8 +1385,20 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		quotaPeriod: p.QuotaPeriod,
 	}
 	g.stats.quotaBytes = p.QuotaBytes
-	if p.QuotaBytes > 0 && p.QuotaPeriod > 0 {
-		g.quotaResetAt.Store(time.Now().Add(p.QuotaPeriod).UnixNano())
+	if p.QuotaBytes > 0 {
+		if p.QuotaUsed > 0 {
+			g.stats.quotaUsed.Store(p.QuotaUsed)
+			if p.QuotaUsed >= p.QuotaBytes {
+				g.stats.quotaExceeded.Store(true)
+			}
+		}
+		if p.QuotaPeriod > 0 {
+			if !p.QuotaResetAt.IsZero() && p.QuotaResetAt.After(time.Now()) {
+				g.quotaResetAt.Store(p.QuotaResetAt.UnixNano())
+			} else {
+				g.quotaResetAt.Store(time.Now().Add(p.QuotaPeriod).UnixNano())
+			}
+		}
 	}
 
 	// Ping with a short timeout so we don't block forever.
