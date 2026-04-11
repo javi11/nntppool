@@ -43,6 +43,7 @@ var (
 	ErrServiceUnavailable = &Error{Code: 502, Message: "service unavailable"}
 	ErrCRCMismatch        = errors.New("nntp: yEnc CRC mismatch")
 	ErrProtocolDesync     = errors.New("nntp: protocol desync: expected status line, got binary data")
+	ErrQuotaExceeded      = errors.New("nntp: download quota exceeded")
 )
 
 // toError maps an NNTP status code to a sentinel error, or returns nil for success codes.

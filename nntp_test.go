@@ -1396,3 +1396,243 @@ func TestUserAgent_EmptyIsAccepted(t *testing.T) {
 		t.Errorf("userAgent = %q, want empty", nc.userAgent)
 	}
 }
+
+// --- Quota tests ---
+
+func TestProviderGroup_isQuotaExceeded_Unlimited(t *testing.T) {
+	g := &providerGroup{}
+	// quotaBytes == 0 → always false regardless of usage
+	g.stats.quotaUsed.Store(1_000_000)
+	g.stats.quotaExceeded.Store(true)
+	if g.isQuotaExceeded() {
+		t.Error("isQuotaExceeded() = true with no quota configured, want false")
+	}
+}
+
+func TestProviderGroup_isQuotaExceeded_NotYetHit(t *testing.T) {
+	g := &providerGroup{}
+	g.stats.quotaBytes = 100
+	// Flag not set → fast path returns false without checking time.
+	if g.isQuotaExceeded() {
+		t.Error("isQuotaExceeded() = true before quota hit, want false")
+	}
+}
+
+func TestProviderGroup_isQuotaExceeded_FlagSet_NoReset(t *testing.T) {
+	g := &providerGroup{} // quotaPeriod == 0 → no auto-reset
+	g.stats.quotaBytes = 100
+	g.stats.quotaUsed.Store(100)
+	g.stats.quotaExceeded.Store(true)
+
+	if !g.isQuotaExceeded() {
+		t.Error("isQuotaExceeded() = false after quota hit with no period, want true")
+	}
+}
+
+func TestProviderGroup_isQuotaExceeded_PeriodElapsed_Resets(t *testing.T) {
+	g := &providerGroup{quotaPeriod: time.Hour}
+	g.stats.quotaBytes = 50
+	g.stats.quotaUsed.Store(50)
+	g.stats.quotaExceeded.Store(true)
+	// Set reset deadline in the past so the period is considered elapsed.
+	g.quotaResetAt.Store(time.Now().Add(-time.Second).UnixNano())
+
+	if g.isQuotaExceeded() {
+		t.Error("isQuotaExceeded() = true after period elapsed, want false (reset should have fired)")
+	}
+	if g.stats.quotaUsed.Load() != 0 {
+		t.Errorf("quotaUsed after reset = %d, want 0", g.stats.quotaUsed.Load())
+	}
+	if g.stats.quotaExceeded.Load() {
+		t.Error("quotaExceeded flag should be cleared after reset")
+	}
+	if g.quotaResetAt.Load() <= time.Now().UnixNano() {
+		t.Error("quotaResetAt should be scheduled in the future after reset")
+	}
+}
+
+func TestProviderGroup_isQuotaExceeded_PeriodNotYetElapsed(t *testing.T) {
+	g := &providerGroup{quotaPeriod: time.Hour}
+	g.stats.quotaBytes = 50
+	g.stats.quotaUsed.Store(50)
+	g.stats.quotaExceeded.Store(true)
+	// Reset deadline is in the future — should stay exceeded.
+	g.quotaResetAt.Store(time.Now().Add(time.Hour).UnixNano())
+
+	if !g.isQuotaExceeded() {
+		t.Error("isQuotaExceeded() = false before period elapsed, want true")
+	}
+}
+
+func TestProviderStats_QuotaAccounting(t *testing.T) {
+	var stats providerStats
+	stats.quotaBytes = 100
+
+	// Add 60 bytes — not yet exceeded.
+	stats.quotaUsed.Add(60)
+	if stats.quotaExceeded.Load() {
+		t.Error("quotaExceeded should be false before threshold")
+	}
+
+	// Simulate readLoop: add 40 more bytes → crosses threshold.
+	if stats.quotaUsed.Add(40) >= stats.quotaBytes {
+		stats.quotaExceeded.Store(true)
+	}
+	if !stats.quotaExceeded.Load() {
+		t.Error("quotaExceeded should be true after crossing threshold")
+	}
+	if stats.quotaUsed.Load() != 100 {
+		t.Errorf("quotaUsed = %d, want 100", stats.quotaUsed.Load())
+	}
+}
+
+func TestClient_Stats_QuotaFields(t *testing.T) {
+	factory := func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				cmd := string(buf[:n])
+				if len(cmd) >= 4 && cmd[:4] == "DATE" {
+					_, _ = server.Write([]byte("111 20240315120000\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Factory:     factory,
+			Connections: 1,
+			QuotaBytes:  1_000_000,
+			QuotaPeriod: 30 * 24 * time.Hour,
+			SkipPing:    true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	stats := c.Stats()
+	if len(stats.Providers) == 0 {
+		t.Fatal("no providers in stats")
+	}
+	ps := stats.Providers[0]
+	if ps.QuotaBytes != 1_000_000 {
+		t.Errorf("QuotaBytes = %d, want 1_000_000", ps.QuotaBytes)
+	}
+	if ps.QuotaUsed != 0 {
+		t.Errorf("QuotaUsed = %d, want 0", ps.QuotaUsed)
+	}
+	if ps.QuotaExceeded {
+		t.Error("QuotaExceeded should be false initially")
+	}
+	if ps.QuotaResetAt.IsZero() {
+		t.Error("QuotaResetAt should be set when QuotaPeriod > 0")
+	}
+	if ps.QuotaResetAt.Before(time.Now()) {
+		t.Error("QuotaResetAt should be in the future")
+	}
+}
+
+func TestClient_QuotaExceeded_FallsThrough(t *testing.T) {
+	// Two providers: first has quota exceeded, second responds normally.
+	// The request must be served by the second provider.
+	makeFactory := func(statusLine string) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if len(cmd) >= 4 && cmd[:4] == "DATE" {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = server.Write([]byte(statusLine + "\r\n"))
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory("223 <article@quota>"), Connections: 1, SkipPing: true, QuotaBytes: 1},
+		{Factory: makeFactory("223 <article@ok>"), Connections: 1, SkipPing: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Manually mark the first provider as quota-exceeded.
+	mains := *c.mainGroups.Load()
+	mains[0].stats.quotaExceeded.Store(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <article@ok>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("Send() error = %v, want nil (second provider should serve)", resp.Err)
+	}
+	if resp.StatusCode != 223 {
+		t.Errorf("StatusCode = %d, want 223", resp.StatusCode)
+	}
+}
+
+func TestClient_AllQuotaExceeded_ReturnsError(t *testing.T) {
+	makeFactory := func() ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					if _, err := server.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory(), Connections: 1, SkipPing: true, QuotaBytes: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Mark the only provider as quota-exceeded.
+	mains := *c.mainGroups.Load()
+	mains[0].stats.quotaExceeded.Store(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <x@x>\r\n"), nil)
+	if resp.Err == nil {
+		t.Fatal("Send() should return an error when all providers are quota-exceeded")
+	}
+	if !errors.Is(resp.Err, ErrQuotaExceeded) {
+		t.Errorf("error = %v, want errors.Is(ErrQuotaExceeded)", resp.Err)
+	}
+}
