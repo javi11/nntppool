@@ -36,6 +36,7 @@ type NNTPResponse struct {
 	State         rapidyenc.State
 	StatusCode    int
 	CRC           uint32
+	RawMode       bool // skip decoding, return raw body bytes
 
 	eof          bool
 	body         bool
@@ -70,6 +71,45 @@ func (r *NNTPResponse) Feed(buf []byte, out io.Writer) (consumed int, done bool,
 }
 
 func (r *NNTPResponse) decode(buf []byte, out io.Writer) (read int, err error) {
+	// In raw mode, pass through raw bytes without decoding
+	if r.RawMode && r.body {
+		for {
+			line, rest, found := bytes.Cut(buf, []byte("\r\n"))
+			if !found {
+				// No complete line in buffer yet
+				return 0, nil
+			}
+
+			// Check for end marker
+			if bytes.Equal(line, []byte(".")) {
+				r.eof = true
+				return len(line) + 2, nil
+			}
+
+			// Handle dot stuffing: ".." at line start becomes "."
+			if bytes.HasPrefix(line, []byte("..")) {
+				line = line[1:]
+			}
+
+			// Write raw line with CRLF
+			if _, err := out.Write(line); err != nil {
+				return 0, err
+			}
+			if _, err := out.Write([]byte("\r\n")); err != nil {
+				return 0, err
+			}
+
+			// Account for bytes consumed (line + CRLF)
+			consumed := len(line) + 2
+			if bytes.HasPrefix(buf, []byte("..")) {
+				consumed = len(buf) - len(rest)
+			}
+
+			read += consumed
+			buf = rest
+		}
+	}
+
 	if r.body && r.Format == rapidyenc.FormatYenc {
 		n, err := r.decodeYenc(buf, out)
 		if err != nil {

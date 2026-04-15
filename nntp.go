@@ -76,6 +76,9 @@ type Request struct {
 	// PostMode signals readerLoop to expect two NNTP responses (340 + 240/441).
 	PostMode bool
 
+	// RawMode signals to return raw body bytes without decoding.
+	RawMode bool
+
 	// postReadyCh is set by writeLoop for PostMode requests. The readerLoop
 	// sends nil after reading 340 (proceed to write body) or a non-nil error
 	// otherwise (e.g. 440 posting not allowed). Buffered with capacity 1.
@@ -967,7 +970,8 @@ func (c *NNTPConnection) readerLoop() {
 			Request: req,
 		}
 		decoder := NNTPResponse{
-			onMeta: req.OnMeta,
+			onMeta:  req.OnMeta,
+			RawMode: req.RawMode,
 		}
 
 		// If the request is cancelled after send, we must still drain its response off the wire,

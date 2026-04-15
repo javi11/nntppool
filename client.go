@@ -125,6 +125,150 @@ func (c *Client) BodyAsync(ctx context.Context, messageID string, w io.Writer, o
 	return ch
 }
 
+// BodyRaw retrieves an article body without decoding, returning raw bytes as-is.
+func (c *Client) BodyRaw(ctx context.Context, messageID string) (*ArticleBody, error) {
+	payload := []byte("BODY <" + messageID + ">\r\n")
+	respCh := c.sendRaw(ctx, payload, nil)
+
+	resp := <-respCh
+	if resp.Err != nil {
+		return nil, resp.Err
+	}
+	if err := toError(resp.StatusCode, resp.Status); err != nil {
+		return nil, err
+	}
+
+	body := &ArticleBody{
+		MessageID: messageID,
+		BytesDecoded:  resp.Meta.BytesDecoded,
+		BytesConsumed: resp.Meta.BytesConsumed,
+	}
+	if buf := resp.Body.Bytes(); len(buf) > 0 {
+		body.Bytes = buf
+	}
+	return body, nil
+}
+
+// sendRaw sends a BODY request with RawMode, returning raw bytes without decoding.
+func (c *Client) sendRaw(ctx context.Context, payload []byte, bodyWriter io.Writer) <-chan Response {
+	respCh := make(chan Response, 1)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go c.doSendRaw(ctx, payload, bodyWriter, respCh)
+	return respCh
+}
+
+// doSendRaw is the raw-mode variant of doSendWithRetry.
+func (c *Client) doSendRaw(ctx context.Context, payload []byte, bodyWriter io.Writer, respCh chan Response) {
+	defer close(respCh)
+
+	tryGroup := func(g *providerGroup) (resp Response, ok bool, done bool) {
+		innerCh := make(chan Response, 1)
+		req := &Request{
+			Ctx:        ctx,
+			Payload:    payload,
+			RespCh:     innerCh,
+			BodyWriter: bodyWriter,
+			RawMode:    true,
+		}
+
+		// Try hot channel first (non-blocking)
+		select {
+		case g.hotReqCh <- req:
+		default:
+			select {
+			case <-c.ctx.Done():
+				return Response{}, false, true
+			case <-ctx.Done():
+				return Response{}, false, true
+			case <-g.ctx.Done():
+				return Response{}, false, false
+			case g.reqCh <- req:
+			}
+		}
+
+		select {
+		case resp, ok = <-innerCh:
+		case <-c.ctx.Done():
+			return Response{}, false, true
+		case <-ctx.Done():
+			return Response{}, false, true
+		case <-g.ctx.Done():
+			return Response{}, false, false
+		}
+		return resp, ok, false
+	}
+
+	var lastResp Response
+	hasResp := false
+
+	// 1. Try all main providers
+	mains := *c.mainGroups.Load()
+	n := len(mains)
+	if n == 0 {
+		respCh <- Response{Err: errors.New("nntp: no main providers")}
+		return
+	}
+
+	var start int
+	switch c.dispatch {
+	case DispatchFIFO:
+		for i, g := range mains {
+			if g.gate.available.Load() > 0 && !g.isQuotaExceeded() {
+				start = i
+				break
+			}
+		}
+	case DispatchRoundRobin:
+		start = int(c.rrIndex.Add(1)) % n
+	default:
+		start = rand.IntN(n)
+	}
+
+	for attempt := 0; attempt < n; attempt++ {
+		idx := (start + attempt) % n
+		g := mains[idx]
+
+		resp, _, done := tryGroup(g)
+		if done {
+			respCh <- resp
+			return
+		}
+		if resp.Err == nil {
+			respCh <- resp
+			return
+		}
+
+		lastResp = resp
+		hasResp = true
+	}
+
+	// 2. Try all fallback providers
+	fallbacks := *c.fallbackGroups.Load()
+	for _, g := range fallbacks {
+		resp, _, done := tryGroup(g)
+		if done {
+			respCh <- resp
+			return
+		}
+		if resp.Err == nil {
+			respCh <- resp
+			return
+		}
+
+		lastResp = resp
+		hasResp = true
+	}
+
+	// All attempts failed
+	if hasResp {
+		respCh <- lastResp
+	} else {
+		respCh <- Response{Err: errors.New("nntp: no providers available")}
+	}
+}
+
 // Head retrieves the headers of an article.
 func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, error) {
 	payload := []byte("HEAD <" + messageID + ">\r\n")
