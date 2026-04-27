@@ -204,7 +204,7 @@ func (h PostHeaders) WriteTo(w io.Writer) (int64, error) {
 		if t.IsZero() {
 			t = time.Now().UTC()
 		}
-		if err := write("Date", t.UTC().Format(time.RFC1123Z)); err != nil {
+		if err := write("Date", t.UTC().Format(time.RFC1123)); err != nil {
 			return total, err
 		}
 	}

@@ -100,9 +100,9 @@ func TestPostHeaders_WriteTo(t *testing.T) {
 		if !strings.Contains(got, "Date: ") {
 			t.Error("expected auto-generated Date header")
 		}
-		// RFC1123Z format ends with numeric offset like " +0000".
-		if !strings.Contains(got, " +0000\r\n") && !strings.Contains(got, " -0000\r\n") {
-			t.Errorf("Date header not in RFC1123Z numeric-offset format: %q", got)
+		// RFC1123 format ends with timezone abbreviation like "UTC".
+		if !strings.Contains(got, " UTC\r\n") {
+			t.Errorf("Date header not in RFC1123 format: %q", got)
 		}
 	})
 
@@ -118,7 +118,7 @@ func TestPostHeaders_WriteTo(t *testing.T) {
 		if _, err := h.WriteTo(&buf); err != nil {
 			t.Fatalf("WriteTo error: %v", err)
 		}
-		want := "Date: " + fixed.Format(time.RFC1123Z) + "\r\n"
+		want := "Date: " + fixed.Format(time.RFC1123) + "\r\n"
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("want %q, got %q", want, buf.String())
 		}
