@@ -1636,3 +1636,121 @@ func TestClient_AllQuotaExceeded_ReturnsError(t *testing.T) {
 		t.Errorf("error = %v, want errors.Is(ErrQuotaExceeded)", resp.Err)
 	}
 }
+
+func TestClient_ResetProviderQuota_NotFound(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "a:119", Factory: func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 ready\r\n"))
+				buf := make([]byte, 512)
+				for {
+					if _, err := server.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+			return client, nil
+		}, Connections: 1, SkipPing: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if err := c.ResetProviderQuota("nonexistent:119"); err == nil {
+		t.Error("ResetProviderQuota() on unknown provider should return an error")
+	}
+}
+
+func TestClient_ResetProviderQuota_ClearsQuota(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "b:119", Factory: func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 ready\r\n"))
+				buf := make([]byte, 512)
+				for {
+					if _, err := server.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+			return client, nil
+		}, Connections: 1, SkipPing: true, QuotaBytes: 1_000_000},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Simulate quota exhaustion.
+	g := (*c.mainGroups.Load())[0]
+	g.stats.quotaUsed.Store(1_000_000)
+	g.stats.quotaExceeded.Store(true)
+
+	if err := c.ResetProviderQuota("b:119"); err != nil {
+		t.Fatalf("ResetProviderQuota() unexpected error: %v", err)
+	}
+
+	if g.stats.quotaUsed.Load() != 0 {
+		t.Errorf("quotaUsed after reset = %d, want 0", g.stats.quotaUsed.Load())
+	}
+	if g.stats.quotaExceeded.Load() {
+		t.Error("quotaExceeded should be false after reset")
+	}
+	// No period configured → resetAt should be 0.
+	if g.quotaResetAt.Load() != 0 {
+		t.Errorf("quotaResetAt = %d, want 0 when no period set", g.quotaResetAt.Load())
+	}
+}
+
+func TestClient_ResetProviderQuota_SchedulesNextPeriod(t *testing.T) {
+	period := time.Hour
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "c:119", Factory: func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 ready\r\n"))
+				buf := make([]byte, 512)
+				for {
+					if _, err := server.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+			return client, nil
+		}, Connections: 1, SkipPing: true, QuotaBytes: 1_000_000, QuotaPeriod: period},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	g := (*c.mainGroups.Load())[0]
+	g.stats.quotaUsed.Store(1_000_000)
+	g.stats.quotaExceeded.Store(true)
+
+	before := time.Now()
+	if err := c.ResetProviderQuota("c:119"); err != nil {
+		t.Fatalf("ResetProviderQuota() unexpected error: %v", err)
+	}
+	after := time.Now()
+
+	if g.stats.quotaUsed.Load() != 0 {
+		t.Errorf("quotaUsed after reset = %d, want 0", g.stats.quotaUsed.Load())
+	}
+	if g.stats.quotaExceeded.Load() {
+		t.Error("quotaExceeded should be false after reset")
+	}
+
+	resetAt := time.Unix(0, g.quotaResetAt.Load())
+	earliest := before.Add(period)
+	latest := after.Add(period)
+	if resetAt.Before(earliest) || resetAt.After(latest) {
+		t.Errorf("quotaResetAt = %v, want in [%v, %v]", resetAt, earliest, latest)
+	}
+}
