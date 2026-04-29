@@ -72,7 +72,7 @@ func TestPostHeaders_WriteTo(t *testing.T) {
 		if !strings.Contains(got, "From: User <user@example.com>\r\n") {
 			t.Error("missing From header")
 		}
-		if !strings.Contains(got, "Newsgroups: alt.test,alt.test2\r\n") {
+		if !strings.Contains(got, "Newsgroups: alt.test, alt.test2\r\n") {
 			t.Error("missing/wrong Newsgroups header")
 		}
 		if !strings.Contains(got, "Message-ID: <unique123@example.com>\r\n") {

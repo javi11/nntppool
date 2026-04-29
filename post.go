@@ -186,7 +186,7 @@ func (h PostHeaders) WriteTo(w io.Writer) (int64, error) {
 	for i, g := range h.Newsgroups {
 		groups[i] = strings.TrimSpace(g)
 	}
-	if err := write("Newsgroups", strings.Join(groups, ",")); err != nil {
+	if err := write("Newsgroups", strings.Join(groups, ", ")); err != nil {
 		return total, err
 	}
 	if err := write("Subject", encodeHeaderValue(h.Subject)); err != nil {
