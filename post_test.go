@@ -72,7 +72,7 @@ func TestPostHeaders_WriteTo(t *testing.T) {
 		if !strings.Contains(got, "From: User <user@example.com>\r\n") {
 			t.Error("missing From header")
 		}
-		if !strings.Contains(got, "Newsgroups: alt.test,alt.test2\r\n") {
+		if !strings.Contains(got, "Newsgroups: alt.test, alt.test2\r\n") {
 			t.Error("missing/wrong Newsgroups header")
 		}
 		if !strings.Contains(got, "Message-ID: <unique123@example.com>\r\n") {
@@ -83,6 +83,153 @@ func TestPostHeaders_WriteTo(t *testing.T) {
 		}
 		if !strings.Contains(got, "X-No-Archive: yes\r\n") {
 			t.Error("missing X-No-Archive header")
+		}
+	})
+
+	t.Run("auto Date header", func(t *testing.T) {
+		h := PostHeaders{
+			From:       "user@example.com",
+			Subject:    "Test",
+			Newsgroups: []string{"alt.test"},
+		}
+		var buf bytes.Buffer
+		if _, err := h.WriteTo(&buf); err != nil {
+			t.Fatalf("WriteTo error: %v", err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, "Date: ") {
+			t.Error("expected auto-generated Date header")
+		}
+		// RFC1123 format ends with timezone abbreviation like "UTC".
+		if !strings.Contains(got, " UTC\r\n") {
+			t.Errorf("Date header not in RFC1123 format: %q", got)
+		}
+	})
+
+	t.Run("explicit Date field", func(t *testing.T) {
+		fixed := time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC)
+		h := PostHeaders{
+			From:       "user@example.com",
+			Subject:    "Test",
+			Newsgroups: []string{"alt.test"},
+			Date:       fixed,
+		}
+		var buf bytes.Buffer
+		if _, err := h.WriteTo(&buf); err != nil {
+			t.Fatalf("WriteTo error: %v", err)
+		}
+		want := "Date: " + fixed.Format(time.RFC1123) + "\r\n"
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("want %q, got %q", want, buf.String())
+		}
+	})
+
+	t.Run("Date in Extra is not overwritten", func(t *testing.T) {
+		h := PostHeaders{
+			From:       "user@example.com",
+			Subject:    "Test",
+			Newsgroups: []string{"alt.test"},
+			Extra:      map[string][]string{"Date": {"Mon, 02 Jan 2024 15:04:05 +0000"}},
+		}
+		var buf bytes.Buffer
+		if _, err := h.WriteTo(&buf); err != nil {
+			t.Fatalf("WriteTo error: %v", err)
+		}
+		got := buf.String()
+		if strings.Count(got, "Date: ") != 1 {
+			t.Errorf("expected exactly one Date header, got: %q", got)
+		}
+		if !strings.Contains(got, "Date: Mon, 02 Jan 2024 15:04:05 +0000\r\n") {
+			t.Error("caller-supplied Date was overwritten")
+		}
+	})
+
+	t.Run("validation rejects missing required fields", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			h       PostHeaders
+			wantSub string
+		}{
+			{"empty From", PostHeaders{Subject: "s", Newsgroups: []string{"a.b"}}, "From"},
+			{"whitespace From", PostHeaders{From: "   ", Subject: "s", Newsgroups: []string{"a.b"}}, "From"},
+			{"empty Subject", PostHeaders{From: "u@x", Newsgroups: []string{"a.b"}}, "Subject"},
+			{"no newsgroups", PostHeaders{From: "u@x", Subject: "s"}, "newsgroup"},
+			{"empty newsgroup", PostHeaders{From: "u@x", Subject: "s", Newsgroups: []string{""}}, "newsgroup"},
+			{"bad newsgroup char", PostHeaders{From: "u@x", Subject: "s", Newsgroups: []string{"alt test"}}, "newsgroup"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := tc.h.WriteTo(io.Discard)
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tc.wantSub) {
+					t.Errorf("error %q does not mention %q", err, tc.wantSub)
+				}
+			})
+		}
+	})
+
+	t.Run("rejects CRLF injection in headers", func(t *testing.T) {
+		cases := []PostHeaders{
+			{From: "u@x\r\nX-Injected: yes", Subject: "s", Newsgroups: []string{"a.b"}},
+			{From: "u@x", Subject: "s\r\nX-Injected: yes", Newsgroups: []string{"a.b"}},
+			{From: "u@x", Subject: "s", Newsgroups: []string{"a.b"}, MessageID: "<id\r\nX-Injected: yes>"},
+			{From: "u@x", Subject: "s", Newsgroups: []string{"a.b"}, Extra: map[string][]string{"X-Foo": {"bar\r\nX-Injected: yes"}}},
+		}
+		for i, h := range cases {
+			if _, err := h.WriteTo(io.Discard); err == nil {
+				t.Errorf("case %d: expected error, got nil", i)
+			}
+		}
+	})
+
+	t.Run("rejects malformed Message-ID", func(t *testing.T) {
+		cases := []string{"no-angle-brackets@x", "<missing-close@x", "missing-open@x>", "<has space@x>"}
+		for _, mid := range cases {
+			h := PostHeaders{From: "u@x", Subject: "s", Newsgroups: []string{"a.b"}, MessageID: mid}
+			if _, err := h.WriteTo(io.Discard); err == nil {
+				t.Errorf("Message-ID %q: expected error, got nil", mid)
+			}
+		}
+	})
+
+	t.Run("RFC 2047 encodes non-ASCII Subject", func(t *testing.T) {
+		h := PostHeaders{
+			From:       "user@example.com",
+			Subject:    "Café résumé",
+			Newsgroups: []string{"alt.test"},
+		}
+		var buf bytes.Buffer
+		if _, err := h.WriteTo(&buf); err != nil {
+			t.Fatalf("WriteTo error: %v", err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, "=?utf-8?b?") && !strings.Contains(got, "=?UTF-8?b?") {
+			t.Errorf("Subject not RFC 2047 encoded: %q", got)
+		}
+	})
+
+	t.Run("folds long Subject", func(t *testing.T) {
+		long := "Subject" + strings.Repeat(" word", 250) // ~1.2K bytes
+		h := PostHeaders{
+			From:       "user@example.com",
+			Subject:    long,
+			Newsgroups: []string{"alt.test"},
+		}
+		var buf bytes.Buffer
+		if _, err := h.WriteTo(&buf); err != nil {
+			t.Fatalf("WriteTo error: %v", err)
+		}
+		got := buf.String()
+		if !strings.Contains(got, "\r\n\t") {
+			t.Error("expected folded continuation \\r\\n\\t in long Subject")
+		}
+		// No physical line should exceed 998 octets.
+		for line := range strings.SplitSeq(got, "\r\n") {
+			if len(line) > 998 {
+				t.Errorf("line exceeds 998 octets: %d", len(line))
+			}
 		}
 	})
 }

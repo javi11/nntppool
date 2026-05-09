@@ -1905,3 +1905,31 @@ func (c *Client) RemoveProvider(name string) error {
 	}
 	return fmt.Errorf("nntp: provider %q not found", name)
 }
+
+// ResetProviderQuota resets the download quota for the named provider without
+// removing and re-adding it. The consumed-bytes counter and exceeded flag are
+// cleared atomically, and a fresh reset deadline is scheduled when the provider
+// has a non-zero quota period.
+//
+// Returns an error if no provider with that name is registered.
+func (c *Client) ResetProviderQuota(name string) error {
+	for _, ptr := range [...]*atomic.Pointer[[]*providerGroup]{
+		&c.mainGroups,
+		&c.backupGroups,
+	} {
+		for _, g := range *ptr.Load() {
+			if g.name != name {
+				continue
+			}
+			g.stats.quotaUsed.Store(0)
+			g.stats.quotaExceeded.Store(false)
+			if g.quotaPeriod > 0 {
+				g.quotaResetAt.Store(time.Now().Add(g.quotaPeriod).UnixNano())
+			} else {
+				g.quotaResetAt.Store(0)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("nntp: provider %q not found", name)
+}

@@ -438,7 +438,10 @@ func (c *Client) PostYenc(ctx context.Context, headers PostHeaders, body io.Read
 		if err = enc.Close(); err != nil {
 			return
 		}
-		_, err = pw.Write([]byte("\r\n.\r\n"))
+		// rapidyenc's Close already terminates the last line with CRLF, so we
+		// only need the dot-line terminator here. Writing "\r\n.\r\n" would
+		// inject a stray blank line before the dot.
+		_, err = pw.Write([]byte(".\r\n"))
 	}()
 
 	respCh := c.sendPost(ctx, pr)
