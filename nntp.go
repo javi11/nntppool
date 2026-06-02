@@ -1567,9 +1567,12 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	defer close(respCh)
 
 	tryGroup := func(g *providerGroup) (resp Response, ok bool, done bool) {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer attemptCancel()
+
 		innerCh := make(chan Response, 1)
 		req := &Request{
-			Ctx:        ctx,
+			Ctx:        attemptCtx,
 			Payload:    payload,
 			RespCh:     innerCh,
 			BodyWriter: bodyWriter,
@@ -1595,8 +1598,8 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			select {
 			case <-c.ctx.Done():
 				return Response{}, false, true
-			case <-ctx.Done():
-				return Response{}, false, true
+			case <-attemptCtx.Done():
+				return Response{}, false, ctx.Err() != nil
 			case <-g.ctx.Done():
 				return Response{}, false, false
 			case coldCh <- req:
@@ -1607,8 +1610,8 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		case resp, ok = <-innerCh:
 		case <-c.ctx.Done():
 			return Response{}, false, true
-		case <-ctx.Done():
-			return Response{}, false, true
+		case <-attemptCtx.Done():
+			return Response{}, false, ctx.Err() != nil
 		case <-g.ctx.Done():
 			return Response{}, false, false // provider removed; try others
 		}
