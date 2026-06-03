@@ -21,6 +21,14 @@ type SpeedTestOptions struct {
 	OnProgress      func(SpeedTestProgress)
 	NZBFetchTimeout time.Duration // defaults to 30s
 	ProviderName    string        // if set, test only this provider
+	// SegmentTimeout bounds each individual segment fetch when targeting a
+	// specific provider via ProviderName. Without this, a dead or very slow
+	// provider holds the entire speed test hostage until the caller's global
+	// context expires (typically 5 minutes).
+	// Defaults to 30s when ProviderName is set and SegmentTimeout is zero.
+	// Has no effect when ProviderName is empty (sendWithRetry handles its
+	// own per-attempt timeout via the global context).
+	SegmentTimeout time.Duration
 }
 
 // SpeedTestProgress is passed to OnProgress roughly every second.
@@ -133,10 +141,25 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 	// Fan-out: dispatch all segment requests.
 	testStart := time.Now()
 	respChans := make([]<-chan Response, totalSegs)
+
+	// Resolve the per-segment deadline used when targeting a specific provider.
+	// sendWithRetry has its own per-attempt timeout; sendToGroup does not, so we
+	// supply one here to prevent a dead provider from blocking the entire test.
+	segTimeout := opts.SegmentTimeout
+	if targetGroup != nil && segTimeout == 0 {
+		segTimeout = 30 * time.Second
+	}
+
 	for i, seg := range segments {
 		payload := append(append([]byte("BODY <"), seg.MessageID...), ">\r\n"...)
 		if targetGroup != nil {
-			respChans[i] = c.sendToGroup(stCtx, targetGroup, payload, io.Discard)
+			segCtx := stCtx
+			if segTimeout > 0 {
+				var segCancel context.CancelFunc
+				segCtx, segCancel = context.WithTimeout(stCtx, segTimeout)
+				defer segCancel() //nolint:gocritic // deferred inside loop intentionally; all cancelled on test exit
+			}
+			respChans[i] = c.sendToGroup(segCtx, targetGroup, payload, io.Discard)
 		} else {
 			respChans[i] = c.Send(stCtx, payload, io.Discard)
 		}
