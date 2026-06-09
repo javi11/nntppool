@@ -501,6 +501,61 @@ func TestClient_SendRetryFallbackBackup(t *testing.T) {
 	}
 }
 
+func TestClient_SendRetryConnectionDiedSameProvider(t *testing.T) {
+	// Simulate a stale pooled connection: the first connection the pool opens
+	// dies mid-request (server closes without responding), the next one is
+	// healthy. With a single provider there is no other provider to fall back
+	// to, so the pool must retry on a fresh same-provider connection instead of
+	// returning "all providers exhausted: ... connection died".
+	var connNum atomic.Int32
+
+	factory := func(ctx context.Context) (net.Conn, error) {
+		n := connNum.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			if n == 1 {
+				// Stale connection: accept one command, then drop the socket
+				// without responding, mimicking a server-closed idle connection.
+				_, _ = server.Read(buf)
+				_ = server.Close()
+				return
+			}
+			// Healthy connection: answer every STAT with 223.
+			for {
+				if _, err := server.Read(buf); err != nil {
+					return
+				}
+				_, _ = server.Write([]byte("223 1 <id@test> exists\r\n"))
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 1, SkipPing: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("Send() error = %v, want recovery on a fresh same-provider connection", resp.Err)
+	}
+	if resp.StatusCode != 223 {
+		t.Errorf("StatusCode = %d, want 223 after same-provider reconnect", resp.StatusCode)
+	}
+	if got := connNum.Load(); got < 2 {
+		t.Errorf("expected at least 2 connections (stale + fresh), got %d", got)
+	}
+}
+
 func TestClient_SendRetryAll430(t *testing.T) {
 	makeFactory430 := func() ConnFactory {
 		return func(ctx context.Context) (net.Conn, error) {
