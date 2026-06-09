@@ -18,6 +18,28 @@ import (
 var ErrMaxConnections = errors.New("nntp: server max connections reached")
 var ErrConnectionDied = errors.New("nntp: connection died")
 
+// isConnectionDeathError reports whether err indicates the underlying
+// connection failed at the transport layer (as opposed to a protocol-level
+// response like 430/502, which is delivered via StatusCode). These are
+// retryable on a fresh connection: an established connection that goes stale
+// surfaces ErrConnectionDied via failOutstanding, while a connection that dies
+// on its bootstrap request surfaces the raw IO error (EOF, closed pipe, reset,
+// timeout). Both mean "this socket is gone — open a new one."
+func isConnectionDeathError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrConnectionDied) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
 const (
 	// inflightDrainTimeout is the maximum time to wait for in-flight
 	// responses to complete during idle disconnect.
@@ -42,6 +64,12 @@ const (
 	// defaultHandshakeTimeout caps the TCP dial + TLS handshake phase
 	// to avoid hanging against unresponsive servers.
 	defaultHandshakeTimeout = 10 * time.Second
+
+	// maxConnDiedRetries bounds same-provider retries when a pooled connection
+	// dies mid-request (typically a stale socket the server already closed).
+	// The dead connection has drained by the time the error surfaces, so the
+	// retry uses a fresh connection on the same provider.
+	maxConnDiedRetries = 2
 )
 
 type greetingError struct {
@@ -1618,6 +1646,27 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		return resp, ok, false
 	}
 
+	// tryGroupResilient retries a single provider on a fresh connection when a
+	// pooled connection dies mid-request (stale socket the server already
+	// closed). Without this, a single-provider pool fails immediately with
+	// "all providers exhausted: ... connection died" because there is no next
+	// provider to fall back to. Bounded so a genuinely-down server still fails
+	// fast. Only transport-level connection death is retried (see
+	// isConnectionDeathError); 430/502/quota and provider removal (!ok) keep
+	// their existing behavior.
+	tryGroupResilient := func(g *providerGroup) (resp Response, ok bool, cancelled bool) {
+		for r := 0; ; r++ {
+			resp, ok, cancelled = tryGroup(g)
+			if cancelled || !ok {
+				return
+			}
+			if r < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
+				continue // dead connection drained; retry fresh on same provider
+			}
+			return
+		}
+	}
+
 	var lastResp Response
 	hasResp := false
 	var lastErr error
@@ -1681,7 +1730,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 			continue
 		}
-		resp, ok, cancelled := tryGroup(g)
+		resp, ok, cancelled := tryGroupResilient(g)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
@@ -1734,7 +1783,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 			continue
 		}
-		resp, ok, cancelled := tryGroup(g)
+		resp, ok, cancelled := tryGroupResilient(g)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
