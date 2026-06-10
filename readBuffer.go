@@ -105,15 +105,26 @@ func (rb *readBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bo
 	return n, err
 }
 
-func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.Writer, deadline func() (time.Time, bool)) error {
+// feedUntilDone streams a response off the wire into out, decoding via feeder.
+//
+// deadline is consulted before every read; it receives wireBytes, the
+// cumulative number of bytes already read from conn during this call. This
+// lets callers distinguish "still waiting for the first response byte" (a
+// time-to-first-byte bound) from "bytes are flowing" (a rolling progress/stall
+// bound), and to detect progress even when the decoder consumes 0 bytes from a
+// partial line.
+func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.Writer, deadline func(wireBytes int) (time.Time, bool)) error {
 	rb.init()
+	wireBytes := 0
 
 	for {
 		// Ensure we have some bytes to feed.
 		if rb.start == rb.end {
 			rb.start, rb.end = 0, 0
-			dl, ok := deadline()
-			if _, err := rb.readMore(conn, dl, ok); err != nil {
+			dl, ok := deadline(wireBytes)
+			n, err := rb.readMore(conn, dl, ok)
+			wireBytes += n
+			if err != nil {
 				return err
 			}
 		}
@@ -136,8 +147,10 @@ func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.W
 			rb.compact()
 		}
 
-		dl, ok := deadline()
-		if _, err := rb.readMore(conn, dl, ok); err != nil {
+		dl, ok := deadline(wireBytes)
+		n, err := rb.readMore(conn, dl, ok)
+		wireBytes += n
+		if err != nil {
 			return err
 		}
 	}

@@ -206,7 +206,7 @@ func TestFeed_ByteAtATime(t *testing.T) {
 	r := &NNTPResponse{}
 	var decoded bytes.Buffer
 	var rb readBuffer
-	err := rb.feedUntilDone(client, r, &decoded, func() (time.Time, bool) {
+	err := rb.feedUntilDone(client, r, &decoded, func(int) (time.Time, bool) {
 		return time.Time{}, false
 	})
 	if err != nil {
@@ -701,7 +701,7 @@ func TestFeed_ProtocolDesyncReaderLoop(t *testing.T) {
 
 	rb := readBuffer{}
 	resp := NNTPResponse{}
-	err := rb.feedUntilDone(client, &resp, io.Discard, func() (time.Time, bool) {
+	err := rb.feedUntilDone(client, &resp, io.Discard, func(int) (time.Time, bool) {
 		return time.Time{}, false
 	})
 	if err != ErrProtocolDesync {

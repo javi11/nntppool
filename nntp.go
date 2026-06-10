@@ -70,6 +70,37 @@ const (
 	// The dead connection has drained by the time the error surfaces, so the
 	// retry uses a fresh connection on the same provider.
 	maxConnDiedRetries = 2
+
+	// minAttemptTimeout is the floor (and default) for the per-attempt timeout
+	// that bounds dispatch + time-to-first-response-byte. Once response bytes
+	// start flowing, the rolling stall timeout takes over instead.
+	minAttemptTimeout = 2 * time.Second
+
+	// maxAttemptTimeout caps the adaptive per-attempt timeout derived from a
+	// provider's measured round-trip time.
+	maxAttemptTimeout = 10 * time.Second
+
+	// defaultStallTimeout is the rolling progress deadline applied to a body
+	// transfer once bytes are flowing: if no further bytes arrive within this
+	// window the connection is considered stalled and torn down. A healthy but
+	// slow transfer keeps extending the deadline and never trips it.
+	defaultStallTimeout = 8 * time.Second
+
+	// stallDeadlineQuantum coarsens stall-deadline updates so the read path
+	// issues at most one SetReadDeadline syscall per quantum instead of one per
+	// read.
+	stallDeadlineQuantum = 250 * time.Millisecond
+)
+
+// Attempt lifecycle states, coordinating the race between tryGroup's attempt
+// timer and the reader observing the first response byte. The CAS handshake
+// guarantees exactly one of them "wins": if the reader commits first the
+// attempt is never abandoned mid-stream; if the timer fires first the attempt
+// fails over and the reader drops the (cancelled) request.
+const (
+	attemptPending   int32 = iota // no response byte seen yet
+	attemptCommitted              // reader saw the first response byte
+	attemptAbandoned              // tryGroup timed out before any byte arrived
 )
 
 type greetingError struct {
@@ -108,6 +139,22 @@ type Request struct {
 	// sends nil after reading 340 (proceed to write body) or a non-nil error
 	// otherwise (e.g. 440 posting not allowed). Buffered with capacity 1.
 	postReadyCh chan error
+
+	// attemptDeadline bounds dispatch + time-to-first-response-byte for this
+	// attempt. Zero means no such bound (e.g. POST and keepalive requests).
+	// Once the reader sees the first byte the attempt is committed and this
+	// deadline no longer applies — the connection's rolling stall timeout does.
+	attemptDeadline time.Time
+
+	// attemptState is one of attemptPending/attemptCommitted/attemptAbandoned.
+	// The reader CASes pending→committed on the first response byte; tryGroup's
+	// timer CASes pending→abandoned on expiry. Zero value is attemptPending.
+	attemptState atomic.Int32
+
+	// sentAt is the Unix-nanosecond timestamp at which the payload was handed
+	// to the connection, used to measure time-to-first-byte. 0 = unset (the
+	// request is not measured, e.g. POST/keepalive).
+	sentAt atomic.Int64
 }
 
 type Response struct {
@@ -141,11 +188,11 @@ type NNTPConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	reqCh      <-chan *Request
-	prioCh     <-chan *Request // priority channel; nil for standalone connections
-	hotReqCh   <-chan *Request // unbuffered; set by runConnSlot before Run()
-	hotPrioCh  <-chan *Request // unbuffered; set by runConnSlot before Run()
-	pending    chan *Request
+	reqCh     <-chan *Request
+	prioCh    <-chan *Request // priority channel; nil for standalone connections
+	hotReqCh  <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotPrioCh <-chan *Request // unbuffered; set by runConnSlot before Run()
+	pending   chan *Request
 
 	inflightSem chan struct{}
 
@@ -155,10 +202,11 @@ type NNTPConnection struct {
 
 	firstReq          *Request      // bootstrap request from connection slot
 	idleTimeout       time.Duration // 0 = no idle timeout
+	stallTimeout      time.Duration // rolling body-progress deadline; 0 = disabled
 	keepaliveInterval time.Duration // 0 = no keepalive
 	keepaliveCommand  string        // NNTP command for keepalive probe (e.g. "DATE")
 	providerName      string        // set by runConnSlot; used for error context
-	userAgent string
+	userAgent         string
 
 	stats *providerStats // nil for standalone connections
 
@@ -209,17 +257,17 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 	}
 
 	c := &NNTPConnection{
-		conn:              conn,
-		ctx:               cctx,
-		cancel:            cancel,
-		reqCh:             reqCh,
-		prioCh:            prioCh,
-		pending:           make(chan *Request, inflightLimit),
-		inflightSem:       make(chan struct{}, inflightLimit),
-		rb:                rb,
-		stats:             stats,
-		done:              make(chan struct{}),
-		userAgent: userAgent,
+		conn:        conn,
+		ctx:         cctx,
+		cancel:      cancel,
+		reqCh:       reqCh,
+		prioCh:      prioCh,
+		pending:     make(chan *Request, inflightLimit),
+		inflightSem: make(chan struct{}, inflightLimit),
+		rb:          rb,
+		stats:       stats,
+		done:        make(chan struct{}),
+		userAgent:   userAgent,
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -503,7 +551,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, userAgent string, idleTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -591,6 +639,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// ACTIVE: run the connection with the bootstrap request.
 		nc.firstReq = firstReq
 		nc.idleTimeout = idleTimeout
+		nc.stallTimeout = stallTimeout
 		nc.providerName = providerName
 		nc.hotReqCh = hotReqCh
 		nc.hotPrioCh = hotPrioCh
@@ -683,7 +732,7 @@ func (c *NNTPConnection) Run() {
 			return
 		}
 
-		dl, hasDL := req.Ctx.Deadline()
+		dl, hasDL := req.writeDeadline()
 		setWriteDeadline(dl, hasDL)
 
 		if _, err := bw.Write(req.Payload); err != nil {
@@ -739,6 +788,7 @@ func (c *NNTPConnection) Run() {
 					return
 				}
 			}
+			req.sentAt.Store(time.Now().UnixNano())
 			c.pending <- req
 		}
 	}
@@ -908,7 +958,7 @@ mainLoop:
 		}
 
 		// per-request write deadline (cached to avoid redundant syscalls)
-		dl, hasDL := req.Ctx.Deadline()
+		dl, hasDL := req.writeDeadline()
 		setWriteDeadline(dl, hasDL)
 
 		// pipeline write (buffered; flushed at top of loop before blocking)
@@ -966,6 +1016,7 @@ mainLoop:
 				}
 			}
 			// track FIFO ordering (after writes succeed to avoid send on closed channel)
+			req.sentAt.Store(time.Now().UnixNano())
 			c.pending <- req
 		}
 	}
@@ -1018,7 +1069,17 @@ func (c *NNTPConnection) readerLoop() {
 		// we are still draining the response.
 		outRef := &writerRef{w: out}
 
-		err := c.rb.feedUntilDone(c.conn, &decoder, outRef, func() (time.Time, bool) {
+		// Progress-aware deadline: before the first response byte we honor the
+		// attempt deadline (dispatch + TTFB bound); once bytes flow we switch to
+		// a rolling stall deadline that the wire progress keeps extending, so a
+		// healthy-but-slow body never trips it. The caller's own ctx deadline
+		// always still applies as an upper bound.
+		stall := c.stallTimeout
+		lastBytes := 0
+		var stallDeadline time.Time
+		var firstByteAt time.Time
+		respStart := time.Now()
+		err := c.rb.feedUntilDone(c.conn, &decoder, outRef, func(wireBytes int) (time.Time, bool) {
 			if deliver {
 				select {
 				case <-req.Ctx.Done():
@@ -1027,7 +1088,27 @@ func (c *NNTPConnection) readerLoop() {
 				default:
 				}
 			}
-			return req.Ctx.Deadline()
+			if wireBytes > lastBytes {
+				lastBytes = wireBytes
+				if firstByteAt.IsZero() {
+					firstByteAt = time.Now()
+				}
+				req.attemptState.CompareAndSwap(attemptPending, attemptCommitted)
+				if stall > 0 {
+					if dl := time.Now().Add(stall); dl.Sub(stallDeadline) >= stallDeadlineQuantum {
+						stallDeadline = dl
+					}
+				}
+			}
+			parentDL, hasParent := req.Ctx.Deadline()
+			switch {
+			case lastBytes == 0 && !req.attemptDeadline.IsZero():
+				return minDeadline(req.attemptDeadline, parentDL, hasParent)
+			case lastBytes > 0 && stall > 0:
+				return minDeadline(stallDeadline, parentDL, hasParent)
+			default:
+				return parentDL, hasParent
+			}
 		})
 		if err != nil {
 			if c.providerName != "" {
@@ -1051,7 +1132,7 @@ func (c *NNTPConnection) readerLoop() {
 					req.postReadyCh <- nil
 				}
 				decoder2 := NNTPResponse{}
-				err2 := c.rb.feedUntilDone(c.conn, &decoder2, io.Discard, func() (time.Time, bool) {
+				err2 := c.rb.feedUntilDone(c.conn, &decoder2, io.Discard, func(wireBytes int) (time.Time, bool) {
 					if deliver {
 						select {
 						case <-req.Ctx.Done():
@@ -1091,6 +1172,20 @@ func (c *NNTPConnection) readerLoop() {
 				c.stats.Missing.Add(1)
 			} else if decoder.StatusCode < 200 || decoder.StatusCode >= 400 {
 				c.stats.Errors.Add(1)
+			} else {
+				// Successful transfer: feed the TTFB and throughput EWMAs that
+				// drive the adaptive attempt timeout and speed-aware dispatch.
+				// firstByteAt is unset when the whole response arrived in a
+				// single read; fall back to the read start. recordTTFB/Speed
+				// ignore non-positive and sub-floor samples respectively.
+				fb := firstByteAt
+				if fb.IsZero() {
+					fb = respStart
+				}
+				if sentAt := req.sentAt.Load(); sentAt != 0 {
+					recordTTFB(c.stats, fb.Sub(time.Unix(0, sentAt)))
+				}
+				recordSpeed(c.stats, n, time.Since(fb))
 			}
 		}
 
@@ -1136,7 +1231,7 @@ func (c *NNTPConnection) readerLoop() {
 // Any unread bytes remain buffered in c.rbuf[c.rstart:c.rend] for subsequent reads.
 func (c *NNTPConnection) readOneResponse(out io.Writer) (NNTPResponse, error) {
 	resp := NNTPResponse{}
-	if err := c.rb.feedUntilDone(c.conn, &resp, out, func() (time.Time, bool) { return time.Time{}, false }); err != nil {
+	if err := c.rb.feedUntilDone(c.conn, &resp, out, func(int) (time.Time, bool) { return time.Time{}, false }); err != nil {
 		return resp, err
 	}
 	return resp, nil
@@ -1159,8 +1254,9 @@ const (
 type ClientOption func(*clientConfig)
 
 type clientConfig struct {
-	dispatch     DispatchStrategy
-	statProbeOff bool
+	dispatch      DispatchStrategy
+	statProbeOff  bool
+	speedAwareOff bool
 }
 
 // WithDispatchStrategy sets the request distribution strategy for main providers.
@@ -1179,6 +1275,15 @@ func WithStatProbe(enabled bool) ClientOption {
 	return func(cfg *clientConfig) { cfg.statProbeOff = !enabled }
 }
 
+// WithSpeedAwareDispatch enables or disables speed-aware weighting of the
+// DispatchRoundRobin strategy. When enabled (the default), each provider's
+// round-robin weight is scaled by its observed throughput so faster providers
+// receive proportionally more traffic; available connection capacity still
+// governs the base weight. Has no effect under DispatchFIFO.
+func WithSpeedAwareDispatch(enabled bool) ClientOption {
+	return func(cfg *clientConfig) { cfg.speedAwareOff = !enabled }
+}
+
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
 	Host            string
@@ -1193,6 +1298,19 @@ type Provider struct {
 	ThrottleRestore time.Duration // 0 defaults to 30s
 	KeepAlive       time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
 	ReconnectDelay  time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
+
+	// AttemptTimeout bounds dispatch plus time-to-first-response-byte for each
+	// attempt against this provider (it does NOT bound the body transfer, which
+	// is governed by StallTimeout). 0 selects an adaptive value derived from the
+	// provider's measured RTT, clamped to [2s, 10s]. Set explicitly to override.
+	AttemptTimeout time.Duration
+
+	// StallTimeout is the rolling progress deadline for a body transfer: once
+	// bytes are flowing, the read deadline is extended by StallTimeout on each
+	// chunk of progress, so a slow-but-healthy download never times out while a
+	// truly stalled one is torn down. 0 defaults to 8s; negative disables it
+	// (only the caller's context deadline applies).
+	StallTimeout time.Duration
 
 	// KeepaliveInterval, if non-zero, sends a lightweight NNTP command
 	// periodically when the connection is idle, to detect zombie connections
@@ -1231,23 +1349,46 @@ type Provider struct {
 }
 
 type providerGroup struct {
-	name     string
-	host     string // raw Provider.Host; empty for Factory-based providers
-	maxConns int
-	ctx      context.Context    // cancelled on removal/close
-	reqCh    chan *Request
-	prioCh   chan *Request // priority requests; connections prefer this over reqCh
+	name      string
+	host      string // raw Provider.Host; empty for Factory-based providers
+	maxConns  int
+	ctx       context.Context // cancelled on removal/close
+	reqCh     chan *Request
+	prioCh    chan *Request // priority requests; connections prefer this over reqCh
 	hotReqCh  chan *Request // unbuffered; hot (connected) connections read this
 	hotPrioCh chan *Request // unbuffered; hot priority connections read this
-	gate     *connGate
-	stats    providerStats
-	cancel   context.CancelFunc // cancels this group's slot goroutines
-	p        Provider           // original config; used for auto-reconnect
+	gate      *connGate
+	stats     providerStats
+	cancel    context.CancelFunc // cancels this group's slot goroutines
+	p         Provider           // original config; used for auto-reconnect
 
 	// Quota period configuration. quotaBytes/quotaUsed/quotaExceeded live in
 	// stats so that NNTPConnection can update them via its *providerStats pointer.
 	quotaPeriod  time.Duration // 0 = no auto-reset
 	quotaResetAt atomic.Int64  // Unix nanoseconds of next reset; 0 = never
+}
+
+// attemptTimeout returns the per-attempt timeout (dispatch + time-to-first-byte
+// bound). An explicit Provider.AttemptTimeout wins; otherwise it adapts to the
+// provider's observed time-to-first-byte EWMA (seeded from the ping RTT) as
+// 4×TTFB, clamped to [minAttemptTimeout, maxAttemptTimeout]. With no sample yet
+// it falls back to minAttemptTimeout, preserving the historical 2s behavior.
+func (g *providerGroup) attemptTimeout() time.Duration {
+	if g.p.AttemptTimeout > 0 {
+		return g.p.AttemptTimeout
+	}
+	ttfb := g.stats.ttfbEWMA.Load()
+	if ttfb <= 0 {
+		return minAttemptTimeout
+	}
+	d := time.Duration(ttfb) * 4
+	if d < minAttemptTimeout {
+		return minAttemptTimeout
+	}
+	if d > maxAttemptTimeout {
+		return maxAttemptTimeout
+	}
+	return d
 }
 
 // isQuotaExceeded reports whether this provider has consumed its download quota
@@ -1286,6 +1427,7 @@ type Client struct {
 
 	dispatch   DispatchStrategy // set once by NewClient, read-only after
 	statProbe  bool             // set once by NewClient; enables parallel STAT probing on 430
+	speedAware bool             // set once by NewClient; weights round-robin dispatch by throughput
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
@@ -1446,6 +1588,19 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
 		g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
 		pingCancel()
+		// Seed the TTFB EWMA from the measured RTT so the adaptive attempt
+		// timeout has a sensible starting point before any request completes.
+		if g.stats.Ping.Err == nil && g.stats.Ping.RTT > 0 {
+			g.stats.ttfbEWMA.Store(int64(g.stats.Ping.RTT))
+		}
+	}
+
+	// Resolve the rolling stall timeout: 0 => default, negative => disabled.
+	stall := p.StallTimeout
+	if stall == 0 {
+		stall = defaultStallTimeout
+	} else if stall < 0 {
+		stall = 0
 	}
 
 	// Resolve keepalive settings. If SkipPing is true and no explicit command
@@ -1464,7 +1619,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.UserAgent, p.IdleTimeout, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
 	}
 
 	return g
@@ -1514,11 +1669,12 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	}
 
 	c := &Client{
-		ctx:       ctx,
-		cancel:    cancel,
-		dispatch:  cfg.dispatch,
-		statProbe: !cfg.statProbeOff,
-		startTime: time.Now(),
+		ctx:        ctx,
+		cancel:     cancel,
+		dispatch:   cfg.dispatch,
+		statProbe:  !cfg.statProbeOff,
+		speedAware: !cfg.speedAwareOff,
+		startTime:  time.Now(),
 	}
 	// Initialize empty slices.
 	c.mainGroups.Store(&[]*providerGroup{})
@@ -1759,6 +1915,13 @@ func (c *Client) raceCandidates(
 		return false, false, lastErr
 	}
 	if resp.Err != nil {
+		// A committed attempt with a caller writer already streamed partial
+		// bytes; deliver the error rather than letting the caller re-stream
+		// into the same writer on another provider.
+		if bodyWriter != nil && attemptCommittedResp(resp) {
+			respCh <- resp
+			return true, false, nil
+		}
 		return false, false, resp.Err
 	}
 	if resp.StatusCode == 430 || resp.StatusCode == 423 {
@@ -1781,8 +1944,36 @@ func (c *Client) raceCandidates(
 	return true, false, lastErr
 }
 
+// minDeadline returns d, unless other is an earlier deadline (when hasOther),
+// in which case it returns other. The bool is always true (a deadline exists).
+func minDeadline(d, other time.Time, hasOther bool) (time.Time, bool) {
+	if hasOther && other.Before(d) {
+		return other, true
+	}
+	return d, true
+}
+
+// writeDeadline is the deadline used while writing the request payload: the
+// earlier of the caller's ctx deadline and the attempt deadline, so a dead
+// socket cannot hang the writer. Payloads are tiny, so the attempt deadline is
+// a safe upper bound.
+func (req *Request) writeDeadline() (time.Time, bool) {
+	dl, ok := req.Ctx.Deadline()
+	if !req.attemptDeadline.IsZero() && (!ok || req.attemptDeadline.Before(dl)) {
+		return req.attemptDeadline, true
+	}
+	return dl, ok
+}
+
 // tryGroup dispatches a single request to a provider group and waits for the
 // response. priority=true routes through the priority channels.
+//
+// The attempt timeout bounds only dispatch + time-to-first-response-byte, not
+// the whole body transfer: the request ctx carries no fixed deadline, and a
+// timer races the response. If the timer fires before any byte arrives the
+// attempt is abandoned (CAS pending→abandoned) and we fail over; if the reader
+// committed first (it saw a byte) we keep waiting for the body to finish, since
+// failing over after partial delivery would corrupt a caller's writer.
 func (c *Client) tryGroup(
 	ctx context.Context,
 	g *providerGroup,
@@ -1791,17 +1982,22 @@ func (c *Client) tryGroup(
 	onMeta func(YEncMeta),
 	priority bool,
 ) (resp Response, ok bool, done bool) {
-	attemptCtx, attemptCancel := context.WithTimeout(ctx, 2*time.Second)
-	defer attemptCancel()
+	reqCtx, reqCancel := context.WithCancel(ctx)
+	defer reqCancel()
 
+	attemptTimeout := g.attemptTimeout()
 	innerCh := make(chan Response, 1)
 	req := &Request{
-		Ctx:        attemptCtx,
-		Payload:    payload,
-		RespCh:     innerCh,
-		BodyWriter: bodyWriter,
-		OnMeta:     onMeta,
+		Ctx:             reqCtx,
+		Payload:         payload,
+		RespCh:          innerCh,
+		BodyWriter:      bodyWriter,
+		OnMeta:          onMeta,
+		attemptDeadline: time.Now().Add(attemptTimeout),
 	}
+
+	timer := time.NewTimer(attemptTimeout)
+	defer timer.Stop()
 
 	var hotCh chan *Request
 	var coldCh chan *Request
@@ -1819,24 +2015,42 @@ func (c *Client) tryGroup(
 		select {
 		case <-c.ctx.Done():
 			return Response{}, false, true
-		case <-attemptCtx.Done():
+		case <-reqCtx.Done():
 			return Response{}, false, ctx.Err() != nil
 		case <-g.ctx.Done():
+			return Response{}, false, false
+		case <-timer.C:
+			// Could not be dispatched within the attempt window: the provider
+			// is saturated. Fail over.
 			return Response{}, false, false
 		case coldCh <- req:
 		}
 	}
 
-	select {
-	case resp, ok = <-innerCh:
-	case <-c.ctx.Done():
-		return Response{}, false, true
-	case <-attemptCtx.Done():
-		return Response{}, false, ctx.Err() != nil
-	case <-g.ctx.Done():
-		return Response{}, false, false
+	for {
+		select {
+		case resp, ok = <-innerCh:
+			return resp, ok, false
+		case <-c.ctx.Done():
+			return Response{}, false, true
+		case <-g.ctx.Done():
+			return Response{}, false, false
+		case <-reqCtx.Done():
+			return Response{}, false, ctx.Err() != nil
+		case <-timer.C:
+			if req.attemptState.CompareAndSwap(attemptPending, attemptAbandoned) {
+				// No response byte arrived in time: hung or too-slow to start.
+				// Cancel so the reader drops the request, and fail over.
+				reqCancel()
+				// done only when the caller's or the pool's context was
+				// cancelled (true shutdown), not on a plain attempt timeout.
+				return Response{}, false, ctx.Err() != nil || c.ctx.Err() != nil
+			}
+			// Reader already committed (first byte arrived): the body is
+			// streaming. Do not fail over; keep waiting for it to finish. The
+			// timer has fired and will not fire again.
+		}
 	}
-	return resp, ok, false
 }
 
 // hostSkipped reports whether host is already in the skip list.
@@ -1851,6 +2065,64 @@ func hostSkipped(host string, skipHosts *[4]string, count int) bool {
 		}
 	}
 	return false
+}
+
+// attemptCommittedResp reports whether the response came from an attempt that
+// had already started streaming bytes (the reader committed). Such an attempt
+// must not be retried or failed over when a caller-supplied writer is in use.
+func attemptCommittedResp(resp Response) bool {
+	return resp.Request != nil && resp.Request.attemptState.Load() == attemptCommitted
+}
+
+// maxSpeedScore is the highest multiplier speed-aware dispatch applies to a
+// provider's base (capacity) weight.
+const maxSpeedScore = 4
+
+// dispatchWeights computes cumulative round-robin weights for the given main
+// providers. The base weight is each provider's available connection capacity
+// (min 1 when live); quota-exceeded providers get weight 0. When speedAware is
+// true the base weight is scaled by speedScore so faster providers receive
+// proportionally more traffic. With no throughput samples this reduces to pure
+// capacity weighting (the historical behavior).
+func dispatchWeights(mains []*providerGroup, speedAware bool) (cum []int, total int) {
+	cum = make([]int, len(mains))
+	var maxSpeed float64
+	if speedAware {
+		for _, g := range mains {
+			if s := speedEWMABytesPerSec(&g.stats); s > maxSpeed {
+				maxSpeed = s
+			}
+		}
+	}
+	for i, g := range mains {
+		w := 0
+		if !g.isQuotaExceeded() {
+			w = max(1, int(g.gate.available.Load()))
+			if speedAware && maxSpeed > 0 {
+				w *= speedScore(speedEWMABytesPerSec(&g.stats), maxSpeed)
+			}
+		}
+		total += w
+		cum[i] = total
+	}
+	return cum, total
+}
+
+// speedScore maps a provider's throughput to an integer multiplier in
+// [1, maxSpeedScore] relative to the fastest provider. An unmeasured provider
+// (speed 0) scores the maximum so it is not starved before it has a sample.
+func speedScore(speed, maxSpeed float64) int {
+	if speed <= 0 {
+		return maxSpeedScore
+	}
+	s := int(float64(maxSpeedScore)*speed/maxSpeed + 0.5)
+	if s < 1 {
+		return 1
+	}
+	if s > maxSpeedScore {
+		return maxSpeedScore
+	}
+	return s
 }
 
 func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
@@ -1876,6 +2148,13 @@ func (c *Client) tryGroupResilient(
 	for r := 0; ; r++ {
 		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority)
 		if cancelled || !ok {
+			return
+		}
+		// If the attempt already streamed bytes into the caller's writer, never
+		// retry: partial data was delivered and re-streaming would corrupt it.
+		// Buffered requests (bodyWriter == nil) keep their per-attempt buffer,
+		// so retrying them stays safe.
+		if bodyWriter != nil && attemptCommittedResp(resp) {
 			return
 		}
 		if r < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
@@ -1927,19 +2206,9 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			}
 		}
 	default: // DispatchRoundRobin
-		// Dynamic weighted round-robin: each provider's weight equals
-		// its available capacity (allowed - held). Quota-exceeded providers
-		// get weight 0 so they are never selected during normal dispatch.
-		cumWeights := make([]int, n)
-		totalW := 0
-		for i, g := range mains {
-			avail := 0
-			if !g.isQuotaExceeded() {
-				avail = max(1, int(g.gate.available.Load()))
-			}
-			totalW += avail
-			cumWeights[i] = totalW
-		}
+		// Dynamic weighted round-robin. Quota-exceeded providers get weight 0
+		// so they are never selected during normal dispatch.
+		cumWeights, totalW := dispatchWeights(mains, c.speedAware)
 		if totalW == 0 {
 			// All providers are quota-exceeded; start at 0 and let the main
 			// loop below return ErrQuotaExceeded for each.
@@ -1974,6 +2243,13 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			continue
 		}
 		if resp.Err != nil {
+			// A committed attempt with a caller writer already streamed partial
+			// bytes; deliver the error rather than re-streaming into the same
+			// writer on another provider.
+			if bodyWriter != nil && attemptCommittedResp(resp) {
+				respCh <- resp
+				return
+			}
 			lastErr = resp.Err
 			continue
 		}
@@ -2074,6 +2350,13 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				continue
 			}
 			if resp.Err != nil {
+				// A committed attempt with a caller writer already streamed
+				// partial bytes; deliver the error rather than re-streaming into
+				// the same writer on another provider.
+				if bodyWriter != nil && attemptCommittedResp(resp) {
+					respCh <- resp
+					return
+				}
 				lastErr = resp.Err
 				continue
 			}
@@ -2121,11 +2404,14 @@ func (c *Client) Stats() ClientStats {
 			quotaUsed := g.stats.quotaUsed.Load()
 			ps := ProviderStats{
 				Name:              g.name,
+				SpeedEWMA:         speedEWMABytesPerSec(&g.stats),
 				BytesConsumed:     consumed,
 				Missing:           g.stats.Missing.Load(),
 				Errors:            g.stats.Errors.Load(),
 				ActiveConnections: running,
 				MaxConnections:    maxSlots,
+				AvailableSlots:    int(g.gate.available.Load()),
+				TTFB:              time.Duration(g.stats.ttfbEWMA.Load()),
 				Ping:              g.stats.Ping,
 				QuotaBytes:        g.stats.quotaBytes,
 				QuotaUsed:         quotaUsed,
