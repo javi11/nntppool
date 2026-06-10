@@ -235,7 +235,7 @@ func TestReadBuffer_FeedUntilDone(t *testing.T) {
 			},
 		}
 
-		err := rb.feedUntilDone(client, feeder, io.Discard, func() (time.Time, bool) {
+		err := rb.feedUntilDone(client, feeder, io.Discard, func(int) (time.Time, bool) {
 			return time.Time{}, false
 		})
 		if err != nil {
@@ -266,7 +266,7 @@ func TestReadBuffer_FeedUntilDone(t *testing.T) {
 			},
 		}
 
-		err := rb.feedUntilDone(client, feeder, io.Discard, func() (time.Time, bool) {
+		err := rb.feedUntilDone(client, feeder, io.Discard, func(int) (time.Time, bool) {
 			return time.Time{}, false
 		})
 		if err != nil {
@@ -293,7 +293,7 @@ func TestReadBuffer_FeedUntilDone(t *testing.T) {
 			},
 		}
 
-		err := rb.feedUntilDone(client, feeder, io.Discard, func() (time.Time, bool) {
+		err := rb.feedUntilDone(client, feeder, io.Discard, func(int) (time.Time, bool) {
 			return time.Time{}, false
 		})
 		if err != io.ErrUnexpectedEOF {
@@ -315,7 +315,7 @@ func TestReadBuffer_FeedUntilDone(t *testing.T) {
 			},
 		}
 
-		err := rb.feedUntilDone(client, feeder, io.Discard, func() (time.Time, bool) {
+		err := rb.feedUntilDone(client, feeder, io.Discard, func(int) (time.Time, bool) {
 			return time.Time{}, false
 		})
 		_ = client.Close()
@@ -348,7 +348,7 @@ func TestReadBuffer_FeedUntilDone(t *testing.T) {
 			},
 		}
 
-		err := rb.feedUntilDone(client, feeder, io.Discard, func() (time.Time, bool) {
+		err := rb.feedUntilDone(client, feeder, io.Discard, func(int) (time.Time, bool) {
 			return time.Time{}, false
 		})
 		if err != nil {
