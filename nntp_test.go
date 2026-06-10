@@ -1095,6 +1095,459 @@ func TestFailRequest_DoubleClose(t *testing.T) {
 	failRequest(ch, fmt.Errorf("err2"))
 }
 
+// --- extractProbeMsgID ---
+
+func TestExtractProbeMsgID(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    string // empty means nil expected
+	}{
+		{"BODY with msgid", "BODY <a@b>\r\n", "<a@b>"},
+		{"HEAD with msgid", "HEAD <foo@bar.example>\r\n", "<foo@bar.example>"},
+		{"ARTICLE with msgid", "ARTICLE <x@y>\r\n", "<x@y>"},
+		{"STAT is excluded", "STAT <a@b>\r\n", ""},
+		{"POST is excluded", "POST\r\n", ""},
+		{"GROUP has no msgid", "GROUP alt.test\r\n", ""},
+		{"DATE has no msgid", "DATE\r\n", ""},
+		{"malformed no closing >", "BODY <a@b\r\n", ""},
+		{"empty payload", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractProbeMsgID([]byte(tt.payload))
+			if tt.want == "" {
+				if got != nil {
+					t.Errorf("extractProbeMsgID() = %q, want nil", got)
+				}
+			} else {
+				if string(got) != tt.want {
+					t.Errorf("extractProbeMsgID() = %q, want %q", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// --- STAT probe failover tests ---
+
+// makeStatProbeFactory creates a ConnFactory for STAT probe tests.
+// cmdLog (guarded by mu) records every non-DATE command received.
+// responses maps command prefixes to response lines.
+func makeStatProbeFactory(t *testing.T, mu *sync.Mutex, cmdLog *[]string, responses map[string]string) ConnFactory {
+	t.Helper()
+	return func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				cmd := strings.TrimRight(string(buf[:n]), "\r\n")
+				// Always respond to DATE for ping.
+				if strings.HasPrefix(cmd, "DATE") {
+					_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					continue
+				}
+				mu.Lock()
+				*cmdLog = append(*cmdLog, cmd)
+				mu.Unlock()
+				var reply string
+				for prefix, resp := range responses {
+					if strings.HasPrefix(cmd, prefix) {
+						reply = resp
+						break
+					}
+				}
+				if reply == "" {
+					reply = "500 unknown command"
+				}
+				_, _ = fmt.Fprintf(server, "%s\r\n", reply)
+			}
+		}()
+		return client, nil
+	}
+}
+
+func TestSend_430StatProbeWinnerGetsBody(t *testing.T) {
+	// P1: BODY→430 (first attempt, forces probe).
+	// P2: STAT→430.
+	// P3: STAT→223, BODY→222 (winner).
+	var mu sync.Mutex
+	var p1Cmds, p2Cmds, p3Cmds []string
+
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p1Cmds, map[string]string{
+				"BODY": "430 no such article",
+				"STAT": "430 no such article",
+			}),
+			Connections: 1,
+		},
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p2Cmds, map[string]string{
+				"STAT": "430 no such article",
+			}),
+			Connections: 1,
+		},
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p3Cmds, map[string]string{
+				"STAT": "223 0 <test@host> article exists",
+				"BODY": "222 0 <test@host> body follows\r\n.\r\n",
+			}),
+			Connections: 1,
+		},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("unexpected error: %v", resp.Err)
+	}
+	if resp.StatusCode != 222 {
+		t.Errorf("StatusCode = %d, want 222", resp.StatusCode)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// P1 should have received BODY.
+	if len(p1Cmds) == 0 || !strings.HasPrefix(p1Cmds[0], "BODY") {
+		t.Errorf("P1 commands = %v, want first to be BODY", p1Cmds)
+	}
+	// P2 should have received STAT (probe), not BODY.
+	if len(p2Cmds) == 0 || !strings.HasPrefix(p2Cmds[0], "STAT") {
+		t.Errorf("P2 commands = %v, want first to be STAT probe", p2Cmds)
+	}
+	for _, cmd := range p2Cmds {
+		if strings.HasPrefix(cmd, "BODY") {
+			t.Error("P2 should not have received BODY")
+		}
+	}
+	// P3 should have received STAT then BODY.
+	if len(p3Cmds) < 2 {
+		t.Fatalf("P3 commands = %v, want at least STAT + BODY", p3Cmds)
+	}
+	if !strings.HasPrefix(p3Cmds[0], "STAT") {
+		t.Errorf("P3 first command = %q, want STAT", p3Cmds[0])
+	}
+	if !strings.HasPrefix(p3Cmds[1], "BODY") {
+		t.Errorf("P3 second command = %q, want BODY", p3Cmds[1])
+	}
+}
+
+func TestSend_430StatProbeParallel(t *testing.T) {
+	// P1: BODY→430 immediately.
+	// P2 and P3: STAT responds after 150ms with 430.
+	// If probed in parallel, total wait ≈ 150ms; sequential would be ≈ 300ms.
+	delay := 150 * time.Millisecond
+
+	makeDelayedFactory := func(cmdLog *[]string, mu *sync.Mutex, statReply string) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := strings.TrimRight(string(buf[:n]), "\r\n")
+					if strings.HasPrefix(cmd, "DATE") {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+						continue
+					}
+					mu.Lock()
+					*cmdLog = append(*cmdLog, cmd)
+					mu.Unlock()
+					if strings.HasPrefix(cmd, "STAT") {
+						time.Sleep(delay)
+					}
+					_, _ = fmt.Fprintf(server, "%s\r\n", statReply)
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	var mu sync.Mutex
+	var p1Cmds, p2Cmds, p3Cmds []string
+
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p1Cmds, map[string]string{
+				"BODY": "430 no such article",
+				"STAT": "430 no such article",
+			}),
+			Connections: 1,
+		},
+		{Factory: makeDelayedFactory(&p2Cmds, &mu, "430 no such article"), Connections: 1},
+		{Factory: makeDelayedFactory(&p3Cmds, &mu, "430 no such article"), Connections: 1},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != 430 {
+		t.Errorf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+	// Parallel: should finish in ~delay, not ~2*delay.
+	// Allow generous margin (3x) to avoid flakiness.
+	if elapsed > 3*delay {
+		t.Errorf("elapsed = %v, want ≤ %v (probes should be parallel)", elapsed, 3*delay)
+	}
+}
+
+func TestSend_All430WithStatProbeReturnsSaved430(t *testing.T) {
+	makeAll430 := func() ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := string(buf[:n])
+					if strings.HasPrefix(cmd, "DATE") {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					} else {
+						_, _ = server.Write([]byte("430 no such article\r\n"))
+					}
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeAll430(), Connections: 1},
+		{Factory: makeAll430(), Connections: 1},
+		{Factory: makeAll430(), Connections: 1, Backup: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("unexpected error: %v", resp.Err)
+	}
+	if resp.StatusCode != 430 {
+		t.Errorf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+}
+
+func TestSend_430NoMsgIDUsesSequentialFallback(t *testing.T) {
+	// GROUP command has no message-ID: probe should not be used.
+	// P1 returns error; P2 returns 211 success.
+	var mu sync.Mutex
+	var p2Cmds []string
+
+	makeGroupFactory := func(reply string, cmdLog *[]string) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer func() { _ = server.Close() }()
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					cmd := strings.TrimRight(string(buf[:n]), "\r\n")
+					if strings.HasPrefix(cmd, "DATE") {
+						_, _ = server.Write([]byte("111 20240315120000\r\n"))
+						continue
+					}
+					if cmdLog != nil {
+						mu.Lock()
+						*cmdLog = append(*cmdLog, cmd)
+						mu.Unlock()
+					}
+					_, _ = fmt.Fprintf(server, "%s\r\n", reply)
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeGroupFactory("430 no such article", nil), Connections: 1},
+		{Factory: makeGroupFactory("211 15 1 15 alt.test", &p2Cmds), Connections: 1},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use a command without a message-ID: STAT with a bare article number.
+	resp := <-c.Send(ctx, []byte("GROUP alt.test\r\n"), nil)
+	if resp.StatusCode != 211 {
+		t.Errorf("StatusCode = %d, want 211", resp.StatusCode)
+	}
+
+	// P2 should not have received any STAT probe — only the GROUP command.
+	mu.Lock()
+	defer mu.Unlock()
+	for _, cmd := range p2Cmds {
+		if strings.HasPrefix(cmd, "STAT") {
+			t.Errorf("P2 received STAT probe %q, expected only GROUP fallback", cmd)
+		}
+	}
+}
+
+func TestSend_WithStatProbeDisabled(t *testing.T) {
+	// With WithStatProbe(false), should NOT probe — fall back sequentially.
+	var mu sync.Mutex
+	var p1Cmds, p2Cmds []string
+
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p1Cmds, map[string]string{
+				"BODY": "430 no such article",
+			}),
+			Connections: 1,
+		},
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p2Cmds, map[string]string{
+				"BODY": "222 0 <test@host> body\r\n.\r\n",
+			}),
+			Connections: 1,
+		},
+	}, WithDispatchStrategy(DispatchFIFO), WithStatProbe(false))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	if resp.StatusCode != 222 {
+		t.Errorf("StatusCode = %d, want 222", resp.StatusCode)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// No STAT commands should have been sent to either provider.
+	for _, cmd := range p1Cmds {
+		if strings.HasPrefix(cmd, "STAT") {
+			t.Errorf("P1 received STAT %q but StatProbe is disabled", cmd)
+		}
+	}
+	for _, cmd := range p2Cmds {
+		if strings.HasPrefix(cmd, "STAT") {
+			t.Errorf("P2 received STAT %q but StatProbe is disabled", cmd)
+		}
+	}
+}
+
+func TestSend_430Probe502RemovesProvider(t *testing.T) {
+	// P1: BODY→430 (triggers probe of remaining providers).
+	// P2: STAT→502 (probe returns 502; P2 should be removed from pool).
+	// P3: STAT→223, BODY→222 (winner).
+	var mu sync.Mutex
+	var p1Cmds, p2Cmds, p3Cmds []string
+
+	p2Factory := func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				cmd := strings.TrimRight(string(buf[:n]), "\r\n")
+				if strings.HasPrefix(cmd, "DATE") {
+					_, _ = server.Write([]byte("111 20240315120000\r\n"))
+					continue
+				}
+				mu.Lock()
+				p2Cmds = append(p2Cmds, cmd)
+				mu.Unlock()
+				// Always reply 502 on STAT probe.
+				_, _ = server.Write([]byte("502 service unavailable\r\n"))
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p1Cmds, map[string]string{
+				"BODY": "430 no such article",
+				"STAT": "430 no such article",
+			}),
+			Connections: 1,
+		},
+		{Factory: p2Factory, Connections: 1},
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p3Cmds, map[string]string{
+				"STAT": "223 0 <test@host> exists",
+				"BODY": "222 0 <test@host> body\r\n.\r\n",
+			}),
+			Connections: 1,
+		},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("unexpected error: %v", resp.Err)
+	}
+	if resp.StatusCode != 222 {
+		t.Errorf("StatusCode = %d, want 222", resp.StatusCode)
+	}
+
+	// P2 should have been removed due to 502 probe response.
+	if c.NumProviders() != 2 {
+		t.Errorf("NumProviders() = %d, want 2 (P2 removed after 502 probe response)", c.NumProviders())
+	}
+}
+
 // --- resolveProviderName ---
 
 func TestResolveProviderName(t *testing.T) {

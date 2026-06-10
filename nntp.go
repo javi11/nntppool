@@ -1159,13 +1159,24 @@ const (
 type ClientOption func(*clientConfig)
 
 type clientConfig struct {
-	dispatch DispatchStrategy
+	dispatch     DispatchStrategy
+	statProbeOff bool
 }
 
 // WithDispatchStrategy sets the request distribution strategy for main providers.
 // The default is DispatchRoundRobin.
 func WithDispatchStrategy(s DispatchStrategy) ClientOption {
 	return func(cfg *clientConfig) { cfg.dispatch = s }
+}
+
+// WithStatProbe enables or disables parallel STAT probing on 430 failover.
+// When enabled (the default), after the first 430 response the remaining
+// providers are probed concurrently with lightweight STAT commands; only the
+// first provider that confirms article existence (223) receives the full
+// request. This reduces "article missing on N providers" latency from
+// sum-of-RTTs to max-of-RTTs.
+func WithStatProbe(enabled bool) ClientOption {
+	return func(cfg *clientConfig) { cfg.statProbeOff = !enabled }
 }
 
 // Provider describes a single NNTP server with its own credentials and connection count.
@@ -1273,7 +1284,8 @@ type Client struct {
 	backupGroups atomic.Pointer[[]*providerGroup]
 	nextIdx      atomic.Uint64 // round-robin counter for mainGroups
 
-	dispatch DispatchStrategy // set once by NewClient, read-only after
+	dispatch   DispatchStrategy // set once by NewClient, read-only after
+	statProbe  bool             // set once by NewClient; enables parallel STAT probing on 430
 
 	providerIdx atomic.Int64 // monotonic counter for unnamed providers
 
@@ -1505,6 +1517,7 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 		ctx:       ctx,
 		cancel:    cancel,
 		dispatch:  cfg.dispatch,
+		statProbe: !cfg.statProbeOff,
 		startTime: time.Now(),
 	}
 	// Initialize empty slices.
@@ -1573,6 +1586,259 @@ func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io
 	return respCh
 }
 
+// extractProbeMsgID returns the "<id@host>" message-ID from a BODY, HEAD, or
+// ARTICLE payload, or nil when the payload has no message-ID (GROUP, DATE, …)
+// or when the command is already STAT or POST (probing would be redundant or
+// inapplicable).
+func extractProbeMsgID(payload []byte) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+	// Reject commands where probing is irrelevant or already done.
+	switch {
+	case len(payload) >= 4 && (payload[0]|0x20) == 's' && (payload[1]|0x20) == 't' &&
+		(payload[2]|0x20) == 'a' && (payload[3]|0x20) == 't':
+		return nil // STAT
+	case len(payload) >= 4 && (payload[0]|0x20) == 'p' && (payload[1]|0x20) == 'o' &&
+		(payload[2]|0x20) == 's' && (payload[3]|0x20) == 't':
+		return nil // POST
+	}
+	open := bytes.IndexByte(payload, '<')
+	if open < 0 {
+		return nil
+	}
+	close := bytes.IndexByte(payload[open:], '>')
+	if close < 0 {
+		return nil
+	}
+	return payload[open : open+close+1]
+}
+
+// probeResult carries the outcome of one parallel STAT probe.
+type probeResult struct {
+	g         *providerGroup
+	resp      Response
+	ok        bool
+	cancelled bool
+}
+
+// raceCandidates probes candidates in parallel with STAT on the priority lane,
+// then sends the real payload to the first provider that confirms 223.
+// All-miss latency is max-of-RTTs instead of sum-of-RTTs.
+//
+// Note: when all probes miss, respCh is NOT written; the caller must deliver
+// the saved 430 response from the first provider that triggered the race.
+func (c *Client) raceCandidates(
+	ctx context.Context,
+	candidates []*providerGroup,
+	statPayload, payload []byte,
+	bodyWriter io.Writer,
+	onMeta func(YEncMeta),
+	skipHosts *[4]string,
+	skipCount *int,
+	respCh chan<- Response,
+) (delivered, cancelled bool, lastErr error) {
+	// Filter to live candidates (skip same hosts and quota-exceeded).
+	live := make([]*providerGroup, 0, len(candidates))
+	seen := make(map[string]bool)
+	for _, g := range candidates {
+		if hostSkipped(g.host, skipHosts, *skipCount) {
+			continue
+		}
+		if g.isQuotaExceeded() {
+			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+			continue
+		}
+		if g.host != "" && seen[g.host] {
+			continue
+		}
+		if g.host != "" {
+			seen[g.host] = true
+		}
+		live = append(live, g)
+	}
+
+	if len(live) == 0 {
+		return false, false, lastErr
+	}
+
+	// Single live candidate: skip the probe RTT and send the real payload directly.
+	if len(live) == 1 {
+		g := live[0]
+		resp, ok, done := c.tryGroup(ctx, g, payload, bodyWriter, onMeta, true)
+		if done {
+			return false, true, lastErr
+		}
+		if !ok {
+			return false, false, lastErr
+		}
+		if resp.Err != nil {
+			return false, false, resp.Err
+		}
+		if resp.StatusCode == 502 {
+			_ = c.RemoveProvider(g.name)
+			if g.p.ReconnectDelay > 0 {
+				c.scheduleReconnect(g)
+			}
+			return false, false, fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+		}
+		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+			if g.host != "" && *skipCount < len(skipHosts) {
+				skipHosts[*skipCount] = g.host
+				*skipCount++
+			}
+			c.nextIdx.Add(1)
+			return false, false, lastErr
+		}
+		respCh <- resp
+		return true, false, lastErr
+	}
+
+	// ≥2 candidates: probe all in parallel.
+	results := make(chan probeResult, len(live))
+	for _, g := range live {
+		go func(g *providerGroup) {
+			resp, ok, done := c.tryGroup(ctx, g, statPayload, nil, nil, true)
+			results <- probeResult{g: g, resp: resp, ok: ok, cancelled: done}
+		}(g)
+	}
+
+	// Collect ALL probe results before acting on the winner, so that side
+	// effects like 502 provider removal are applied regardless of order.
+	var winner *providerGroup
+	for range live {
+		pr := <-results
+		if pr.cancelled {
+			cancelled = true
+			continue
+		}
+		if !pr.ok {
+			continue
+		}
+		if pr.resp.Err != nil {
+			lastErr = pr.resp.Err
+			continue
+		}
+		g := pr.g
+		switch pr.resp.StatusCode {
+		case 502:
+			_ = c.RemoveProvider(g.name)
+			if g.p.ReconnectDelay > 0 {
+				c.scheduleReconnect(g)
+			}
+			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+		case 430, 423:
+			if g.host != "" && *skipCount < len(skipHosts) {
+				skipHosts[*skipCount] = g.host
+				*skipCount++
+			}
+			c.nextIdx.Add(1)
+		case 223:
+			if winner == nil {
+				winner = g // first 223; keep collecting for 502s
+			}
+		default:
+			lastErr = fmt.Errorf("%s: unexpected STAT probe status %d", g.name, pr.resp.StatusCode)
+		}
+	}
+
+	if cancelled {
+		return false, true, lastErr
+	}
+
+	if winner == nil {
+		return false, false, lastErr
+	}
+
+	// Send the real payload to the winner on the priority lane.
+	resp, ok, done := c.tryGroup(ctx, winner, payload, bodyWriter, onMeta, true)
+	if done {
+		return false, true, lastErr
+	}
+	if !ok {
+		return false, false, lastErr
+	}
+	if resp.Err != nil {
+		return false, false, resp.Err
+	}
+	if resp.StatusCode == 430 || resp.StatusCode == 423 {
+		// Rare: article expired between STAT and BODY.
+		if winner.host != "" && *skipCount < len(skipHosts) {
+			skipHosts[*skipCount] = winner.host
+			*skipCount++
+		}
+		c.nextIdx.Add(1)
+		return false, false, lastErr
+	}
+	if resp.StatusCode == 502 {
+		_ = c.RemoveProvider(winner.name)
+		if winner.p.ReconnectDelay > 0 {
+			c.scheduleReconnect(winner)
+		}
+		return false, false, fmt.Errorf("%s: %w", winner.name, ErrServiceUnavailable)
+	}
+	respCh <- resp
+	return true, false, lastErr
+}
+
+// tryGroup dispatches a single request to a provider group and waits for the
+// response. priority=true routes through the priority channels.
+func (c *Client) tryGroup(
+	ctx context.Context,
+	g *providerGroup,
+	payload []byte,
+	bodyWriter io.Writer,
+	onMeta func(YEncMeta),
+	priority bool,
+) (resp Response, ok bool, done bool) {
+	attemptCtx, attemptCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer attemptCancel()
+
+	innerCh := make(chan Response, 1)
+	req := &Request{
+		Ctx:        attemptCtx,
+		Payload:    payload,
+		RespCh:     innerCh,
+		BodyWriter: bodyWriter,
+		OnMeta:     onMeta,
+	}
+
+	var hotCh chan *Request
+	var coldCh chan *Request
+	if priority {
+		hotCh = g.hotPrioCh
+		coldCh = g.prioCh
+	} else {
+		hotCh = g.hotReqCh
+		coldCh = g.reqCh
+	}
+
+	select {
+	case hotCh <- req:
+	default:
+		select {
+		case <-c.ctx.Done():
+			return Response{}, false, true
+		case <-attemptCtx.Done():
+			return Response{}, false, ctx.Err() != nil
+		case <-g.ctx.Done():
+			return Response{}, false, false
+		case coldCh <- req:
+		}
+	}
+
+	select {
+	case resp, ok = <-innerCh:
+	case <-c.ctx.Done():
+		return Response{}, false, true
+	case <-attemptCtx.Done():
+		return Response{}, false, ctx.Err() != nil
+	case <-g.ctx.Done():
+		return Response{}, false, false
+	}
+	return resp, ok, false
+}
+
 // hostSkipped reports whether host is already in the skip list.
 // Empty hosts (Factory-based providers) are never skipped.
 func hostSkipped(host string, skipHosts *[4]string, count int) bool {
@@ -1591,85 +1857,49 @@ func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter i
 	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, false)
 }
 
+// tryGroupResilient retries a single provider on a fresh connection when a
+// pooled connection dies mid-request (stale socket the server already
+// closed). Without this, a single-provider pool fails immediately with
+// "all providers exhausted: ... connection died" because there is no next
+// provider to fall back to. Bounded so a genuinely-down server still fails
+// fast. Only transport-level connection death is retried (see
+// isConnectionDeathError); 430/502/quota and provider removal (!ok) keep
+// their existing behavior.
+func (c *Client) tryGroupResilient(
+	ctx context.Context,
+	g *providerGroup,
+	payload []byte,
+	bodyWriter io.Writer,
+	onMeta func(YEncMeta),
+	priority bool,
+) (resp Response, ok bool, cancelled bool) {
+	for r := 0; ; r++ {
+		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority)
+		if cancelled || !ok {
+			return
+		}
+		if r < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
+			continue // dead connection drained; retry fresh on same provider
+		}
+		return
+	}
+}
+
 func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool) {
 	defer close(respCh)
 
-	tryGroup := func(g *providerGroup) (resp Response, ok bool, done bool) {
-		attemptCtx, attemptCancel := context.WithTimeout(ctx, 2*time.Second)
-		defer attemptCancel()
-
-		innerCh := make(chan Response, 1)
-		req := &Request{
-			Ctx:        attemptCtx,
-			Payload:    payload,
-			RespCh:     innerCh,
-			BodyWriter: bodyWriter,
-			OnMeta:     onMeta,
-		}
-
-		var hotCh chan *Request
-		var coldCh chan *Request
-		if priority {
-			hotCh = g.hotPrioCh
-			coldCh = g.prioCh
-		} else {
-			hotCh = g.hotReqCh
-			coldCh = g.reqCh
-		}
-
-		// Try hot channel first (non-blocking): succeeds only if a
-		// hot connection is already waiting with inflight capacity.
-		select {
-		case hotCh <- req:
-		default:
-			// No hot connection available — send to cold channel.
-			select {
-			case <-c.ctx.Done():
-				return Response{}, false, true
-			case <-attemptCtx.Done():
-				return Response{}, false, ctx.Err() != nil
-			case <-g.ctx.Done():
-				return Response{}, false, false
-			case coldCh <- req:
-			}
-		}
-
-		select {
-		case resp, ok = <-innerCh:
-		case <-c.ctx.Done():
-			return Response{}, false, true
-		case <-attemptCtx.Done():
-			return Response{}, false, ctx.Err() != nil
-		case <-g.ctx.Done():
-			return Response{}, false, false // provider removed; try others
-		}
-		return resp, ok, false
-	}
-
-	// tryGroupResilient retries a single provider on a fresh connection when a
-	// pooled connection dies mid-request (stale socket the server already
-	// closed). Without this, a single-provider pool fails immediately with
-	// "all providers exhausted: ... connection died" because there is no next
-	// provider to fall back to. Bounded so a genuinely-down server still fails
-	// fast. Only transport-level connection death is retried (see
-	// isConnectionDeathError); 430/502/quota and provider removal (!ok) keep
-	// their existing behavior.
-	tryGroupResilient := func(g *providerGroup) (resp Response, ok bool, cancelled bool) {
-		for r := 0; ; r++ {
-			resp, ok, cancelled = tryGroup(g)
-			if cancelled || !ok {
-				return
-			}
-			if r < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
-				continue // dead connection drained; retry fresh on same provider
-			}
-			return
-		}
+	// Precompute for STAT probe: extract message-ID once.
+	msgID := extractProbeMsgID(payload)
+	raceable := c.statProbe && msgID != nil
+	var statPayload []byte
+	if raceable {
+		statPayload = append(append([]byte("STAT "), msgID...), "\r\n"...)
 	}
 
 	var lastResp Response
 	hasResp := false
 	var lastErr error
+	post430 := false
 
 	// Track hosts that returned 430 so we can skip other providers on
 	// the same server (different credentials won't help).
@@ -1730,7 +1960,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 			continue
 		}
-		resp, ok, cancelled := tryGroupResilient(g)
+		resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
@@ -1765,6 +1995,34 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			}
 			lastResp = resp
 			hasResp = true
+			post430 = true
+
+			if raceable {
+				// Build remaining mains and race them in parallel via STAT.
+				rest := make([]*providerGroup, 0, n-attempt-1)
+				for a := attempt + 1; a < n; a++ {
+					rest = append(rest, mains[(start+a)%n])
+				}
+				delivered, cancelled, raceErr := c.raceCandidates(
+					ctx, rest, statPayload, payload, bodyWriter, onMeta,
+					&skipHosts, &skipCount, respCh,
+				)
+				if cancelled {
+					err := ctx.Err()
+					if err == nil {
+						err = c.ctx.Err()
+					}
+					respCh <- Response{Err: err}
+					return
+				}
+				if delivered {
+					return
+				}
+				if raceErr != nil {
+					lastErr = raceErr
+				}
+				break // all remaining mains were probed in the race
+			}
 			continue
 		}
 		// Success.
@@ -1772,18 +2030,13 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		return
 	}
 
-	// 2. All main providers returned 430 (or died) — try backup providers in order.
+	// 2. All main providers returned 430 (or died) — try backup providers.
 	backups := *c.backupGroups.Load()
-	for i := range backups {
-		g := backups[i]
-		if hostSkipped(g.host, &skipHosts, skipCount) {
-			continue
-		}
-		if g.isQuotaExceeded() {
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
-			continue
-		}
-		resp, ok, cancelled := tryGroupResilient(g)
+	if raceable && post430 {
+		delivered, cancelled, raceErr := c.raceCandidates(
+			ctx, backups, statPayload, payload, bodyWriter, onMeta,
+			&skipHosts, &skipCount, respCh,
+		)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
@@ -1792,24 +2045,50 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			respCh <- Response{Err: err}
 			return
 		}
-		if !ok {
-			continue
+		if delivered {
+			return
 		}
-		if resp.Err != nil {
-			lastErr = resp.Err
-			continue
+		if raceErr != nil {
+			lastErr = raceErr
 		}
-		if resp.StatusCode == 502 {
-			_ = c.RemoveProvider(g.name)
-			if g.p.ReconnectDelay > 0 {
-				c.scheduleReconnect(g)
+	} else {
+		for i := range backups {
+			g := backups[i]
+			if hostSkipped(g.host, &skipHosts, skipCount) {
+				continue
 			}
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
-			continue
+			if g.isQuotaExceeded() {
+				lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+				continue
+			}
+			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430)
+			if cancelled {
+				err := ctx.Err()
+				if err == nil {
+					err = c.ctx.Err()
+				}
+				respCh <- Response{Err: err}
+				return
+			}
+			if !ok {
+				continue
+			}
+			if resp.Err != nil {
+				lastErr = resp.Err
+				continue
+			}
+			if resp.StatusCode == 502 {
+				_ = c.RemoveProvider(g.name)
+				if g.p.ReconnectDelay > 0 {
+					c.scheduleReconnect(g)
+				}
+				lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+				continue
+			}
+			// Deliver whatever backup returns (including 430).
+			respCh <- resp
+			return
 		}
-		// Deliver whatever backup returns (including 430).
-		respCh <- resp
-		return
 	}
 
 	// 3. All providers exhausted — deliver the last 430, the last error, or a fallback.
