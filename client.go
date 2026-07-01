@@ -144,12 +144,15 @@ func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, erro
 	}, nil
 }
 
-// Stat checks whether an article exists without transferring its contents.
-func (c *Client) Stat(ctx context.Context, messageID string) (*StatResult, error) {
-	payload := []byte("STAT <" + messageID + ">\r\n")
-	respCh := c.Send(ctx, payload, nil)
+// statPayload builds the wire payload for a STAT command.
+func statPayload(messageID string) []byte {
+	return []byte("STAT <" + messageID + ">\r\n")
+}
 
-	resp := <-respCh
+// parseStat maps a STAT Response to a StatResult. A 430/423 (article not found)
+// is returned as ErrArticleNotFound with a nil result; callers doing bulk
+// existence checks treat that as a normal miss rather than a fatal error.
+func parseStat(messageID string, resp Response) (*StatResult, error) {
 	if resp.Err != nil {
 		return nil, resp.Err
 	}
@@ -169,6 +172,32 @@ func (c *Client) Stat(ctx context.Context, messageID string) (*StatResult, error
 	}
 
 	return result, nil
+}
+
+// Stat checks whether an article exists without transferring its contents.
+func (c *Client) Stat(ctx context.Context, messageID string) (*StatResult, error) {
+	return parseStat(messageID, <-c.Send(ctx, statPayload(messageID), nil))
+}
+
+// StatPriority is like Stat but enqueues on the priority channel so idle
+// connections pick it up before normal requests. Useful for a latency-sensitive
+// existence check that must not queue behind a large BODY on a busy connection.
+func (c *Client) StatPriority(ctx context.Context, messageID string) (*StatResult, error) {
+	return parseStat(messageID, <-c.SendPriority(ctx, statPayload(messageID), nil))
+}
+
+// StatAsync returns a channel that will receive exactly one StatManyResult,
+// mirroring BodyAsync. It preserves the fan-out pattern used by BodyAsync so a
+// caller can dispatch many existence checks and collect them concurrently. For
+// checking a slice of message-IDs prefer StatMany, which bounds concurrency.
+func (c *Client) StatAsync(ctx context.Context, messageID string) <-chan StatManyResult {
+	ch := make(chan StatManyResult, 1)
+	go func() {
+		res, err := c.Stat(ctx, messageID)
+		ch <- StatManyResult{MessageID: messageID, Result: res, Err: err}
+		close(ch)
+	}()
+	return ch
 }
 
 // doBody is the shared implementation for Body, BodyStream, and BodyAsync.

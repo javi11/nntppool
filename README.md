@@ -281,6 +281,75 @@ if errors.Is(err, nntppool.ErrArticleNotFound) {
 }
 ```
 
+`StatPriority` is the same check dispatched via the priority queue (prefers idle
+connections, so a one-off check doesn't queue behind a large BODY). `StatAsync`
+returns a channel for a single non-blocking check.
+
+### Bulk existence checks (NZB health checks)
+
+`STAT` is a single-line request with a single-line reply and **no body**, so it is
+purely round-trip-latency bound — the ideal command to run massively in parallel.
+`StatMany` checks a slice of message-IDs concurrently, streaming a result per ID as
+each completes (out of order), and closes the channel when done. A genuine miss is
+reported as `ErrArticleNotFound` with a nil `Result` — a normal outcome of a sweep,
+not a fatal error:
+
+```go
+ids := nzb.SegmentMessageIDs() // e.g. thousands of segments
+var have, missing int
+for r := range client.StatMany(ctx, ids, nntppool.StatManyOptions{Concurrency: 64}) {
+    switch {
+    case r.Err == nil:
+        have++
+    case errors.Is(r.Err, nntppool.ErrArticleNotFound):
+        missing++
+    default:
+        log.Printf("%s: %v", r.MessageID, r.Err)
+    }
+}
+fmt.Printf("availability: %d/%d present\n", have, have+missing)
+```
+
+`StatManyOptions`:
+
+| Field | Description |
+|-------|-------------|
+| `Concurrency` | Max STATs outstanding across the whole pool at once (0 ⇒ 64). |
+| `Priority` | Route each STAT through the priority queue. |
+| `Provider` | Restrict every STAT to one named provider group (per-provider availability audit). Empty ⇒ pool-wide with the same failover as `Stat`. |
+
+If `ctx` is cancelled mid-sweep, dispatch stops and in-flight checks are cancelled;
+IDs not yet dispatched produce no result, so check `ctx.Err()` after draining.
+
+#### Tuning STAT throughput
+
+Two levers, both usenet-informed:
+
+- **Fan-out across connections** — handled for you: `StatMany` spreads checks over
+  every connection via the pool's weighted round-robin. More `Connections` ⇒ more
+  parallel checks.
+- **Pipeline depth per connection** — set `Provider.StatInflight` higher than
+  `Inflight`. Because STAT carries no payload, many checks can be in flight on one
+  connection at negligible memory cost, amortising the round-trip. `Inflight`
+  bounds concurrent **BODY** responses (keep it modest — `5`–`10` — to cap
+  download memory), while `StatInflight` independently sets how deep bodyless
+  **STAT** commands pipeline. A general-purpose client can therefore run
+  `Inflight: 8, StatInflight: 100`: downloads stay bounded, existence sweeps go
+  fast — no separate client needed.
+
+  ```go
+  nntppool.Provider{
+      Host:         "news.example.com:563",
+      Connections:  20,
+      Inflight:     8,   // max concurrent BODY per connection
+      StatInflight: 100, // STAT pipelines this deep (0 ⇒ same as Inflight)
+  }
+  ```
+
+  Caveat: replies on a connection are read in order (FIFO), so a STAT queued
+  behind an in-progress BODY on the *same* connection waits for that BODY. A pure
+  STAT sweep has no bodies in the way and reaches the full `StatInflight` depth.
+
 ### Fetch article headers
 
 ```go
@@ -661,6 +730,9 @@ Provider names default to `host:port` or `host:port+username` (when auth is set)
 | `BodyPriority` | `(ctx, messageID, onMeta...) (*ArticleBody, error)` | Like `Body` but dispatched via the priority queue |
 | `Head` | `(ctx, messageID) (*ArticleHead, error)` | Fetch RFC 5322 headers; returns parsed `map[string][]string` with folding resolved |
 | `Stat` | `(ctx, messageID) (*StatResult, error)` | Check article existence without transferring body |
+| `StatPriority` | `(ctx, messageID) (*StatResult, error)` | Like `Stat` but dispatched via the priority queue |
+| `StatAsync` | `(ctx, messageID) <-chan StatManyResult` | Non-blocking single existence check; channel receives exactly one result |
+| `StatMany` | `(ctx, messageIDs, StatManyOptions) <-chan StatManyResult` | Concurrent bulk existence check; streams one result per ID as it completes |
 
 The `onMeta` optional callback is called once `=ybegin`/`=ypart` is fully parsed (before any body bytes), enabling pre-allocation or filename routing.
 
@@ -785,7 +857,8 @@ type ProviderStats struct {
 | `TLSConfig` | `*tls.Config` | nil (plain TCP) | Pass a `tls.Config` to enable TLS; set `ServerName` for SNI |
 | `Auth` | `Auth` | — | `Username` and `Password` for AUTHINFO handshake |
 | `Connections` | `int` | — | **Required.** Number of connection slots for this provider |
-| `Inflight` | `int` | 1 | Max pipelined NNTP commands per connection |
+| `Inflight` | `int` | 1 | Max concurrent BODY (and other body-bearing) commands per connection |
+| `StatInflight` | `int` | 0 (= `Inflight`) | Pipeline depth for bodyless STAT commands; set higher than `Inflight` (e.g. 50–100) to amortise round-trips on existence sweeps without inflating BODY memory |
 | `Factory` | `ConnFactory` | nil | Custom dialer `func(ctx) (net.Conn, error)`; overrides `Host`/`TLSConfig` |
 | `Backup` | `bool` | false | If true, only used when all main providers return 430 |
 | `SkipPing` | `bool` | false | Skip the startup DATE ping (for servers that don't support DATE) |

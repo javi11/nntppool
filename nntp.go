@@ -155,6 +155,11 @@ type Request struct {
 	// to the connection, used to measure time-to-first-byte. 0 = unset (the
 	// request is not measured, e.g. POST/keepalive).
 	sentAt atomic.Int64
+
+	// heldBody is set by writeLoop when this (body-bearing) request acquired a
+	// bodySem slot, so readerLoop releases exactly the slots that were taken.
+	// Bodyless STAT requests never acquire bodySem and leave this false.
+	heldBody bool
 }
 
 type Response struct {
@@ -194,7 +199,14 @@ type NNTPConnection struct {
 	hotPrioCh <-chan *Request // unbuffered; set by runConnSlot before Run()
 	pending   chan *Request
 
+	// inflightSem bounds the total pipeline depth (cap = StatInflight, i.e.
+	// max(Inflight, StatInflight)). bodySem additionally bounds concurrent
+	// body-bearing commands (cap = Inflight) so raising the STAT pipeline depth
+	// never increases the number of BODY responses buffered/streamed at once.
+	// Bodyless STAT commands acquire only inflightSem and so pipeline to the
+	// deeper StatInflight depth.
 	inflightSem chan struct{}
+	bodySem     chan struct{}
 
 	rb readBuffer
 
@@ -264,10 +276,14 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		prioCh:      prioCh,
 		pending:     make(chan *Request, inflightLimit),
 		inflightSem: make(chan struct{}, inflightLimit),
-		rb:          rb,
-		stats:       stats,
-		done:        make(chan struct{}),
-		userAgent:   userAgent,
+		// Default bodySem to the full pipeline depth (no separate BODY bound);
+		// runConnSlot overrides this to Provider.Inflight when a deeper STAT
+		// pipeline is configured. Standalone connections keep them equal.
+		bodySem:   make(chan struct{}, inflightLimit),
+		rb:        rb,
+		stats:     stats,
+		done:      make(chan struct{}),
+		userAgent: userAgent,
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -363,6 +379,19 @@ func keepaliveExpectedCode(cmd string) int {
 	default:
 		return 111
 	}
+}
+
+// statCmdPrefix identifies STAT commands, the only bodyless request the pool
+// issues through the normal write path (keepalive DATE has its own path). STAT
+// has a single-line reply and no payload, so it may pipeline to the deeper
+// StatInflight depth without acquiring a bodySem slot.
+var statCmdPrefix = []byte("STAT ")
+
+// isCheapCommand reports whether payload is a bodyless command that should
+// bypass the BODY concurrency bound (bodySem) and pipeline to the full
+// inflightSem (StatInflight) depth.
+func isCheapCommand(payload []byte) bool {
+	return bytes.HasPrefix(payload, statCmdPrefix)
 }
 
 func failRequest(ch chan Response, err error) {
@@ -551,7 +580,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -611,7 +640,10 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 			continue
 		}
 
-		nc, err := newNNTPConnectionFromConn(ctx, conn, inflight, reqCh, prioCh, auth, userAgent, &sharedBuf, stats)
+		// Size the pipeline (inflightSem/pending) to statInflight so bodyless
+		// STAT commands can pipeline deep; bodySem is overridden below to the
+		// (smaller) Inflight so concurrent bodies stay bounded.
+		nc, err := newNNTPConnectionFromConn(ctx, conn, statInflight, reqCh, prioCh, auth, userAgent, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
 			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
@@ -637,6 +669,10 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		}
 
 		// ACTIVE: run the connection with the bootstrap request.
+		// Bound concurrent bodies to Inflight while the pipeline (inflightSem)
+		// allows STAT to reach statInflight. When statInflight == inflight this
+		// is identical to the default (both caps equal).
+		nc.bodySem = make(chan struct{}, inflight)
 		nc.firstReq = firstReq
 		nc.idleTimeout = idleTimeout
 		nc.stallTimeout = stallTimeout
@@ -730,6 +766,24 @@ func (c *NNTPConnection) Run() {
 		case <-c.ctx.Done():
 			failRequest(req.RespCh, c.ctx.Err())
 			return
+		}
+
+		// Body-bearing requests additionally take a bodySem slot so concurrent
+		// bodies stay bounded by Inflight even when the pipeline (inflightSem)
+		// is deeper for STAT. Bodyless STAT skips this and pipelines deep.
+		if !isCheapCommand(req.Payload) {
+			select {
+			case c.bodySem <- struct{}{}:
+				req.heldBody = true
+			case <-req.Ctx.Done():
+				<-c.inflightSem
+				failRequest(req.RespCh, req.Ctx.Err())
+				goto mainLoop // connection still good
+			case <-c.ctx.Done():
+				<-c.inflightSem
+				failRequest(req.RespCh, c.ctx.Err())
+				return
+			}
 		}
 
 		dl, hasDL := req.writeDeadline()
@@ -955,6 +1009,23 @@ mainLoop:
 			failRequest(req.RespCh, req.Ctx.Err())
 			continue
 		default:
+		}
+
+		// Body-bearing requests additionally take a bodySem slot so concurrent
+		// bodies stay bounded by Inflight even when the pipeline (inflightSem)
+		// is deeper for STAT. Bodyless STAT skips this and pipelines deep.
+		if !isCheapCommand(req.Payload) {
+			select {
+			case c.bodySem <- struct{}{}:
+				req.heldBody = true
+			case <-req.Ctx.Done():
+				<-c.inflightSem
+				failRequest(req.RespCh, req.Ctx.Err())
+				continue
+			case <-c.ctx.Done():
+				<-c.inflightSem
+				return
+			}
 		}
 
 		// per-request write deadline (cached to avoid redundant syscalls)
@@ -1198,8 +1269,11 @@ func (c *NNTPConnection) readerLoop() {
 		}
 		safeClose(req.RespCh)
 
-		// release inflight slot
+		// release inflight slot (and the body slot, if this request took one)
 		<-c.inflightSem
+		if req.heldBody {
+			<-c.bodySem
+		}
 
 		// If we hit a timeout, cancellation-related network error, or protocol
 		// desync, close the connection so the pool replaces it with a fresh one.
@@ -1290,7 +1364,8 @@ type Provider struct {
 	TLSConfig       *tls.Config
 	Auth            Auth
 	Connections     int
-	Inflight        int           // 0 defaults to 1
+	Inflight        int           // 0 defaults to 1; max concurrent BODY (and other body-bearing) commands per connection
+	StatInflight    int           // 0 defaults to Inflight; deeper pipeline depth for bodyless STAT commands. Because STAT carries no payload, many can be in flight per connection at negligible memory cost, amortising round-trips. Set higher than Inflight (e.g. 50-100) for STAT-heavy workloads without inflating BODY memory.
 	Factory         ConnFactory   // overrides Host/TLSConfig when set
 	Backup          bool          // if true, only used when main providers return 430
 	SkipPing        bool          // if true, skip the DATE ping on startup (for providers that don't support DATE)
@@ -1537,6 +1612,13 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	if inflight <= 0 {
 		inflight = 1
 	}
+	// STAT (bodyless) may pipeline deeper than BODY. The overall pipeline cap is
+	// max(Inflight, StatInflight); 0 or a smaller value means "same as Inflight"
+	// (no separate STAT lane — fully backward compatible).
+	statInflight := p.StatInflight
+	if statInflight < inflight {
+		statInflight = inflight
+	}
 
 	factory := p.Factory
 	if factory == nil {
@@ -1619,7 +1701,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
 	}
 
 	return g
