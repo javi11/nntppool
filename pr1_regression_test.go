@@ -390,6 +390,9 @@ func TestPR1CancelledPipelineDoesNotDelayNewPriorityBody(t *testing.T) {
 	if got := connections.Load(); got < 2 {
 		t.Errorf("connections = %d, want canceled pipeline socket retired", got)
 	}
+	if errorsCount := client.Stats().Providers[0].Errors; errorsCount != 0 {
+		t.Errorf("provider errors = %d, caller cancellation must not count as provider failure", errorsCount)
+	}
 }
 
 func BenchmarkPR1AbandonedBodyDrainCaps(b *testing.B) {
@@ -1145,6 +1148,13 @@ func TestPR1PipelineWaitDoesNotConsumeResponseTimeout(t *testing.T) {
 	}
 	if maxHeadWait < 150*time.Millisecond {
 		t.Errorf("maximum pipeline head wait = %v, want evidence of >150ms wait outside 70ms response timeout", maxHeadWait)
+	}
+	providerStats := client.Stats().Providers[0]
+	if providerStats.TTFB >= 70*time.Millisecond {
+		t.Errorf("provider TTFB = %v, pipeline wait contaminated response-head timing", providerStats.TTFB)
+	}
+	if providerStats.Errors != 0 {
+		t.Errorf("provider errors = %d, pipeline wait must not count as provider failure", providerStats.Errors)
 	}
 }
 

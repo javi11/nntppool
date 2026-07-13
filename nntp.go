@@ -1519,7 +1519,7 @@ func (c *NNTPConnection) readerLoop() {
 					c.stats.quotaExceeded.Store(true)
 				}
 			}
-			if resp.Err != nil {
+			if resp.Err != nil && classifyOutcome(resp.StatusCode, resp.Err) != OutcomeCancellation {
 				c.stats.Errors.Add(1)
 			} else if decoder.StatusCode == 430 || decoder.StatusCode == 423 {
 				c.stats.Missing.Add(1)
