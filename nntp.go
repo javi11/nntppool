@@ -90,7 +90,15 @@ const (
 	// issues at most one SetReadDeadline syscall per quantum instead of one per
 	// read.
 	stallDeadlineQuantum = 250 * time.Millisecond
+
+	// Abandoned BODY responses are drained only within both bounds. Reaching a
+	// bound retires the connection so obsolete pipeline data cannot delay or
+	// poison later work.
+	defaultAbandonedBodyDrainBytes   = 1 * 1024 * 1024
+	defaultAbandonedBodyDrainTimeout = 250 * time.Millisecond
 )
+
+var errAbandonedBodyDrainLimit = errors.New("nntp: abandoned BODY drain limit exceeded")
 
 // Attempt lifecycle states, coordinating the race between tryGroup's attempt
 // timer and the reader observing the first response byte. The CAS handshake
@@ -98,9 +106,10 @@ const (
 // attempt is never abandoned mid-stream; if the timer fires first the attempt
 // fails over and the reader drops the (cancelled) request.
 const (
-	attemptPending   int32 = iota // no response byte seen yet
-	attemptCommitted              // reader saw the first response byte
-	attemptAbandoned              // tryGroup timed out before any byte arrived
+	attemptPending      int32 = iota // request has not reached response head
+	attemptResponseHead              // request is the FIFO response head
+	attemptCommitted                 // decoded bytes crossed the output boundary
+	attemptAbandoned                 // request was abandoned before response head
 )
 
 type greetingError struct {
@@ -146,10 +155,14 @@ type Request struct {
 	// deadline no longer applies — the connection's rolling stall timeout does.
 	attemptDeadline time.Time
 
-	// attemptState is one of attemptPending/attemptCommitted/attemptAbandoned.
-	// The reader CASes pending→committed on the first response byte; tryGroup's
-	// timer CASes pending→abandoned on expiry. Zero value is attemptPending.
+	// attemptState coordinates response-head admission with attempt timeout.
+	// Decoded output advances responseHead→committed. Zero is attemptPending.
 	attemptState atomic.Int32
+
+	// decodedCommitted protects the v4 caller-writer contract independently of
+	// response timing: after any decoded byte crosses the writer boundary, the
+	// request must never restart on another provider.
+	decodedCommitted atomic.Bool
 
 	// sentAt is the Unix-nanosecond timestamp at which the payload was handed
 	// to the connection, used to measure time-to-first-byte. 0 = unset (the
@@ -212,13 +225,15 @@ type NNTPConnection struct {
 
 	Greeting NNTPResponse
 
-	firstReq          *Request      // bootstrap request from connection slot
-	idleTimeout       time.Duration // 0 = no idle timeout
-	stallTimeout      time.Duration // rolling body-progress deadline; 0 = disabled
-	keepaliveInterval time.Duration // 0 = no keepalive
-	keepaliveCommand  string        // NNTP command for keepalive probe (e.g. "DATE")
-	providerName      string        // set by runConnSlot; used for error context
-	userAgent         string
+	firstReq              *Request      // bootstrap request from connection slot
+	idleTimeout           time.Duration // 0 = no idle timeout
+	stallTimeout          time.Duration // rolling body-progress deadline; 0 = disabled
+	abandonedDrainBytes   int           // maximum obsolete BODY bytes to drain
+	abandonedDrainTimeout time.Duration // maximum obsolete BODY drain duration
+	keepaliveInterval     time.Duration // 0 = no keepalive
+	keepaliveCommand      string        // NNTP command for keepalive probe (e.g. "DATE")
+	providerName          string        // set by runConnSlot; used for error context
+	userAgent             string
 
 	stats *providerStats // nil for standalone connections
 
@@ -279,11 +294,13 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		// Default bodySem to the full pipeline depth (no separate BODY bound);
 		// runConnSlot overrides this to Provider.Inflight when a deeper STAT
 		// pipeline is configured. Standalone connections keep them equal.
-		bodySem:   make(chan struct{}, inflightLimit),
-		rb:        rb,
-		stats:     stats,
-		done:      make(chan struct{}),
-		userAgent: userAgent,
+		bodySem:               make(chan struct{}, inflightLimit),
+		rb:                    rb,
+		stats:                 stats,
+		done:                  make(chan struct{}),
+		userAgent:             userAgent,
+		abandonedDrainBytes:   defaultAbandonedBodyDrainBytes,
+		abandonedDrainTimeout: defaultAbandonedBodyDrainTimeout,
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -386,12 +403,17 @@ func keepaliveExpectedCode(cmd string) int {
 // has a single-line reply and no payload, so it may pipeline to the deeper
 // StatInflight depth without acquiring a bodySem slot.
 var statCmdPrefix = []byte("STAT ")
+var bodyCmdPrefix = []byte("BODY ")
 
 // isCheapCommand reports whether payload is a bodyless command that should
 // bypass the BODY concurrency bound (bodySem) and pipeline to the full
 // inflightSem (StatInflight) depth.
 func isCheapCommand(payload []byte) bool {
 	return bytes.HasPrefix(payload, statCmdPrefix)
+}
+
+func isBodyCommand(payload []byte) bool {
+	return bytes.HasPrefix(payload, bodyCmdPrefix)
 }
 
 func failRequest(ch chan Response, err error) {
@@ -580,7 +602,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, abandonedDrainBytes int, abandonedDrainTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -676,6 +698,8 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc.firstReq = firstReq
 		nc.idleTimeout = idleTimeout
 		nc.stallTimeout = stallTimeout
+		nc.abandonedDrainBytes = abandonedDrainBytes
+		nc.abandonedDrainTimeout = abandonedDrainTimeout
 		nc.providerName = providerName
 		nc.hotReqCh = hotReqCh
 		nc.hotPrioCh = hotPrioCh
@@ -703,6 +727,21 @@ type writerRef struct {
 
 func (wr *writerRef) Write(p []byte) (int, error) {
 	return wr.w.Write(p)
+}
+
+type attemptWriter struct {
+	req *Request
+	w   io.Writer
+}
+
+func (w *attemptWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		// Mark before entering a potentially blocking writer. Once decoded bytes
+		// cross this boundary, cancellation cannot safely restart the request.
+		w.req.decodedCommitted.Store(true)
+		w.req.attemptState.CompareAndSwap(attemptResponseHead, attemptCommitted)
+	}
+	return w.w.Write(p)
 }
 
 func (c *NNTPConnection) Run() {
@@ -1112,6 +1151,7 @@ func (c *NNTPConnection) readerLoop() {
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
 		}
+		req.attemptState.CompareAndSwap(attemptPending, attemptResponseHead)
 
 		resp := Response{
 			Request: req,
@@ -1120,8 +1160,8 @@ func (c *NNTPConnection) readerLoop() {
 			onMeta: req.OnMeta,
 		}
 
-		// If the request is cancelled after send, we must still drain its response off the wire,
-		// but we don't deliver it.
+		// If the request is cancelled after send, drain only a bounded prefix of
+		// a BODY response, then retire the socket.
 		deliver := true
 		select {
 		case <-req.Ctx.Done():
@@ -1134,6 +1174,9 @@ func (c *NNTPConnection) readerLoop() {
 			out = io.Discard
 		} else if out == nil {
 			out = &resp.Body
+		}
+		if deliver && isBodyCommand(req.Payload) {
+			out = &attemptWriter{req: req, w: out}
 		}
 
 		// Allow us to switch output to io.Discard if the request is cancelled while
@@ -1149,22 +1192,39 @@ func (c *NNTPConnection) readerLoop() {
 		lastBytes := 0
 		var stallDeadline time.Time
 		var firstByteAt time.Time
+		var drainStarted time.Time
+		drainStartConsumed := 0
 		respStart := time.Now()
-		err := c.rb.feedUntilDone(c.conn, &decoder, outRef, func(wireBytes int) (time.Time, bool) {
+		err := c.rb.feedUntilDoneControlled(c.conn, &decoder, outRef, func(wireBytes, consumedBytes int) (time.Time, bool, int, error) {
 			if deliver {
 				select {
 				case <-req.Ctx.Done():
 					deliver = false
 					outRef.w = io.Discard
+					drainStarted = time.Now()
+					drainStartConsumed = consumedBytes
 				default:
 				}
+			}
+			if !deliver && isBodyCommand(req.Payload) {
+				if drainStarted.IsZero() {
+					drainStarted = time.Now()
+					drainStartConsumed = consumedBytes
+				}
+				remaining := c.abandonedDrainBytes - (consumedBytes - drainStartConsumed)
+				if c.abandonedDrainBytes > 0 && remaining <= 0 {
+					return time.Time{}, false, 0, errAbandonedBodyDrainLimit
+				}
+				if c.abandonedDrainTimeout > 0 {
+					return drainStarted.Add(c.abandonedDrainTimeout), true, max(remaining, 0), nil
+				}
+				return time.Time{}, false, max(remaining, 0), nil
 			}
 			if wireBytes > lastBytes {
 				lastBytes = wireBytes
 				if firstByteAt.IsZero() {
 					firstByteAt = time.Now()
 				}
-				req.attemptState.CompareAndSwap(attemptPending, attemptCommitted)
 				if stall > 0 {
 					if dl := time.Now().Add(stall); dl.Sub(stallDeadline) >= stallDeadlineQuantum {
 						stallDeadline = dl
@@ -1174,11 +1234,13 @@ func (c *NNTPConnection) readerLoop() {
 			parentDL, hasParent := req.Ctx.Deadline()
 			switch {
 			case lastBytes == 0 && !req.attemptDeadline.IsZero():
-				return minDeadline(req.attemptDeadline, parentDL, hasParent)
+				dl, ok := minDeadline(req.attemptDeadline, parentDL, hasParent)
+				return dl, ok, 0, nil
 			case lastBytes > 0 && stall > 0:
-				return minDeadline(stallDeadline, parentDL, hasParent)
+				dl, ok := minDeadline(stallDeadline, parentDL, hasParent)
+				return dl, ok, 0, nil
 			default:
-				return parentDL, hasParent
+				return parentDL, hasParent, 0, nil
 			}
 		})
 		if err != nil {
@@ -1273,6 +1335,14 @@ func (c *NNTPConnection) readerLoop() {
 		<-c.inflightSem
 		if req.heldBody {
 			<-c.bodySem
+		}
+
+		// A BODY parse/decode/writer/drain failure can leave unread framing in
+		// either the socket or shared read buffer. Never reuse that connection.
+		if resp.Err != nil && isBodyCommand(req.Payload) {
+			_ = c.conn.Close()
+			c.failOutstanding()
+			return
 		}
 
 		// If we hit a timeout, cancellation-related network error, or protocol
@@ -1386,6 +1456,13 @@ type Provider struct {
 	// truly stalled one is torn down. 0 defaults to 8s; negative disables it
 	// (only the caller's context deadline applies).
 	StallTimeout time.Duration
+
+	// AbandonedBodyDrainBytes and AbandonedBodyDrainTimeout bound cleanup after
+	// a sent BODY request is canceled. Reaching either bound retires the
+	// connection rather than letting obsolete payload block newer work. Zero
+	// selects the conservative library default for that bound.
+	AbandonedBodyDrainBytes   int
+	AbandonedBodyDrainTimeout time.Duration
 
 	// KeepaliveInterval, if non-zero, sends a lightweight NNTP command
 	// periodically when the connection is idle, to detect zombie connections
@@ -1684,6 +1761,14 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	} else if stall < 0 {
 		stall = 0
 	}
+	drainBytes := p.AbandonedBodyDrainBytes
+	if drainBytes <= 0 {
+		drainBytes = defaultAbandonedBodyDrainBytes
+	}
+	drainTimeout := p.AbandonedBodyDrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = defaultAbandonedBodyDrainTimeout
+	}
 
 	// Resolve keepalive settings. If SkipPing is true and no explicit command
 	// is set, keepalive is disabled (we don't know which command the server supports).
@@ -1701,7 +1786,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, drainBytes, drainTimeout, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
 	}
 
 	return g
@@ -2153,7 +2238,7 @@ func hostSkipped(host string, skipHosts *[4]string, count int) bool {
 // had already started streaming bytes (the reader committed). Such an attempt
 // must not be retried or failed over when a caller-supplied writer is in use.
 func attemptCommittedResp(resp Response) bool {
-	return resp.Request != nil && resp.Request.attemptState.Load() == attemptCommitted
+	return resp.Request != nil && resp.Request.decodedCommitted.Load()
 }
 
 // maxSpeedScore is the highest multiplier speed-aware dispatch applies to a

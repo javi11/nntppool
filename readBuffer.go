@@ -114,14 +114,41 @@ func (rb *readBuffer) readMore(conn net.Conn, deadline time.Time, hasDeadline bo
 // bound), and to detect progress even when the decoder consumes 0 bytes from a
 // partial line.
 func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.Writer, deadline func(wireBytes int) (time.Time, bool)) error {
+	return rb.feedUntilDoneControlled(
+		conn,
+		feeder,
+		out,
+		func(wireBytes, _ int) (time.Time, bool, int, error) {
+			dl, ok := deadline(wireBytes)
+			return dl, ok, 0, nil
+		},
+	)
+}
+
+// feedUntilDoneControlled is feedUntilDone with an additional response-byte
+// budget. control receives both bytes read from conn during this response and
+// total bytes consumed by the feeder, including bytes that were already in the
+// shared read buffer. maxFeed limits the next feeder call; zero means
+// unlimited. This lets abandoned BODY responses drain a bounded wire prefix
+// without accidentally ignoring a large prebuffered tail.
+func (rb *readBuffer) feedUntilDoneControlled(
+	conn net.Conn,
+	feeder streamFeeder,
+	out io.Writer,
+	control func(wireBytes, consumedBytes int) (deadline time.Time, hasDeadline bool, maxFeed int, err error),
+) error {
 	rb.init()
 	wireBytes := 0
+	consumedBytes := 0
 
 	for {
 		// Ensure we have some bytes to feed.
 		if rb.start == rb.end {
 			rb.start, rb.end = 0, 0
-			dl, ok := deadline(wireBytes)
+			dl, ok, _, controlErr := control(wireBytes, consumedBytes)
+			if controlErr != nil {
+				return controlErr
+			}
 			n, err := rb.readMore(conn, dl, ok)
 			wireBytes += n
 			if err != nil {
@@ -129,15 +156,27 @@ func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.W
 			}
 		}
 
-		consumed, done, err := feeder.Feed(rb.window(), out)
+		_, _, maxFeed, controlErr := control(wireBytes, consumedBytes)
+		if controlErr != nil {
+			return controlErr
+		}
+		window := rb.window()
+		if maxFeed > 0 && len(window) > maxFeed {
+			window = window[:maxFeed]
+		}
+		consumed, done, err := feeder.Feed(window, out)
 		if consumed > 0 {
 			rb.advance(consumed)
+			consumedBytes += consumed
 		}
 		if err != nil {
 			return err
 		}
 		if done {
 			return nil
+		}
+		if _, _, _, controlErr = control(wireBytes, consumedBytes); controlErr != nil {
+			return controlErr
 		}
 
 		// Need more data.
@@ -147,7 +186,10 @@ func (rb *readBuffer) feedUntilDone(conn net.Conn, feeder streamFeeder, out io.W
 			rb.compact()
 		}
 
-		dl, ok := deadline(wireBytes)
+		dl, ok, _, controlErr := control(wireBytes, consumedBytes)
+		if controlErr != nil {
+			return controlErr
+		}
 		n, err := rb.readMore(conn, dl, ok)
 		wireBytes += n
 		if err != nil {
