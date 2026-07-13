@@ -142,7 +142,7 @@ func TestStatInflight_BodyBounded(t *testing.T) {
 						<-release
 						atomic.AddInt32(&cur, -1)
 						wmu.Lock()
-						_, _ = server.Write([]byte("222 0 <x@h> body follows\r\n.\r\n"))
+						_, _ = server.Write(yencSinglePart([]byte("x"), "x.bin"))
 						wmu.Unlock()
 					}()
 				}

@@ -23,10 +23,15 @@ type PingResult struct {
 // providerStats holds internal atomic counters for a single provider group.
 // Used on the hot path — no mutex, atomic only.
 type providerStats struct {
-	BytesConsumed atomic.Int64 // wire bytes consumed (used to compute AvgSpeed)
-	Missing       atomic.Int64 // 430/423 responses
-	Errors        atomic.Int64 // network errors, bad status codes
-	Ping          PingResult   // result of initial DATE ping
+	BytesConsumed       atomic.Int64 // wire bytes consumed (used to compute AvgSpeed)
+	Missing             atomic.Int64 // 430/423 responses
+	Errors              atomic.Int64 // network errors, bad status codes
+	PipelineInUse       atomic.Int64
+	BackgroundStatInUse atomic.Int64
+	Ping                PingResult // result of initial DATE ping
+	pipelineLimit       int
+	backgroundStatLimit int
+	priorityHeadroom    int
 
 	// ttfbEWMA is the exponentially weighted moving average of observed
 	// time-to-first-byte, in nanoseconds. 0 = no sample yet. Seeded from the
@@ -102,17 +107,23 @@ func speedEWMABytesPerSec(stats *providerStats) float64 {
 
 // ProviderStats is a public snapshot of one provider's metrics.
 type ProviderStats struct {
-	Name              string
-	AvgSpeed          float64 // bytes/sec average since client start
-	SpeedEWMA         float64 // bytes/sec recent throughput estimate (drives speed-aware dispatch); 0 = no sample
-	BytesConsumed     int64   // raw wire bytes consumed since client start
-	Missing           int64
-	Errors            int64
-	ActiveConnections int           // currently running connections
-	MaxConnections    int           // configured connection slots
-	AvailableSlots    int           // connection slots currently free (allowed - held)
-	TTFB              time.Duration // recent time-to-first-byte estimate (seeded from ping RTT); 0 = no sample
-	Ping              PingResult
+	Name                string
+	ProviderID          string
+	AvgSpeed            float64 // bytes/sec average since client start
+	SpeedEWMA           float64 // bytes/sec recent throughput estimate (drives speed-aware dispatch); 0 = no sample
+	BytesConsumed       int64   // raw wire bytes consumed since client start
+	Missing             int64
+	Errors              int64
+	ActiveConnections   int           // currently running connections
+	MaxConnections      int           // configured connection slots
+	AvailableSlots      int           // connection slots currently free (allowed - held)
+	TTFB                time.Duration // recent time-to-first-byte estimate (seeded from ping RTT); 0 = no sample
+	PipelineInUse       int
+	PipelineLimit       int
+	BackgroundStatInUse int
+	BackgroundStatLimit int
+	PriorityHeadroom    int
+	Ping                PingResult
 
 	// Quota fields. QuotaBytes is 0 when no quota is configured.
 	QuotaBytes    int64     // configured limit per period (0 = unlimited)

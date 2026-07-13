@@ -57,14 +57,15 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
 - **Multi-provider pooling**: configure N connection slots per provider; supports both main and backup tiers
 - **Command pipelining**: configurable inflight requests per connection (default: 1)
 - **Weighted round-robin dispatch**: distributes load by available inflight capacity; FIFO mode also available
-- **Automatic failover**: on 430 (article not found) the pool retries every main provider before falling back to backups
-- **Same-host deduplication**: a 430 from one account on a host skips all other accounts on the same host
+- **Automatic failover**: ordered fallback for hard absence (423/430), temporary failure, corruption, unavailability, and transport failure, followed by failure-only backups
+- **Same-host deduplication**: a hard-absence response from one account on a host skips all other accounts on the same host
 - **Provider removal on 502**: permanently unavailable providers are atomically removed from the pool
 - **Auto-reconnect after 502**: optionally re-add a provider after a configurable delay (`ReconnectDelay`)
-- **yEnc decoding**: SIMD-accelerated via `rapidyenc`, with CRC32 validation and `=ybegin`/`=ypart`/`=yend` metadata
+- **Validated yEnc decoding**: SIMD-accelerated via `rapidyenc`, with complete framing, size, part, decoder, and supplied-CRC validation
 - **UU encoding support**: detection and decoding of UUEncoded articles
 - **Streaming delivery**: decode directly to an `io.Writer` without memory buffering
-- **Priority channel**: urgent requests preempt the normal queue on already-connected connections
+- **Strict unsent priority**: urgent requests precede normal queued work; commands already written to an NNTP pipeline remain FIFO
+- **Attempt evidence**: successful results and structured errors expose stable provider IDs, typed outcomes, validation status, and separated queue/head/service durations
 - **Idle timeout**: automatically disconnect and clean up connections that have been idle too long
 - **Application-level keepalive**: configurable lightweight NNTP probes to detect zombie connections
 - **Dynamic provider management**: add or remove providers at runtime without restarting the client
@@ -158,7 +159,8 @@ func main() {
 
 ### Multiple providers with backup
 
-Main providers are tried using round-robin (or FIFO). If all main providers return 430 (article not found), the pool falls back to backup providers.
+Main providers are tried using round-robin (or FIFO). Backups are failure-only:
+they are contacted after all eligible mains fail to return a usable result.
 
 ```go
 providers := []nntppool.Provider{
@@ -177,7 +179,7 @@ providers := []nntppool.Provider{
         Inflight:    2,
     },
     {
-        // Backup: only contacted when all main providers return 430
+        // Backup: contacted only after all eligible main providers fail
         Host:        "news.backup-provider.com:119",
         Auth:        nntppool.Auth{Username: "b1", Password: "bp1"},
         Connections: 10,
@@ -261,7 +263,9 @@ for i, ch := range channels {
 
 ### Priority requests
 
-`BodyPriority` and `SendPriority` enqueue on a separate priority channel. Idle connections prefer priority requests over normal ones, reducing latency for time-sensitive fetches.
+`BodyPriority` and `SendPriority` enqueue on a separate priority channel. Unsent
+priority work is selected before normal queued work. NNTP replies are wire-order
+FIFO, so a command that was already written cannot be preempted.
 
 ```go
 // Fetch the most important segment first
@@ -606,7 +610,9 @@ client.Send()
     → try hotReqCh (non-blocking) — succeeds only if a connection is already idle with inflight capacity
     → fall back to reqCh (wakes a cold slot or queues behind in-flight requests)
     → receive response from innerCh
-    → on 430: retry next provider, track host to skip duplicates
+    → on 423/430: retry next provider, track host to skip duplicates
+    → on 451: retry once on a fresh connection, then advance
+    → on buffered BODY corruption: retire the socket and advance
     → on 502: remove provider, retry
     → on all exhausted: deliver last response or error
 ```
@@ -622,7 +628,7 @@ Both strategies skip quota-exceeded providers during normal dispatch. If all pro
 ### Failover and retry logic
 
 ```
-1. Attempt all main providers (round-robin start, then sequentially):
+1. Attempt all main providers (round-robin start, then configured order):
    - 2xx → success, return response immediately
    - 430/423 → article not found on this provider:
        • record host in skipHosts (up to 4)
@@ -632,16 +638,18 @@ Both strategies skip quota-exceeded providers during normal dispatch. If all pro
        • atomically remove provider from pool
        • if ReconnectDelay > 0: schedule re-add after delay
        • try next provider
+   - 451 → retry once on a fresh connection after short jitter, then try next provider
+   - buffered BODY framing/decode/size/CRC failure → retire the socket, try next provider
    - connection error → try next provider
    - quota exceeded → skip, try next provider
 
-2. If all mains returned 430: attempt backup providers in order
-   - backup 430 → still deliver (no further retry)
+2. If all mains failed: attempt failure-only backup providers in order
+   - backup 423/430 → continue through remaining backups
    - backup 502 → remove, try next backup
 
 3. If all providers exhausted:
-   - if any 430 was received → return that 430 response
-   - else → return last error or "all providers exhausted"
+   - return hard absence only when every eligible provider conclusively reported 423/430
+   - mixed outcome classes return a structured inconclusive error with per-attempt evidence
 ```
 
 ### Read buffer internals
@@ -667,7 +675,8 @@ The `NNTPResponse` type in `reader.go` implements `streamFeeder` and processes r
    - Delegates to `rapidyenc.DecodeIncremental()` for SIMD-accelerated in-place decoding
    - Accumulates CRC32 using `crc32.Update()` on each decoded chunk
    - Parses `=yend` for `pcrc32=` or `crc32=` field
-   - Returns `ErrCRCMismatch` alongside the body when CRCs differ
+   - Before buffered acceptance, requires coherent `=ybegin`/`=ypart`/`=yend`, decoded sizes, native decoder success, and every supplied CRC (including `00000000`)
+   - A failed buffered attempt is discarded and may fall back; a caller-owned writer is never restarted after receiving decoded bytes
 4. **UU path**: detected but not decoded further (format is noted in `ArticleBody.Encoding`)
 5. **NNTP terminator**: `.\r\n` detected by `rapidyenc.DecodeIncremental` returning `EndArticle`; backs up 3 bytes to include the terminator in subsequent header parsing
 
@@ -716,7 +725,7 @@ Validates all providers, pings each (unless `SkipPing` is set), and starts conne
 - all providers are `Backup: true` (at least one non-backup required)
 - any provider has `Connections <= 0`
 - any provider has neither `Host` nor `Factory`
-- two providers resolve to the same name
+- two providers resolve to the same name or stable `ID`
 
 Provider names default to `host:port` or `host:port+username` (when auth is set). Factory-based providers without `Host` are named `provider-N`.
 
@@ -728,13 +737,16 @@ Provider names default to `host:port` or `host:port+username` (when auth is set)
 | `BodyStream` | `(ctx, messageID, w, onMeta...) (*ArticleBody, error)` | Decode and stream to `io.Writer`; `body.Bytes` is nil |
 | `BodyAsync` | `(ctx, messageID, w, onMeta...) <-chan BodyResult` | Non-blocking fan-out; returns channel receiving exactly one `BodyResult` |
 | `BodyPriority` | `(ctx, messageID, onMeta...) (*ArticleBody, error)` | Like `Body` but dispatched via the priority queue |
+| `BodyTargeted` | `(ctx, messageID, TargetedBodyOptions, onMeta...) (*ArticleBody, error)` | Validated BODY from exactly one provider, optionally requiring a fresh transport |
 | `Head` | `(ctx, messageID) (*ArticleHead, error)` | Fetch RFC 5322 headers; returns parsed `map[string][]string` with folding resolved |
 | `Stat` | `(ctx, messageID) (*StatResult, error)` | Check article existence without transferring body |
 | `StatPriority` | `(ctx, messageID) (*StatResult, error)` | Like `Stat` but dispatched via the priority queue |
 | `StatAsync` | `(ctx, messageID) <-chan StatManyResult` | Non-blocking single existence check; channel receives exactly one result |
 | `StatMany` | `(ctx, messageIDs, StatManyOptions) <-chan StatManyResult` | Concurrent bulk existence check; streams one result per ID as it completes |
 
-The `onMeta` optional callback is called once `=ybegin`/`=ypart` is fully parsed (before any body bytes), enabling pre-allocation or filename routing.
+The `onMeta` optional callback is called once `=ybegin`/`=ypart` is parsed,
+before final decoding and integrity validation. Its data is provisional and must
+not be treated as provider availability or integrity evidence.
 
 ### Posting articles
 
@@ -751,7 +763,7 @@ func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer,
 func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
 ```
 
-Both return immediately with a buffered channel (capacity 1). The caller receives exactly one `Response`. Use `bodyWriter = nil` to buffer decoded bytes in `Response.Body`; use `io.Discard` to throw them away; use any `io.Writer` to stream them.
+Both return immediately with a buffered channel (capacity 1). The caller receives exactly one `Response`. Use `bodyWriter = nil` to buffer decoded bytes in `Response.Body`; use `io.Discard` to throw them away; use any `io.Writer` to stream them. Raw `Send` retains v4 behavior and does not enable the high-level BODY integrity contract; its BODY evidence reports `not_requested`.
 
 ### Provider management
 
@@ -761,7 +773,7 @@ func (c *Client) RemoveProvider(name string) error
 func (c *Client) NumProviders() int
 ```
 
-`AddProvider` validates, pings (unless `SkipPing`), starts connection slots, and atomically appends to main or backup groups. Returns an error on validation failure or duplicate name.
+`AddProvider` validates, pings (unless `SkipPing`), starts connection slots, and atomically appends to main or backup groups. Returns an error on validation failure or duplicate name/stable ID.
 
 `RemoveProvider` cancels the group's context (causing all slot goroutines to exit), stops the `connGate`, and atomically removes it from the pool. Goroutines wind down asynchronously; `Client.Close()` waits for all via a `sync.WaitGroup`.
 
@@ -787,6 +799,8 @@ Dials a temporary connection, authenticates, sends DATE, and returns RTT + serve
 // ArticleBody is the result of Body/BodyStream/BodyAsync.
 type ArticleBody struct {
     MessageID     string
+    ProviderID    string          // stable Provider.ID (or resolved-name fallback)
+    Attempts      []AttemptEvidence
     Bytes         []byte          // nil when BodyStream was used
     BytesDecoded  int             // decoded payload bytes
     BytesConsumed int             // wire bytes consumed (pre-decode)
@@ -794,7 +808,38 @@ type ArticleBody struct {
     YEnc          YEncMeta        // yEnc metadata (zero value for non-yEnc)
     CRC           uint32          // actual CRC of decoded bytes
     ExpectedCRC   uint32          // CRC from =yend (0 when absent)
-    CRCValid      bool            // true when ExpectedCRC != 0 && CRC == ExpectedCRC
+    CRCProvided   bool
+    CRCValid      bool            // true when a supplied CRC, including zero, matched
+}
+
+// AttemptEvidence contains bounded transport facts for one provider attempt.
+type AttemptEvidence struct {
+    ProviderID               string
+    Operation                Operation
+    Outcome                  OutcomeKind
+    ResponseCode             int
+    BodyValidation           BodyValidationStatus
+    Cause                    error
+    ProviderResponseTimeout  bool
+    PoolQueueDuration        time.Duration
+    PipelineHeadWaitDuration time.Duration
+    ResponseServiceDuration  time.Duration
+}
+
+// TransportError wraps the existing sentinel/protocol cause so errors.Is and
+// errors.As checks remain valid after provider exhaustion or cancellation.
+type TransportError struct {
+    Kind         OutcomeKind
+    ProviderID   string
+    ResponseCode int
+    Attempts     []AttemptEvidence
+    Cause        error
+}
+
+type TargetedBodyOptions struct {
+    Provider       string // stable ID or resolved provider name
+    FreshTransport bool
+    Priority       bool
 }
 
 // YEncMeta holds fields from =ybegin and =ypart headers.
@@ -818,8 +863,10 @@ type PostHeaders struct {
 
 // StatResult is the result of a STAT command.
 type StatResult struct {
-    MessageID string
-    Number    int64 // article number in current group (0 if no group selected)
+    MessageID  string
+    ProviderID string
+    Attempts   []AttemptEvidence
+    Number     int64 // article number in current group (0 if no group selected)
 }
 
 // ArticleHead holds the result of a HEAD command.
@@ -831,12 +878,18 @@ type ArticleHead struct {
 // ProviderStats is a snapshot of one provider's metrics.
 type ProviderStats struct {
     Name              string
+    ProviderID        string
     AvgSpeed          float64       // bytes/sec since client start
     BytesConsumed     int64         // raw wire bytes
     Missing           int64         // 430/423 responses
     Errors            int64         // network errors and bad status codes
     ActiveConnections int           // currently running connection slots
     MaxConnections    int           // configured Connections value
+    PipelineInUse     int
+    PipelineLimit     int
+    BackgroundStatInUse  int
+    BackgroundStatLimit  int
+    PriorityHeadroom     int
     Ping              PingResult    // result of startup DATE ping
     QuotaBytes        int64         // 0 = unlimited
     QuotaUsed         int64         // bytes consumed in current period
@@ -853,19 +906,26 @@ type ProviderStats struct {
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `ID` | `string` | resolved provider name | Stable transport identity returned in results, attempt evidence, and stats |
 | `Host` | `string` | — | Server address as `host:port`, e.g. `news.example.com:563` |
 | `TLSConfig` | `*tls.Config` | nil (plain TCP) | Pass a `tls.Config` to enable TLS; set `ServerName` for SNI |
 | `Auth` | `Auth` | — | `Username` and `Password` for AUTHINFO handshake |
 | `Connections` | `int` | — | **Required.** Number of connection slots for this provider |
 | `Inflight` | `int` | 1 | Max concurrent BODY (and other body-bearing) commands per connection |
 | `StatInflight` | `int` | 0 (= `Inflight`) | Pipeline depth for bodyless STAT commands; set higher than `Inflight` (e.g. 50–100) to amortise round-trips on existence sweeps without inflating BODY memory |
+| `BackgroundStatInflight` | `int` | 0 (= `StatInflight`) | Maximum unanswered ordinary, non-priority STAT commands per connection |
+| `PriorityHeadroom` | `int` | 0 | Pipeline slots per connection that ordinary STAT cannot consume |
 | `Factory` | `ConnFactory` | nil | Custom dialer `func(ctx) (net.Conn, error)`; overrides `Host`/`TLSConfig` |
-| `Backup` | `bool` | false | If true, only used when all main providers return 430 |
+| `Backup` | `bool` | false | If true, used only after all eligible main providers fail the request |
 | `SkipPing` | `bool` | false | Skip the startup DATE ping (for servers that don't support DATE) |
 | `IdleTimeout` | `time.Duration` | 0 (disabled) | Disconnect idle connections after this duration; 0 = never |
 | `ThrottleRestore` | `time.Duration` | 30s | How long to wait before restoring throttled slots after a 502/400 greeting |
 | `KeepAlive` | `time.Duration` | 30s | TCP keep-alive interval; negative disables OS-level keep-alive |
 | `ReconnectDelay` | `time.Duration` | 0 (disabled) | If set, re-adds the provider this long after a 502 removal |
+| `AttemptTimeout` | `time.Duration` | adaptive, 2s–10s | Time-to-first-response-byte bound starting only at FIFO response head; caller context owns pool and pipeline wait |
+| `StallTimeout` | `time.Duration` | 8s | Rolling body-progress timeout; negative disables it |
+| `AbandonedBodyDrainBytes` | `int` | 1 MiB | Maximum obsolete BODY bytes drained after cancellation before retiring the socket |
+| `AbandonedBodyDrainTimeout` | `time.Duration` | 250ms | Maximum obsolete BODY drain time before retiring the socket |
 | `KeepaliveInterval` | `time.Duration` | 0 (disabled) | Application-level probe interval; 0 or when `SkipPing && KeepaliveCommand == ""` disables |
 | `KeepaliveCommand` | `string` | `"DATE"` | NNTP command for application-level probe: `"DATE"` (111), `"HELP"` (100), `"CAPABILITIES"` (101) |
 | `UserAgent` | `string` | `""` | Sent as `X-User-Agent` or equivalent; empty disables |
@@ -899,7 +959,8 @@ nntppool.WithDispatchStrategy(nntppool.DispatchFIFO)
 | `ErrAuthRequired` | 480 | Authentication required before this command |
 | `ErrAuthRejected` | 481 | Authentication credentials rejected |
 | `ErrServiceUnavailable` | 502 | Server permanently unavailable; provider removed from pool |
-| `ErrCRCMismatch` | — | yEnc CRC32 validation failed; body is returned alongside the error |
+| `ErrCRCMismatch` | — | A supplied yEnc CRC32 did not match |
+| `ErrBodyCorrupt` | — | BODY framing, metadata, size, decoding, or integrity validation failed |
 | `ErrMaxConnections` | 502/400 | Server reported max connections reached during handshake |
 | `ErrConnectionDied` | — | TCP connection closed unexpectedly |
 | `ErrProtocolDesync` | — | Binary data received where a status line was expected |
@@ -907,7 +968,10 @@ nntppool.WithDispatchStrategy(nntppool.DispatchFIFO)
 
 `ErrArticleNotFound` uses category matching: `errors.Is(err, ErrArticleNotFound)` returns true for both 430 and 423 responses.
 
-`ErrCRCMismatch` is returned alongside a non-nil `*ArticleBody` so callers can inspect the decoded data and decide whether to discard or use it.
+High-level buffered BODY APIs never return corrupt payload as a successful body.
+They preserve `errors.Is` checks through `TransportError` and expose every
+provider attempt there. Streaming APIs surface validation failure without
+restarting after decoded bytes have crossed the caller's writer boundary.
 
 ---
 
@@ -1160,9 +1224,12 @@ err := client.AddProvider(myProvider)
 
 ### CRC mismatch on decoded bodies
 
-**Symptom**: `ErrCRCMismatch` returned alongside a non-nil `*ArticleBody`.
+**Symptom**: `ErrCRCMismatch`/`ErrBodyCorrupt` is present in a structured BODY error.
 
-**Behaviour**: The body is always returned even on CRC mismatch so callers can choose to discard or accept the data. Check `body.CRCValid` and compare `body.CRC` with `body.ExpectedCRC`. This typically indicates a corrupt article on the server side.
+**Behaviour**: Buffered BODY retrieval discards the corrupt attempt, retires its
+socket, and tries the next eligible provider. If no provider returns a validated
+body, the error retains the corrupt attempt evidence. Streaming retrieval does
+not restart after any decoded byte was delivered to the caller's writer.
 
 ### Zombie connections under idle load
 

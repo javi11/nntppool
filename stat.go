@@ -132,7 +132,7 @@ func (c *Client) statOne(ctx context.Context, messageID string, target *provider
 // resilient single-group send (with fresh-connection retry on connection death)
 // that the failover path uses per provider. No cross-provider failover.
 func (c *Client) statViaGroup(ctx context.Context, g *providerGroup, payload []byte, priority bool) Response {
-	resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, nil, nil, priority)
+	resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, nil, nil, priority, false, false)
 	switch {
 	case cancelled:
 		err := ctx.Err()

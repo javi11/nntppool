@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"sort"
 	"sync"
@@ -37,7 +38,10 @@ func isConnectionDeathError(err error) bool {
 		return true
 	}
 	var netErr net.Error
-	return errors.As(err, &netErr)
+	if errors.As(err, &netErr) {
+		return !netErr.Timeout()
+	}
+	return false
 }
 
 const (
@@ -71,9 +75,10 @@ const (
 	// retry uses a fresh connection on the same provider.
 	maxConnDiedRetries = 2
 
-	// minAttemptTimeout is the floor (and default) for the per-attempt timeout
-	// that bounds dispatch + time-to-first-response-byte. Once response bytes
-	// start flowing, the rolling stall timeout takes over instead.
+	// minAttemptTimeout is the floor (and default) for the provider response
+	// timeout. It begins only when a request reaches FIFO response head and
+	// bounds time-to-first-response-byte. Once response bytes start flowing,
+	// the rolling stall timeout takes over instead.
 	minAttemptTimeout = 2 * time.Second
 
 	// maxAttemptTimeout caps the adaptive per-attempt timeout derived from a
@@ -96,20 +101,22 @@ const (
 	// poison later work.
 	defaultAbandonedBodyDrainBytes   = 1 * 1024 * 1024
 	defaultAbandonedBodyDrainTimeout = 250 * time.Millisecond
+	temporaryRetryMinDelay           = 10 * time.Millisecond
+	temporaryRetryJitter             = 15 * time.Millisecond
 )
 
 var errAbandonedBodyDrainLimit = errors.New("nntp: abandoned BODY drain limit exceeded")
+var errFreshTransportRequired = errors.New("nntp: fresh transport required")
+var errBackgroundStatWindowFull = errors.New("nntp: background STAT window full")
 
-// Attempt lifecycle states, coordinating the race between tryGroup's attempt
-// timer and the reader observing the first response byte. The CAS handshake
-// guarantees exactly one of them "wins": if the reader commits first the
-// attempt is never abandoned mid-stream; if the timer fires first the attempt
-// fails over and the reader drops the (cancelled) request.
+// Attempt lifecycle states distinguish local queueing, FIFO response-head
+// service, decoded output commitment, and caller abandonment. This prevents a
+// cancellation from restarting a request after decoded bytes crossed a caller
+// writer boundary, including bytes that were already buffered locally.
 const (
 	attemptPending      int32 = iota // request has not reached response head
 	attemptResponseHead              // request is the FIFO response head
 	attemptCommitted                 // decoded bytes crossed the output boundary
-	attemptAbandoned                 // request was abandoned before response head
 )
 
 type greetingError struct {
@@ -134,6 +141,11 @@ type Request struct {
 	// Optional: decoded body bytes are streamed here. If nil, they are buffered into Response.Body.
 	BodyWriter io.Writer
 
+	// ValidateBody enables complete yEnc framing/integrity validation. It is
+	// set by the high-level BODY APIs; raw Send remains source/behavior compatible.
+	ValidateBody   bool
+	FreshTransport bool
+
 	// Optional: called with yEnc metadata once =ybegin/=ypart headers are parsed, before body decoding.
 	OnMeta func(YEncMeta)
 
@@ -149,13 +161,11 @@ type Request struct {
 	// otherwise (e.g. 440 posting not allowed). Buffered with capacity 1.
 	postReadyCh chan error
 
-	// attemptDeadline bounds dispatch + time-to-first-response-byte for this
-	// attempt. Zero means no such bound (e.g. POST and keepalive requests).
-	// Once the reader sees the first byte the attempt is committed and this
-	// deadline no longer applies — the connection's rolling stall timeout does.
-	attemptDeadline time.Time
+	// responseTimeout starts only when this request becomes FIFO response head.
+	// Pool queue and pipeline-head wait remain governed solely by the caller ctx.
+	responseTimeout time.Duration
 
-	// attemptState coordinates response-head admission with attempt timeout.
+	// attemptState records response-head admission and decoded commitment.
 	// Decoded output advances responseHead→committed. Zero is attemptPending.
 	attemptState atomic.Int32
 
@@ -164,20 +174,26 @@ type Request struct {
 	// request must never restart on another provider.
 	decodedCommitted atomic.Bool
 
-	// sentAt is the Unix-nanosecond timestamp at which the payload was handed
-	// to the connection, used to measure time-to-first-byte. 0 = unset (the
-	// request is not measured, e.g. POST/keepalive).
-	sentAt atomic.Int64
+	// submittedAt, writtenAt, and responseHeadAt delimit the three transport
+	// timing components exposed in AttemptEvidence.
+	submittedAt    time.Time
+	writtenAt      atomic.Int64
+	responseHeadAt atomic.Int64
 
 	// heldBody is set by writeLoop when this (body-bearing) request acquired a
 	// bodySem slot, so readerLoop releases exactly the slots that were taken.
 	// Bodyless STAT requests never acquire bodySem and leave this false.
-	heldBody bool
+	heldBody           bool
+	heldBackgroundStat bool
+	heldPipeline       bool
+	Priority           bool
 }
 
 type Response struct {
 	StatusCode int
 	Status     string
+	ProviderID string
+	Attempts   []AttemptEvidence
 
 	// For non-body multiline responses (CAPABILITIES, etc).
 	Lines []string
@@ -218,14 +234,17 @@ type NNTPConnection struct {
 	// never increases the number of BODY responses buffered/streamed at once.
 	// Bodyless STAT commands acquire only inflightSem and so pipeline to the
 	// deeper StatInflight depth.
-	inflightSem chan struct{}
-	bodySem     chan struct{}
+	inflightSem         chan struct{}
+	bodySem             chan struct{}
+	backgroundStatSem   chan struct{}
+	backgroundStatFreed chan struct{}
 
 	rb readBuffer
 
 	Greeting NNTPResponse
 
 	firstReq              *Request      // bootstrap request from connection slot
+	secondReq             *Request      // normal request deferred behind bootstrap priority
 	idleTimeout           time.Duration // 0 = no idle timeout
 	stallTimeout          time.Duration // rolling body-progress deadline; 0 = disabled
 	abandonedDrainBytes   int           // maximum obsolete BODY bytes to drain
@@ -233,6 +252,8 @@ type NNTPConnection struct {
 	keepaliveInterval     time.Duration // 0 = no keepalive
 	keepaliveCommand      string        // NNTP command for keepalive probe (e.g. "DATE")
 	providerName          string        // set by runConnSlot; used for error context
+	providerID            string        // stable identity exposed in results/evidence
+	createdAt             time.Time
 	userAgent             string
 
 	stats *providerStats // nil for standalone connections
@@ -240,7 +261,7 @@ type NNTPConnection struct {
 	done   chan struct{}
 	doneMu sync.Once
 
-	failMu sync.Once
+	failMu sync.Mutex
 }
 
 func newNetConn(ctx context.Context, addr string, tlsConfig *tls.Config, keepAlive time.Duration) (net.Conn, error) {
@@ -295,12 +316,15 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		// runConnSlot overrides this to Provider.Inflight when a deeper STAT
 		// pipeline is configured. Standalone connections keep them equal.
 		bodySem:               make(chan struct{}, inflightLimit),
+		backgroundStatSem:     make(chan struct{}, inflightLimit),
+		backgroundStatFreed:   make(chan struct{}, 1),
 		rb:                    rb,
 		stats:                 stats,
 		done:                  make(chan struct{}),
 		userAgent:             userAgent,
 		abandonedDrainBytes:   defaultAbandonedBodyDrainBytes,
 		abandonedDrainTimeout: defaultAbandonedBodyDrainTimeout,
+		createdAt:             time.Now(),
 	}
 
 	// Server greeting is sent immediately upon connect.
@@ -426,28 +450,28 @@ func failRequest(ch chan Response, err error) {
 }
 
 func (c *NNTPConnection) failOutstanding() {
-	c.failMu.Do(func() {
-		connErr := error(ErrConnectionDied)
-		if c.providerName != "" {
-			connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
-		}
-		for {
-			select {
-			case req := <-c.pending:
-				if req == nil {
-					continue
-				}
-				failRequest(req.RespCh, connErr)
-				// Best-effort inflight release (not strictly needed once we're shutting down).
-				select {
-				case <-c.inflightSem:
-				default:
-				}
-			default:
-				return
+	c.failMu.Lock()
+	defer c.failMu.Unlock()
+	connErr := error(ErrConnectionDied)
+	if c.providerName != "" {
+		connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
+	}
+	for {
+		select {
+		case req := <-c.pending:
+			if req == nil {
+				continue
 			}
+			c.releaseRequestPending(req)
+			failRequest(req.RespCh, connErr)
+			select {
+			case <-c.inflightSem:
+			default:
+			}
+		default:
+			return
 		}
-	})
+	}
 }
 
 func (c *NNTPConnection) Close() error {
@@ -602,34 +626,61 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, abandonedDrainBytes int, abandonedDrainTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, backgroundStatInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, abandonedDrainBytes int, abandonedDrainTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName, providerID string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
 	var sharedBuf readBuffer
+	var carriedReq *Request
 
 	for {
 		// IDLE: wait for a request (zero TCP resources).
 		// Prefer priority requests over normal ones.
 		var firstReq *Request
+		var secondReq *Request
 		var ok bool
-		select {
-		case firstReq, ok = <-prioCh:
-			if !ok {
-				return
+		if carriedReq != nil {
+			firstReq, ok = carriedReq, true
+			carriedReq = nil
+			select {
+			case priorityReq, priorityOK := <-prioCh:
+				if !priorityOK {
+					failRequest(firstReq.RespCh, ctx.Err())
+					return
+				}
+				secondReq = firstReq
+				firstReq = priorityReq
+			default:
 			}
-		default:
+		} else {
 			select {
 			case firstReq, ok = <-prioCh:
 				if !ok {
 					return
 				}
-			case firstReq, ok = <-reqCh:
-				if !ok {
-					return // channel closed, shut down
+			default:
+				select {
+				case firstReq, ok = <-prioCh:
+					if !ok {
+						return
+					}
+				case firstReq, ok = <-reqCh:
+					if !ok {
+						return // channel closed, shut down
+					}
+					select {
+					case priorityReq, priorityOK := <-prioCh:
+						if !priorityOK {
+							failRequest(firstReq.RespCh, ctx.Err())
+							return
+						}
+						secondReq = firstReq
+						firstReq = priorityReq
+					default:
+					}
+				case <-ctx.Done():
+					return
 				}
-			case <-ctx.Done():
-				return
 			}
 		}
 
@@ -637,6 +688,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		select {
 		case <-firstReq.Ctx.Done():
 			failRequest(firstReq.RespCh, firstReq.Ctx.Err())
+			carriedReq = secondReq
 			continue
 		default:
 		}
@@ -645,6 +697,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		if !gate.enter(ctx, firstReq.Ctx) {
 			// Slot or request context cancelled while waiting at the gate.
 			failRequest(firstReq.RespCh, context.Canceled)
+			carriedReq = secondReq
 			continue
 		}
 
@@ -653,6 +706,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		if err != nil {
 			gate.exit()
 			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			carriedReq = secondReq
 			// Backoff before retrying to avoid thrashing.
 			select {
 			case <-time.After(connFailureBackoff):
@@ -669,6 +723,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		if err != nil {
 			_ = conn.Close()
 			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			carriedReq = secondReq
 
 			if errors.Is(err, ErrMaxConnections) {
 				// Server said "max connections" — throttle and use longer backoff.
@@ -695,12 +750,15 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// allows STAT to reach statInflight. When statInflight == inflight this
 		// is identical to the default (both caps equal).
 		nc.bodySem = make(chan struct{}, inflight)
+		nc.backgroundStatSem = make(chan struct{}, backgroundStatInflight)
 		nc.firstReq = firstReq
+		nc.secondReq = secondReq
 		nc.idleTimeout = idleTimeout
 		nc.stallTimeout = stallTimeout
 		nc.abandonedDrainBytes = abandonedDrainBytes
 		nc.abandonedDrainTimeout = abandonedDrainTimeout
 		nc.providerName = providerName
+		nc.providerID = providerID
 		nc.hotReqCh = hotReqCh
 		nc.hotPrioCh = hotPrioCh
 		nc.keepaliveInterval = keepaliveInterval
@@ -734,6 +792,57 @@ type attemptWriter struct {
 	w   io.Writer
 }
 
+func markRequestWritten(req *Request) {
+	now := time.Now().UnixNano()
+	req.writtenAt.Store(now)
+}
+
+func (c *NNTPConnection) acquireBackgroundStat(req *Request) error {
+	if !isCheapCommand(req.Payload) || req.Priority {
+		return nil
+	}
+	select {
+	case c.backgroundStatSem <- struct{}{}:
+		req.heldBackgroundStat = true
+		if c.stats != nil {
+			c.stats.BackgroundStatInUse.Add(1)
+		}
+		return nil
+	default:
+		return errBackgroundStatWindowFull
+	}
+}
+
+func (c *NNTPConnection) releaseBackgroundStat(req *Request) {
+	if !req.heldBackgroundStat {
+		return
+	}
+	req.heldBackgroundStat = false
+	<-c.backgroundStatSem
+	if c.stats != nil {
+		c.stats.BackgroundStatInUse.Add(-1)
+	}
+	select {
+	case c.backgroundStatFreed <- struct{}{}:
+	default:
+	}
+}
+
+func (c *NNTPConnection) markRequestPending(req *Request) {
+	req.heldPipeline = true
+	if c.stats != nil {
+		c.stats.PipelineInUse.Add(1)
+	}
+}
+
+func (c *NNTPConnection) releaseRequestPending(req *Request) {
+	c.releaseBackgroundStat(req)
+	if req.heldPipeline && c.stats != nil {
+		c.stats.PipelineInUse.Add(-1)
+	}
+	req.heldPipeline = false
+}
+
 func (w *attemptWriter) Write(p []byte) (int, error) {
 	if len(p) > 0 {
 		// Mark before entering a potentially blocking writer. Once decoded bytes
@@ -745,7 +854,16 @@ func (w *attemptWriter) Write(p []byte) (int, error) {
 }
 
 func (c *NNTPConnection) Run() {
+	var unsent *Request
+	deferredNormal := c.secondReq
+	c.secondReq = nil
 	defer func() {
+		if unsent != nil {
+			failRequest(unsent.RespCh, ErrConnectionDied)
+		}
+		if deferredNormal != nil {
+			failRequest(deferredNormal.RespCh, ErrConnectionDied)
+		}
 		c.cancel()
 		_ = c.conn.Close()
 		c.failOutstanding()
@@ -784,10 +902,15 @@ func (c *NNTPConnection) Run() {
 	// Process the bootstrap request injected by runConnSlot, if any.
 	if c.firstReq != nil {
 		req := c.firstReq
+		unsent = req
 		c.firstReq = nil
 
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
+		}
+		if req.FreshTransport && c.createdAt.Before(req.submittedAt) {
+			failRequest(req.RespCh, errFreshTransportRequired)
+			return
 		}
 
 		// Check cancellation.
@@ -824,12 +947,21 @@ func (c *NNTPConnection) Run() {
 				return
 			}
 		}
+		if err := c.acquireBackgroundStat(req); err != nil {
+			<-c.inflightSem
+			if req.heldBody {
+				<-c.bodySem
+			}
+			failRequest(req.RespCh, err)
+			goto mainLoop
+		}
 
 		dl, hasDL := req.writeDeadline()
 		setWriteDeadline(dl, hasDL)
 
 		if _, err := bw.Write(req.Payload); err != nil {
 			<-c.inflightSem
+			c.releaseBackgroundStat(req)
 			failRequest(req.RespCh, err)
 			_ = c.conn.Close()
 			c.failOutstanding()
@@ -846,7 +978,9 @@ func (c *NNTPConnection) Run() {
 				return
 			}
 			req.postReadyCh = make(chan error, 1)
+			c.markRequestPending(req)
 			c.pending <- req
+			unsent = nil
 			// Block here — no other request can be written while we wait.
 			select {
 			case postErr := <-req.postReadyCh:
@@ -881,8 +1015,10 @@ func (c *NNTPConnection) Run() {
 					return
 				}
 			}
-			req.sentAt.Store(time.Now().UnixNano())
+			markRequestWritten(req)
+			c.markRequestPending(req)
 			c.pending <- req
+			unsent = nil
 		}
 	}
 
@@ -947,29 +1083,77 @@ mainLoop:
 		var ok bool
 		var didKeepalive bool
 		if c.prioCh != nil {
-			// Try hot priority (non-blocking).
-			select {
-			case req, ok = <-c.hotPrioCh:
-			default:
-				// Try hot normal (non-blocking).
+			takePriority := func() (*Request, bool, bool) {
 				select {
-				case req, ok = <-c.hotReqCh:
+				case priorityReq, priorityOK := <-c.hotPrioCh:
+					return priorityReq, priorityOK, true
 				default:
-					// Blocking: wait on all channels.
+				}
+				select {
+				case priorityReq, priorityOK := <-c.prioCh:
+					return priorityReq, priorityOK, true
+				default:
+					return nil, false, false
+				}
+			}
+
+			var gotPriority bool
+			blockedDeferredStat := deferredNormal != nil &&
+				isCheapCommand(deferredNormal.Payload) &&
+				!deferredNormal.Priority &&
+				len(c.backgroundStatSem) == cap(c.backgroundStatSem)
+			req, ok, gotPriority = takePriority()
+			if blockedDeferredStat && !gotPriority {
+				select {
+				case req, ok = <-c.hotPrioCh:
+					gotPriority = true
+				case req, ok = <-c.prioCh:
+					gotPriority = true
+				case <-c.backgroundStatFreed:
+				case <-c.ctx.Done():
+					<-c.inflightSem
+					return
+				}
+			}
+			if !gotPriority {
+				selectedNormal := false
+				if deferredNormal != nil {
+					req, ok = deferredNormal, true
+					deferredNormal = nil
+					selectedNormal = true
+				} else {
 					select {
-					case req, ok = <-c.hotPrioCh:
 					case req, ok = <-c.hotReqCh:
-					case req, ok = <-c.prioCh:
-					case req, ok = <-c.reqCh:
-					case <-c.ctx.Done():
-						<-c.inflightSem
-						return
-					case <-idleCh:
-						<-c.inflightSem
-						c.waitForInflightDrain()
-						return
-					case <-keepaliveCh:
-						didKeepalive = true
+						selectedNormal = true
+					default:
+						select {
+						case req, ok = <-c.reqCh:
+							selectedNormal = true
+						default:
+							select {
+							case req, ok = <-c.hotPrioCh:
+							case req, ok = <-c.prioCh:
+							case req, ok = <-c.hotReqCh:
+								selectedNormal = true
+							case req, ok = <-c.reqCh:
+								selectedNormal = true
+							case <-c.ctx.Done():
+								<-c.inflightSem
+								return
+							case <-idleCh:
+								<-c.inflightSem
+								c.waitForInflightDrain()
+								return
+							case <-keepaliveCh:
+								didKeepalive = true
+							}
+						}
+					}
+				}
+				if selectedNormal {
+					if priorityReq, priorityOK, available := takePriority(); available {
+						deferredNormal = req
+						req, ok = priorityReq, priorityOK
 					}
 				}
 			}
@@ -1026,6 +1210,7 @@ mainLoop:
 			<-c.inflightSem
 			return
 		}
+		unsent = req
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
 		}
@@ -1049,6 +1234,11 @@ mainLoop:
 			continue
 		default:
 		}
+		if req.FreshTransport && c.createdAt.Before(req.submittedAt) {
+			<-c.inflightSem
+			failRequest(req.RespCh, errFreshTransportRequired)
+			return
+		}
 
 		// Body-bearing requests additionally take a bodySem slot so concurrent
 		// bodies stay bounded by Inflight even when the pipeline (inflightSem)
@@ -1066,6 +1256,19 @@ mainLoop:
 				return
 			}
 		}
+		if err := c.acquireBackgroundStat(req); err != nil {
+			<-c.inflightSem
+			if req.heldBody {
+				<-c.bodySem
+			}
+			if errors.Is(err, errBackgroundStatWindowFull) {
+				deferredNormal = req
+				unsent = nil
+				continue
+			}
+			failRequest(req.RespCh, err)
+			continue
+		}
 
 		// per-request write deadline (cached to avoid redundant syscalls)
 		dl, hasDL := req.writeDeadline()
@@ -1074,6 +1277,7 @@ mainLoop:
 		// pipeline write (buffered; flushed at top of loop before blocking)
 		if _, err := bw.Write(req.Payload); err != nil {
 			<-c.inflightSem
+			c.releaseBackgroundStat(req)
 			failRequest(req.RespCh, err)
 			_ = c.conn.Close()
 			c.failOutstanding()
@@ -1091,7 +1295,9 @@ mainLoop:
 				return
 			}
 			req.postReadyCh = make(chan error, 1)
+			c.markRequestPending(req)
 			c.pending <- req
+			unsent = nil
 			select {
 			case postErr := <-req.postReadyCh:
 				if postErr != nil {
@@ -1126,8 +1332,10 @@ mainLoop:
 				}
 			}
 			// track FIFO ordering (after writes succeed to avoid send on closed channel)
-			req.sentAt.Store(time.Now().UnixNano())
+			markRequestWritten(req)
+			c.markRequestPending(req)
 			c.pending <- req
+			unsent = nil
 		}
 	}
 }
@@ -1151,6 +1359,7 @@ func (c *NNTPConnection) readerLoop() {
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
 		}
+		req.responseHeadAt.Store(time.Now().UnixNano())
 		req.attemptState.CompareAndSwap(attemptPending, attemptResponseHead)
 
 		resp := Response{
@@ -1195,6 +1404,10 @@ func (c *NNTPConnection) readerLoop() {
 		var drainStarted time.Time
 		drainStartConsumed := 0
 		respStart := time.Now()
+		var responseDeadline time.Time
+		if req.responseTimeout > 0 {
+			responseDeadline = respStart.Add(req.responseTimeout)
+		}
 		err := c.rb.feedUntilDoneControlled(c.conn, &decoder, outRef, func(wireBytes, consumedBytes int) (time.Time, bool, int, error) {
 			if deliver {
 				select {
@@ -1233,8 +1446,8 @@ func (c *NNTPConnection) readerLoop() {
 			}
 			parentDL, hasParent := req.Ctx.Deadline()
 			switch {
-			case lastBytes == 0 && !req.attemptDeadline.IsZero():
-				dl, ok := minDeadline(req.attemptDeadline, parentDL, hasParent)
+			case lastBytes == 0 && !responseDeadline.IsZero():
+				dl, ok := minDeadline(responseDeadline, parentDL, hasParent)
 				return dl, ok, 0, nil
 			case lastBytes > 0 && stall > 0:
 				dl, ok := minDeadline(stallDeadline, parentDL, hasParent)
@@ -1243,6 +1456,12 @@ func (c *NNTPConnection) readerLoop() {
 				return parentDL, hasParent, 0, nil
 			}
 		})
+		if err == nil && req.ValidateBody {
+			err = decoder.validateBody()
+		}
+		if err != nil && req.Ctx.Err() != nil {
+			err = req.Ctx.Err()
+		}
 		if err != nil {
 			if c.providerName != "" {
 				resp.Err = fmt.Errorf("%s: %w", c.providerName, err)
@@ -1255,6 +1474,7 @@ func (c *NNTPConnection) readerLoop() {
 		resp.Status = decoder.Message
 		resp.Lines = decoder.Lines
 		resp.Meta = decoder
+		resp.ProviderID = c.providerID
 
 		// Two-phase POST: coordinate with writeLoop via postReadyCh.
 		if req.PostMode {
@@ -1315,12 +1535,13 @@ func (c *NNTPConnection) readerLoop() {
 				if fb.IsZero() {
 					fb = respStart
 				}
-				if sentAt := req.sentAt.Load(); sentAt != 0 {
-					recordTTFB(c.stats, fb.Sub(time.Unix(0, sentAt)))
+				if headAt := req.responseHeadAt.Load(); headAt != 0 {
+					recordTTFB(c.stats, fb.Sub(time.Unix(0, headAt)))
 				}
 				recordSpeed(c.stats, n, time.Since(fb))
 			}
 		}
+		resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, c.providerID, resp, time.Now())}
 
 		if deliver {
 			// Best effort: don't block forever if the receiver abandoned the channel.
@@ -1333,6 +1554,7 @@ func (c *NNTPConnection) readerLoop() {
 
 		// release inflight slot (and the body slot, if this request took one)
 		<-c.inflightSem
+		c.releaseRequestPending(req)
 		if req.heldBody {
 			<-c.bodySem
 		}
@@ -1364,6 +1586,12 @@ func (c *NNTPConnection) readerLoop() {
 		// 502 "service unavailable" mid-session: close the connection so
 		// all pending requests fail fast instead of waiting in the pipeline.
 		if decoder.StatusCode == 502 {
+			_ = c.conn.Close()
+			c.failOutstanding()
+			return
+		}
+		// A 451 retry must use a fresh transport.
+		if decoder.StatusCode == 451 {
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
@@ -1430,24 +1658,29 @@ func WithSpeedAwareDispatch(enabled bool) ClientOption {
 
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
-	Host            string
-	TLSConfig       *tls.Config
-	Auth            Auth
-	Connections     int
-	Inflight        int           // 0 defaults to 1; max concurrent BODY (and other body-bearing) commands per connection
-	StatInflight    int           // 0 defaults to Inflight; deeper pipeline depth for bodyless STAT commands. Because STAT carries no payload, many can be in flight per connection at negligible memory cost, amortising round-trips. Set higher than Inflight (e.g. 50-100) for STAT-heavy workloads without inflating BODY memory.
-	Factory         ConnFactory   // overrides Host/TLSConfig when set
-	Backup          bool          // if true, only used when main providers return 430
-	SkipPing        bool          // if true, skip the DATE ping on startup (for providers that don't support DATE)
-	IdleTimeout     time.Duration // 0 means no idle disconnect
-	ThrottleRestore time.Duration // 0 defaults to 30s
-	KeepAlive       time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
-	ReconnectDelay  time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
+	// ID is the caller's stable transport identity for result and attempt
+	// evidence. When empty, the existing resolved provider name is used.
+	ID                     string
+	Host                   string
+	TLSConfig              *tls.Config
+	Auth                   Auth
+	Connections            int
+	Inflight               int           // 0 defaults to 1; max concurrent BODY (and other body-bearing) commands per connection
+	StatInflight           int           // 0 defaults to Inflight; deeper pipeline depth for bodyless STAT commands. Because STAT carries no payload, many can be in flight per connection at negligible memory cost, amortising round-trips. Set higher than Inflight (e.g. 50-100) for STAT-heavy workloads without inflating BODY memory.
+	BackgroundStatInflight int           // 0 defaults to StatInflight; max ordinary (non-priority) STAT commands written per connection
+	PriorityHeadroom       int           // pipeline slots per connection ordinary STAT cannot consume
+	Factory                ConnFactory   // overrides Host/TLSConfig when set
+	Backup                 bool          // if true, used only after all eligible main providers fail the request
+	SkipPing               bool          // if true, skip the DATE ping on startup (for providers that don't support DATE)
+	IdleTimeout            time.Duration // 0 means no idle disconnect
+	ThrottleRestore        time.Duration // 0 defaults to 30s
+	KeepAlive              time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
+	ReconnectDelay         time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
 
-	// AttemptTimeout bounds dispatch plus time-to-first-response-byte for each
-	// attempt against this provider (it does NOT bound the body transfer, which
-	// is governed by StallTimeout). 0 selects an adaptive value derived from the
-	// provider's measured RTT, clamped to [2s, 10s]. Set explicitly to override.
+	// AttemptTimeout bounds time-to-first-response-byte starting only when the
+	// request becomes response head on its NNTP connection. Pool admission and
+	// pipeline wait remain governed by the caller context; body progress after
+	// the first byte is governed by StallTimeout. Zero selects an adaptive value.
 	AttemptTimeout time.Duration
 
 	// StallTimeout is the rolling progress deadline for a body transfer: once
@@ -1502,6 +1735,7 @@ type Provider struct {
 
 type providerGroup struct {
 	name      string
+	id        string
 	host      string // raw Provider.Host; empty for Factory-based providers
 	maxConns  int
 	ctx       context.Context // cancelled on removal/close
@@ -1520,8 +1754,8 @@ type providerGroup struct {
 	quotaResetAt atomic.Int64  // Unix nanoseconds of next reset; 0 = never
 }
 
-// attemptTimeout returns the per-attempt timeout (dispatch + time-to-first-byte
-// bound). An explicit Provider.AttemptTimeout wins; otherwise it adapts to the
+// attemptTimeout returns the response-head time-to-first-byte bound. An
+// explicit Provider.AttemptTimeout wins; otherwise it adapts to the
 // provider's observed time-to-first-byte EWMA (seeded from the ping RTT) as
 // 4×TTFB, clamped to [minAttemptTimeout, maxAttemptTimeout]. With no sample yet
 // it falls back to minAttemptTimeout, preserving the historical 2s behavior.
@@ -1682,6 +1916,13 @@ func resolveProviderName(p Provider, index int) string {
 	return fmt.Sprintf("provider-%d", index)
 }
 
+func resolveProviderID(p Provider, index int) string {
+	if p.ID != "" {
+		return p.ID
+	}
+	return resolveProviderName(p, index)
+}
+
 // startProviderGroup creates a providerGroup, pings the provider, and launches
 // connection slot goroutines. The caller is responsible for storing the group.
 func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
@@ -1696,6 +1937,15 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	if statInflight < inflight {
 		statInflight = inflight
 	}
+	priorityHeadroom := max(p.PriorityHeadroom, 0)
+	if priorityHeadroom >= statInflight {
+		priorityHeadroom = statInflight - 1
+	}
+	backgroundStatInflight := p.BackgroundStatInflight
+	if backgroundStatInflight <= 0 {
+		backgroundStatInflight = statInflight
+	}
+	backgroundStatInflight = min(backgroundStatInflight, statInflight-priorityHeadroom)
 
 	factory := p.Factory
 	if factory == nil {
@@ -1713,6 +1963,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	g := &providerGroup{
 		name:        name,
+		id:          resolveProviderID(p, index),
 		host:        p.Host,
 		maxConns:    p.Connections,
 		ctx:         gctx,
@@ -1726,6 +1977,9 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		quotaPeriod: p.QuotaPeriod,
 	}
 	g.stats.quotaBytes = p.QuotaBytes
+	g.stats.pipelineLimit = statInflight * p.Connections
+	g.stats.backgroundStatLimit = backgroundStatInflight * p.Connections
+	g.stats.priorityHeadroom = priorityHeadroom * p.Connections
 	if p.QuotaBytes > 0 {
 		if p.QuotaUsed > 0 {
 			g.stats.quotaUsed.Store(p.QuotaUsed)
@@ -1786,7 +2040,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 
 	for range p.Connections {
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, drainBytes, drainTimeout, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, backgroundStatInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, drainBytes, drainTimeout, kaInterval, kaCmd, gate, &g.stats, name, g.id, &c.wg)
 	}
 
 	return g
@@ -1811,6 +2065,7 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 
 	// Validation only — no TCP connections are created here.
 	seen := make(map[string]struct{}, len(providers))
+	seenIDs := make(map[string]struct{}, len(providers))
 	for i, p := range providers {
 		if p.Connections <= 0 {
 			return nil, fmt.Errorf("nntp: provider connections must be > 0")
@@ -1823,6 +2078,11 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 			return nil, fmt.Errorf("nntp: provider %q already exists", name)
 		}
 		seen[name] = struct{}{}
+		id := resolveProviderID(p, i)
+		if _, dup := seenIDs[id]; dup {
+			return nil, fmt.Errorf("nntp: provider ID %q already exists", id)
+		}
+		seenIDs[id] = struct{}{}
 	}
 
 	if ctx == nil {
@@ -1905,7 +2165,16 @@ func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io
 		metaFn = onMeta[0]
 	}
 
-	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, true)
+	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, true, false)
+	return respCh
+}
+
+func (c *Client) sendValidatedBody(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), priority bool) <-chan Response {
+	respCh := make(chan Response, 1)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, priority, true)
 	return respCh
 }
 
@@ -1939,6 +2208,7 @@ func extractProbeMsgID(payload []byte) []byte {
 
 // probeResult carries the outcome of one parallel STAT probe.
 type probeResult struct {
+	index     int
 	g         *providerGroup
 	resp      Response
 	ok        bool
@@ -1957,6 +2227,8 @@ func (c *Client) raceCandidates(
 	statPayload, payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
+	validateBody bool,
+	attempts *[]AttemptEvidence,
 	skipHosts *[4]string,
 	skipCount *int,
 	respCh chan<- Response,
@@ -1970,6 +2242,7 @@ func (c *Client) raceCandidates(
 		}
 		if g.isQuotaExceeded() {
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+			*attempts = append(*attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 			continue
 		}
 		if g.host != "" && seen[g.host] {
@@ -1988,7 +2261,8 @@ func (c *Client) raceCandidates(
 	// Single live candidate: skip the probe RTT and send the real payload directly.
 	if len(live) == 1 {
 		g := live[0]
-		resp, ok, done := c.tryGroup(ctx, g, payload, bodyWriter, onMeta, true)
+		resp, ok, done := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, true, validateBody, false)
+		*attempts = append(*attempts, resp.Attempts...)
 		if done {
 			return false, true, lastErr
 		}
@@ -2013,24 +2287,30 @@ func (c *Client) raceCandidates(
 			c.nextIdx.Add(1)
 			return false, false, lastErr
 		}
+		resp.Attempts = cloneAttempts(*attempts)
 		respCh <- resp
 		return true, false, lastErr
 	}
 
 	// ≥2 candidates: probe all in parallel.
 	results := make(chan probeResult, len(live))
-	for _, g := range live {
-		go func(g *providerGroup) {
-			resp, ok, done := c.tryGroup(ctx, g, statPayload, nil, nil, true)
-			results <- probeResult{g: g, resp: resp, ok: ok, cancelled: done}
-		}(g)
+	for index, g := range live {
+		go func(index int, g *providerGroup) {
+			resp, ok, done := c.tryGroupResilient(ctx, g, statPayload, nil, nil, true, false, false)
+			results <- probeResult{index: index, g: g, resp: resp, ok: ok, cancelled: done}
+		}(index, g)
 	}
 
 	// Collect ALL probe results before acting on the winner, so that side
 	// effects like 502 provider removal are applied regardless of order.
-	var winner *providerGroup
+	ordered := make([]probeResult, len(live))
 	for range live {
 		pr := <-results
+		ordered[pr.index] = pr
+	}
+	var winners []*providerGroup
+	for _, pr := range ordered {
+		*attempts = append(*attempts, pr.resp.Attempts...)
 		if pr.cancelled {
 			cancelled = true
 			continue
@@ -2057,11 +2337,9 @@ func (c *Client) raceCandidates(
 			}
 			c.nextIdx.Add(1)
 		case 223:
-			if winner == nil {
-				winner = g // first 223; keep collecting for 502s
-			}
+			winners = append(winners, g)
 		default:
-			lastErr = fmt.Errorf("%s: unexpected STAT probe status %d", g.name, pr.resp.StatusCode)
+			lastErr = fmt.Errorf("%s: %w", g.name, toError(pr.resp.StatusCode, pr.resp.Status))
 		}
 	}
 
@@ -2069,46 +2347,55 @@ func (c *Client) raceCandidates(
 		return false, true, lastErr
 	}
 
-	if winner == nil {
+	if len(winners) == 0 {
 		return false, false, lastErr
 	}
 
-	// Send the real payload to the winner on the priority lane.
-	resp, ok, done := c.tryGroup(ctx, winner, payload, bodyWriter, onMeta, true)
-	if done {
-		return false, true, lastErr
-	}
-	if !ok {
-		return false, false, lastErr
-	}
-	if resp.Err != nil {
-		// A committed attempt with a caller writer already streamed partial
-		// bytes; deliver the error rather than letting the caller re-stream
-		// into the same writer on another provider.
-		if bodyWriter != nil && attemptCommittedResp(resp) {
-			respCh <- resp
-			return true, false, nil
+	// Try STAT-positive providers in configured order. A faster later probe may
+	// not override the preferred provider, and corrupt/expired winners advance.
+	for _, winner := range winners {
+		resp, ok, done := c.tryGroupResilient(ctx, winner, payload, bodyWriter, onMeta, true, validateBody, false)
+		*attempts = append(*attempts, resp.Attempts...)
+		if done {
+			return false, true, lastErr
 		}
-		return false, false, resp.Err
-	}
-	if resp.StatusCode == 430 || resp.StatusCode == 423 {
-		// Rare: article expired between STAT and BODY.
-		if winner.host != "" && *skipCount < len(skipHosts) {
-			skipHosts[*skipCount] = winner.host
-			*skipCount++
+		if !ok {
+			continue
 		}
-		c.nextIdx.Add(1)
-		return false, false, lastErr
-	}
-	if resp.StatusCode == 502 {
-		_ = c.RemoveProvider(winner.name)
-		if winner.p.ReconnectDelay > 0 {
-			c.scheduleReconnect(winner)
+		if resp.Err != nil {
+			if bodyWriter != nil && attemptCommittedResp(resp) {
+				resp.Attempts = cloneAttempts(*attempts)
+				respCh <- resp
+				return true, false, nil
+			}
+			lastErr = resp.Err
+			continue
 		}
-		return false, false, fmt.Errorf("%s: %w", winner.name, ErrServiceUnavailable)
+		if resp.StatusCode == 430 || resp.StatusCode == 423 {
+			if winner.host != "" && *skipCount < len(skipHosts) {
+				skipHosts[*skipCount] = winner.host
+				*skipCount++
+			}
+			c.nextIdx.Add(1)
+			continue
+		}
+		if resp.StatusCode == 502 {
+			_ = c.RemoveProvider(winner.name)
+			if winner.p.ReconnectDelay > 0 {
+				c.scheduleReconnect(winner)
+			}
+			lastErr = fmt.Errorf("%s: %w", winner.name, ErrServiceUnavailable)
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("%s: %w", winner.name, toError(resp.StatusCode, resp.Status))
+			continue
+		}
+		resp.Attempts = cloneAttempts(*attempts)
+		respCh <- resp
+		return true, false, lastErr
 	}
-	respCh <- resp
-	return true, false, lastErr
+	return false, false, lastErr
 }
 
 // minDeadline returns d, unless other is an earlier deadline (when hasOther),
@@ -2120,27 +2407,18 @@ func minDeadline(d, other time.Time, hasOther bool) (time.Time, bool) {
 	return d, true
 }
 
-// writeDeadline is the deadline used while writing the request payload: the
-// earlier of the caller's ctx deadline and the attempt deadline, so a dead
-// socket cannot hang the writer. Payloads are tiny, so the attempt deadline is
-// a safe upper bound.
+// writeDeadline keeps the caller's end-to-end deadline active during writes.
+// Provider response timing begins later, at response-head admission.
 func (req *Request) writeDeadline() (time.Time, bool) {
-	dl, ok := req.Ctx.Deadline()
-	if !req.attemptDeadline.IsZero() && (!ok || req.attemptDeadline.Before(dl)) {
-		return req.attemptDeadline, true
-	}
-	return dl, ok
+	return req.Ctx.Deadline()
 }
 
 // tryGroup dispatches a single request to a provider group and waits for the
 // response. priority=true routes through the priority channels.
 //
-// The attempt timeout bounds only dispatch + time-to-first-response-byte, not
-// the whole body transfer: the request ctx carries no fixed deadline, and a
-// timer races the response. If the timer fires before any byte arrives the
-// attempt is abandoned (CAS pending→abandoned) and we fail over; if the reader
-// committed first (it saw a byte) we keep waiting for the body to finish, since
-// failing over after partial delivery would corrupt a caller's writer.
+// The caller context governs pool admission and pipeline wait. The separate
+// provider response timeout begins in readerLoop only at FIFO response-head
+// admission, so local queueing cannot be classified as provider latency.
 func (c *Client) tryGroup(
 	ctx context.Context,
 	g *providerGroup,
@@ -2148,23 +2426,30 @@ func (c *Client) tryGroup(
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
 	priority bool,
+	validateBody bool,
+	freshTransport bool,
 ) (resp Response, ok bool, done bool) {
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
 
-	attemptTimeout := g.attemptTimeout()
 	innerCh := make(chan Response, 1)
 	req := &Request{
 		Ctx:             reqCtx,
 		Payload:         payload,
 		RespCh:          innerCh,
 		BodyWriter:      bodyWriter,
+		ValidateBody:    validateBody,
+		FreshTransport:  freshTransport,
+		Priority:        priority,
 		OnMeta:          onMeta,
-		attemptDeadline: time.Now().Add(attemptTimeout),
+		submittedAt:     time.Now(),
+		responseTimeout: g.attemptTimeout(),
 	}
-
-	timer := time.NewTimer(attemptTimeout)
-	defer timer.Stop()
+	failAttempt := func(cause error) Response {
+		response := Response{Err: cause, Request: req, ProviderID: g.id}
+		response.Attempts = []AttemptEvidence{buildAttemptEvidence(req, g.id, response, time.Now())}
+		return response
+	}
 
 	var hotCh chan *Request
 	var coldCh chan *Request
@@ -2181,15 +2466,11 @@ func (c *Client) tryGroup(
 	default:
 		select {
 		case <-c.ctx.Done():
-			return Response{}, false, true
+			return failAttempt(c.ctx.Err()), false, true
 		case <-reqCtx.Done():
-			return Response{}, false, ctx.Err() != nil
+			return failAttempt(reqCtx.Err()), false, ctx.Err() != nil
 		case <-g.ctx.Done():
-			return Response{}, false, false
-		case <-timer.C:
-			// Could not be dispatched within the attempt window: the provider
-			// is saturated. Fail over.
-			return Response{}, false, false
+			return failAttempt(ErrConnectionDied), false, false
 		case coldCh <- req:
 		}
 	}
@@ -2197,25 +2478,18 @@ func (c *Client) tryGroup(
 	for {
 		select {
 		case resp, ok = <-innerCh:
+			if ok && len(resp.Attempts) == 0 && !errors.Is(resp.Err, errFreshTransportRequired) {
+				resp.Request = req
+				resp.ProviderID = g.id
+				resp.Attempts = []AttemptEvidence{buildAttemptEvidence(req, g.id, resp, time.Now())}
+			}
 			return resp, ok, false
 		case <-c.ctx.Done():
-			return Response{}, false, true
+			return failAttempt(c.ctx.Err()), false, true
 		case <-g.ctx.Done():
-			return Response{}, false, false
+			return failAttempt(ErrConnectionDied), false, false
 		case <-reqCtx.Done():
-			return Response{}, false, ctx.Err() != nil
-		case <-timer.C:
-			if req.attemptState.CompareAndSwap(attemptPending, attemptAbandoned) {
-				// No response byte arrived in time: hung or too-slow to start.
-				// Cancel so the reader drops the request, and fail over.
-				reqCancel()
-				// done only when the caller's or the pool's context was
-				// cancelled (true shutdown), not on a plain attempt timeout.
-				return Response{}, false, ctx.Err() != nil || c.ctx.Err() != nil
-			}
-			// Reader already committed (first byte arrived): the body is
-			// streaming. Do not fail over; keep waiting for it to finish. The
-			// timer has fired and will not fire again.
+			return failAttempt(reqCtx.Err()), false, ctx.Err() != nil
 		}
 	}
 }
@@ -2239,6 +2513,71 @@ func hostSkipped(host string, skipHosts *[4]string, count int) bool {
 // must not be retried or failed over when a caller-supplied writer is in use.
 func attemptCommittedResp(resp Response) bool {
 	return resp.Request != nil && resp.Request.decodedCommitted.Load()
+}
+
+func buildAttemptEvidence(req *Request, providerID string, resp Response, completedAt time.Time) AttemptEvidence {
+	cause := resp.Err
+	if cause == nil {
+		cause = toError(resp.StatusCode, resp.Status)
+	}
+	outcome := classifyOutcome(resp.StatusCode, cause)
+	validation := BodyValidationNotApplicable
+	if operationFromPayload(req.Payload) == OperationBody {
+		if !req.ValidateBody {
+			validation = BodyValidationNotRequested
+		} else {
+			switch outcome {
+			case OutcomeSuccess:
+				validation = BodyValidationValid
+			case OutcomeCorruptBody:
+				validation = BodyValidationInvalid
+			default:
+				if resp.StatusCode == nntpBody || resp.Err != nil {
+					validation = BodyValidationIncomplete
+				}
+			}
+		}
+	}
+
+	var poolQueue, headWait, service time.Duration
+	writtenAt := req.writtenAt.Load()
+	headAt := req.responseHeadAt.Load()
+	if !req.submittedAt.IsZero() && writtenAt > 0 {
+		poolQueue = time.Unix(0, writtenAt).Sub(req.submittedAt)
+	} else if !req.submittedAt.IsZero() {
+		poolQueue = completedAt.Sub(req.submittedAt)
+	}
+	if writtenAt > 0 && headAt > 0 {
+		headWait = time.Duration(headAt - writtenAt)
+	} else if writtenAt > 0 {
+		headWait = completedAt.Sub(time.Unix(0, writtenAt))
+	}
+	if headAt > 0 {
+		service = completedAt.Sub(time.Unix(0, headAt))
+	}
+
+	providerResponseTimeout := false
+	var networkError net.Error
+	if headAt > 0 && req.Ctx.Err() == nil && errors.As(resp.Err, &networkError) && networkError.Timeout() {
+		providerResponseTimeout = true
+	}
+	return AttemptEvidence{
+		ProviderID:               providerID,
+		Operation:                operationFromPayload(req.Payload),
+		Outcome:                  outcome,
+		ResponseCode:             resp.StatusCode,
+		BodyValidation:           validation,
+		Cause:                    cause,
+		ProviderResponseTimeout:  providerResponseTimeout,
+		PoolQueueDuration:        max(poolQueue, 0),
+		PipelineHeadWaitDuration: max(headWait, 0),
+		ResponseServiceDuration:  max(service, 0),
+	}
+}
+
+func buildEligibilityEvidence(payload []byte, providerID string, cause error, validateBody bool) AttemptEvidence {
+	req := &Request{Payload: payload, ValidateBody: validateBody}
+	return buildAttemptEvidence(req, providerID, Response{Err: cause}, time.Now())
 }
 
 // maxSpeedScore is the highest multiplier speed-aware dispatch applies to a
@@ -2293,7 +2632,7 @@ func speedScore(speed, maxSpeed float64) int {
 }
 
 func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
-	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, false)
+	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, false, false)
 }
 
 // tryGroupResilient retries a single provider on a fresh connection when a
@@ -2311,10 +2650,17 @@ func (c *Client) tryGroupResilient(
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
 	priority bool,
+	validateBody bool,
+	freshTransport bool,
 ) (resp Response, ok bool, cancelled bool) {
-	for r := 0; ; r++ {
-		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority)
+	var attempts []AttemptEvidence
+	connRetries := 0
+	temporaryRetried := false
+	for {
+		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority, validateBody, freshTransport)
+		attempts = append(attempts, resp.Attempts...)
 		if cancelled || !ok {
+			resp.Attempts = cloneAttempts(attempts)
 			return
 		}
 		// If the attempt already streamed bytes into the caller's writer, never
@@ -2322,16 +2668,33 @@ func (c *Client) tryGroupResilient(
 		// Buffered requests (bodyWriter == nil) keep their per-attempt buffer,
 		// so retrying them stays safe.
 		if bodyWriter != nil && attemptCommittedResp(resp) {
+			resp.Attempts = cloneAttempts(attempts)
 			return
 		}
-		if r < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
+		if errors.Is(resp.Err, errFreshTransportRequired) {
+			continue
+		}
+		if !temporaryRetried && resp.Err == nil && resp.StatusCode == 451 {
+			temporaryRetried = true
+			delay := temporaryRetryMinDelay + time.Duration(rand.Int64N(int64(temporaryRetryJitter)+1))
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
+				resp.Attempts = cloneAttempts(attempts)
+				return resp, true, true
+			}
+		}
+		if connRetries < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
+			connRetries++
 			continue // dead connection drained; retry fresh on same provider
 		}
+		resp.Attempts = cloneAttempts(attempts)
 		return
 	}
 }
 
-func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool) {
+func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool, validateBody bool) {
 	defer close(respCh)
 
 	// Precompute for STAT probe: extract message-ID once.
@@ -2345,6 +2708,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	var lastResp Response
 	hasResp := false
 	var lastErr error
+	var attempts []AttemptEvidence
 	post430 := false
 
 	// Track hosts that returned 430 so we can skip other providers on
@@ -2394,15 +2758,17 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 		if g.isQuotaExceeded() {
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+			attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 			continue
 		}
-		resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430)
+		resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, validateBody, false)
+		attempts = append(attempts, resp.Attempts...)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
 				err = c.ctx.Err()
 			}
-			respCh <- Response{Err: err}
+			respCh <- cancellationResponse(attempts, err)
 			return
 		}
 		if !ok {
@@ -2414,6 +2780,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			// bytes; deliver the error rather than re-streaming into the same
 			// writer on another provider.
 			if bodyWriter != nil && attemptCommittedResp(resp) {
+				resp.Attempts = cloneAttempts(attempts)
 				respCh <- resp
 				return
 			}
@@ -2430,7 +2797,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 			continue
 		}
-		if resp.StatusCode == 430 {
+		if resp.StatusCode == 430 || resp.StatusCode == 423 {
 			c.nextIdx.Add(1) // bias next request away from this provider
 			if g.host != "" && skipCount < len(skipHosts) {
 				skipHosts[skipCount] = g.host
@@ -2448,14 +2815,14 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				}
 				delivered, cancelled, raceErr := c.raceCandidates(
 					ctx, rest, statPayload, payload, bodyWriter, onMeta,
-					&skipHosts, &skipCount, respCh,
+					validateBody, &attempts, &skipHosts, &skipCount, respCh,
 				)
 				if cancelled {
 					err := ctx.Err()
 					if err == nil {
 						err = c.ctx.Err()
 					}
-					respCh <- Response{Err: err}
+					respCh <- cancellationResponse(attempts, err)
 					return
 				}
 				if delivered {
@@ -2468,7 +2835,12 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			}
 			continue
 		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+			lastErr = fmt.Errorf("%s: %w", g.name, toError(resp.StatusCode, resp.Status))
+			continue
+		}
 		// Success.
+		resp.Attempts = cloneAttempts(attempts)
 		respCh <- resp
 		return
 	}
@@ -2478,14 +2850,14 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	if raceable && post430 {
 		delivered, cancelled, raceErr := c.raceCandidates(
 			ctx, backups, statPayload, payload, bodyWriter, onMeta,
-			&skipHosts, &skipCount, respCh,
+			validateBody, &attempts, &skipHosts, &skipCount, respCh,
 		)
 		if cancelled {
 			err := ctx.Err()
 			if err == nil {
 				err = c.ctx.Err()
 			}
-			respCh <- Response{Err: err}
+			respCh <- cancellationResponse(attempts, err)
 			return
 		}
 		if delivered {
@@ -2502,15 +2874,17 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			}
 			if g.isQuotaExceeded() {
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+				attempts = append(attempts, buildEligibilityEvidence(payload, g.id, lastErr, validateBody))
 				continue
 			}
-			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430)
+			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, validateBody, false)
+			attempts = append(attempts, resp.Attempts...)
 			if cancelled {
 				err := ctx.Err()
 				if err == nil {
 					err = c.ctx.Err()
 				}
-				respCh <- Response{Err: err}
+				respCh <- cancellationResponse(attempts, err)
 				return
 			}
 			if !ok {
@@ -2521,6 +2895,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				// partial bytes; deliver the error rather than re-streaming into
 				// the same writer on another provider.
 				if bodyWriter != nil && attemptCommittedResp(resp) {
+					resp.Attempts = cloneAttempts(attempts)
 					respCh <- resp
 					return
 				}
@@ -2535,17 +2910,30 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 				continue
 			}
-			// Deliver whatever backup returns (including 430).
+			resp.Attempts = cloneAttempts(attempts)
+			if resp.StatusCode == 430 || resp.StatusCode == 423 {
+				lastResp = resp
+				hasResp = true
+				continue
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+				lastErr = fmt.Errorf("%s: %w", g.name, toError(resp.StatusCode, resp.Status))
+				continue
+			}
 			respCh <- resp
 			return
 		}
 	}
 
 	// 3. All providers exhausted — deliver the last 430, the last error, or a fallback.
-	if hasResp {
+	if lastErr != nil {
+		respCh <- Response{
+			Err:      newTransportError(attempts, lastErr),
+			Attempts: cloneAttempts(attempts),
+		}
+	} else if hasResp {
+		lastResp.Attempts = cloneAttempts(attempts)
 		respCh <- lastResp
-	} else if lastErr != nil {
-		respCh <- Response{Err: fmt.Errorf("nntp: all providers exhausted: %w", lastErr)}
 	} else {
 		respCh <- Response{Err: errors.New("nntp: all providers exhausted")}
 	}
@@ -2570,19 +2958,25 @@ func (c *Client) Stats() ClientStats {
 			maxSlots, running := g.gate.snapshot()
 			quotaUsed := g.stats.quotaUsed.Load()
 			ps := ProviderStats{
-				Name:              g.name,
-				SpeedEWMA:         speedEWMABytesPerSec(&g.stats),
-				BytesConsumed:     consumed,
-				Missing:           g.stats.Missing.Load(),
-				Errors:            g.stats.Errors.Load(),
-				ActiveConnections: running,
-				MaxConnections:    maxSlots,
-				AvailableSlots:    int(g.gate.available.Load()),
-				TTFB:              time.Duration(g.stats.ttfbEWMA.Load()),
-				Ping:              g.stats.Ping,
-				QuotaBytes:        g.stats.quotaBytes,
-				QuotaUsed:         quotaUsed,
-				QuotaExceeded:     g.stats.quotaBytes > 0 && quotaUsed >= g.stats.quotaBytes,
+				Name:                g.name,
+				ProviderID:          g.id,
+				SpeedEWMA:           speedEWMABytesPerSec(&g.stats),
+				BytesConsumed:       consumed,
+				Missing:             g.stats.Missing.Load(),
+				Errors:              g.stats.Errors.Load(),
+				ActiveConnections:   running,
+				MaxConnections:      maxSlots,
+				AvailableSlots:      int(g.gate.available.Load()),
+				TTFB:                time.Duration(g.stats.ttfbEWMA.Load()),
+				PipelineInUse:       int(g.stats.PipelineInUse.Load()),
+				PipelineLimit:       g.stats.pipelineLimit,
+				BackgroundStatInUse: int(g.stats.BackgroundStatInUse.Load()),
+				BackgroundStatLimit: g.stats.backgroundStatLimit,
+				PriorityHeadroom:    g.stats.priorityHeadroom,
+				Ping:                g.stats.Ping,
+				QuotaBytes:          g.stats.quotaBytes,
+				QuotaUsed:           quotaUsed,
+				QuotaExceeded:       g.stats.quotaBytes > 0 && quotaUsed >= g.stats.quotaBytes,
 			}
 			if g.stats.quotaBytes > 0 && g.quotaPeriod > 0 {
 				resetAt := g.quotaResetAt.Load()
@@ -2615,11 +3009,12 @@ func (c *Client) AddProvider(p Provider) error {
 
 	idx := int(c.providerIdx.Add(1))
 	name := resolveProviderName(p, idx)
+	id := resolveProviderID(p, idx)
 
 	// Check for duplicate name.
 	for _, gs := range [...]*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
 		for _, g := range *gs {
-			if g.name == name {
+			if g.name == name || g.id == id {
 				return fmt.Errorf("nntp: provider %q already exists", name)
 			}
 		}

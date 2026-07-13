@@ -15,9 +15,9 @@ const DefaultSpeedTestNZBURL = "https://sabnzbd.org/tests/test_download_1GB.nzb"
 
 // SpeedTestOptions configures a speed test run.
 type SpeedTestOptions struct {
-	NZBURL          string        // defaults to DefaultSpeedTestNZBURL
-	NZBReader       io.Reader     // overrides NZBURL when set (for tests/local files)
-	MaxSegments     int           // 0 = all
+	NZBURL          string    // defaults to DefaultSpeedTestNZBURL
+	NZBReader       io.Reader // overrides NZBURL when set (for tests/local files)
+	MaxSegments     int       // 0 = all
 	OnProgress      func(SpeedTestProgress)
 	NZBFetchTimeout time.Duration // defaults to 30s
 	ProviderName    string        // if set, test only this provider
@@ -102,7 +102,7 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 				elapsed := time.Since(start)
 				secs := elapsed.Seconds()
 
-				instantaneous := float64(wireNow-lastWireBytes) // 1s tick
+				instantaneous := float64(wireNow - lastWireBytes) // 1s tick
 				lastWireBytes = wireNow
 
 				var avg float64
@@ -256,11 +256,11 @@ func (c *Client) sendToGroup(ctx context.Context, g *providerGroup, payload []by
 	return outerCh
 }
 
-// findGroup searches mainGroups and backupGroups by name.
+// findGroup searches mainGroups and backupGroups by resolved name or stable ID.
 func (c *Client) findGroup(name string) *providerGroup {
 	for _, gs := range []*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
 		for _, g := range *gs {
-			if g.name == name {
+			if g.name == name || g.id == name {
 				return g
 			}
 		}

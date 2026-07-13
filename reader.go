@@ -13,8 +13,8 @@ import (
 	"github.com/mnightingale/rapidyenc"
 )
 
-// YEncMeta groups yEnc metadata fields available from =ybegin and =ypart headers,
-// populated before body decoding begins.
+// YEncMeta groups provisional yEnc metadata from =ybegin and =ypart. It is
+// available before decoding completes and is not final integrity evidence.
 type YEncMeta struct {
 	FileName  string
 	FileSize  int64
@@ -40,10 +40,13 @@ type NNTPResponse struct {
 	eof          bool
 	body         bool
 	hasPart      bool
+	hasBegin     bool
 	hasEnd       bool
 	hasCrc       bool
 	hasEmptyline bool // for article requests has the empty line separating headers and body been seen
 	onMeta       func(YEncMeta)
+	headerErr    error
+	decodeFn     func(dst, src []byte, state *rapidyenc.State) (nDst, nSrc int, end rapidyenc.End, err error)
 }
 
 const nntpBody = 222
@@ -268,7 +271,14 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 	var produced, consumed int
 	var end rapidyenc.End
 
-	produced, consumed, end, _ = rapidyenc.DecodeIncremental(buf, buf, &r.State)
+	decodeFn := r.decodeFn
+	if decodeFn == nil {
+		decodeFn = rapidyenc.DecodeIncremental
+	}
+	produced, consumed, end, err = decodeFn(buf, buf, &r.State)
+	if err != nil {
+		return 0, fmt.Errorf("%w: yEnc decode: %w", ErrBodyCorrupt, err)
+	}
 
 	if produced > 0 {
 		r.CRC = crc32.Update(r.CRC, crc32.IEEETable, buf[:produced])
@@ -302,10 +312,18 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 func (r *NNTPResponse) processYencHeader(line []byte) {
 	var err error
 	if bytes.HasPrefix(line, []byte("=ybegin ")) {
+		r.hasBegin = true
 		line = line[len("=ybegin"):]
-		r.YEnc.FileSize, _ = extractInt(line, []byte(" size="))
-		r.YEnc.FileName, _ = extractString(line, []byte(" name="))
+		if r.YEnc.FileSize, err = extractInt(line, []byte(" size=")); err != nil {
+			r.headerErr = fmt.Errorf("invalid =ybegin size: %w", err)
+		}
+		if r.YEnc.FileName, err = extractString(line, []byte(" name=")); err != nil {
+			r.headerErr = fmt.Errorf("invalid =ybegin name: %w", err)
+		}
 		if r.YEnc.Part, err = extractInt(line, []byte(" part=")); err != nil {
+			if bytes.Contains(line, []byte(" part=")) {
+				r.headerErr = fmt.Errorf("invalid =ybegin part: %w", err)
+			}
 			// Not multi-part, so body starts immediately after =ybegin
 			r.body = true
 			r.YEnc.PartSize = r.YEnc.FileSize
@@ -314,7 +332,9 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 				r.onMeta = nil
 			}
 		}
-		r.YEnc.Total, _ = extractInt(line, []byte(" total="))
+		if r.YEnc.Total, err = extractInt(line, []byte(" total=")); err != nil && bytes.Contains(line, []byte(" total=")) {
+			r.headerErr = fmt.Errorf("invalid =ybegin total: %w", err)
+		}
 	} else if bytes.HasPrefix(line, []byte("=ypart ")) {
 		// =ypart signals start of body data in multi-part files
 		r.hasPart = true
@@ -322,11 +342,15 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 		line = line[len("=ypart"):]
 		var begin int64
 		// Convert from 1-based to 0-based indexing
-		if begin, err = extractInt(line, []byte(" begin=")); err == nil {
+		if begin, err = extractInt(line, []byte(" begin=")); err != nil || begin <= 0 {
+			r.headerErr = fmt.Errorf("invalid =ypart begin")
+		} else {
 			r.YEnc.PartBegin = begin - 1
 		}
-		if end, err := extractInt(line, []byte(" end=")); err == nil && end > begin {
+		if end, endErr := extractInt(line, []byte(" end=")); endErr == nil && end >= begin && begin > 0 {
 			r.YEnc.PartSize = end - r.YEnc.PartBegin
+		} else {
+			r.headerErr = fmt.Errorf("invalid =ypart end")
 		}
 		if r.onMeta != nil {
 			r.onMeta(r.YEnc)
@@ -342,8 +366,63 @@ func (r *NNTPResponse) processYencHeader(line []byte) {
 			r.ExpectedCRC = crc
 			r.hasCrc = true
 		}
-		r.EndSize, _ = extractInt(line, []byte(" size="))
+		if (bytes.Contains(line, []byte(" pcrc32=")) || bytes.Contains(line, []byte(" crc32="))) && !r.hasCrc {
+			r.headerErr = fmt.Errorf("invalid =yend CRC")
+		}
+		if r.EndSize, err = extractInt(line, []byte(" size=")); err != nil {
+			r.headerErr = fmt.Errorf("invalid =yend size: %w", err)
+		}
 	}
+}
+
+// validateBody verifies the framing and integrity facts that are knowable at
+// the transport boundary. It is called before a buffered BODY attempt may be
+// accepted or selected as a provider fallback winner.
+func (r *NNTPResponse) validateBody() error {
+	if r.StatusCode != nntpBody {
+		return nil
+	}
+	if r.Format != rapidyenc.FormatYenc || !r.hasBegin {
+		return fmt.Errorf("%w: missing valid =ybegin", ErrBodyCorrupt)
+	}
+	if r.headerErr != nil {
+		return fmt.Errorf("%w: %v", ErrBodyCorrupt, r.headerErr)
+	}
+	if !r.hasEnd {
+		return fmt.Errorf("%w: missing =yend", ErrBodyCorrupt)
+	}
+	if r.YEnc.FileSize < 0 || r.YEnc.PartSize < 0 || r.YEnc.PartBegin < 0 {
+		return fmt.Errorf("%w: negative yEnc metadata", ErrBodyCorrupt)
+	}
+	if r.YEnc.FileName == "" {
+		return fmt.Errorf("%w: missing yEnc name", ErrBodyCorrupt)
+	}
+	if r.hasPart && r.YEnc.Part <= 0 {
+		return fmt.Errorf("%w: =ypart without valid part number", ErrBodyCorrupt)
+	}
+	if r.YEnc.Part > 0 {
+		if !r.hasPart {
+			return fmt.Errorf("%w: multipart body missing =ypart", ErrBodyCorrupt)
+		}
+		if r.YEnc.Total <= 0 || r.YEnc.Part > r.YEnc.Total {
+			return fmt.Errorf("%w: part exceeds total", ErrBodyCorrupt)
+		}
+		partEnd := r.YEnc.PartBegin + r.YEnc.PartSize
+		if r.YEnc.PartSize != int64(r.BytesDecoded) || partEnd > r.YEnc.FileSize ||
+			(r.YEnc.Part == r.YEnc.Total && partEnd != r.YEnc.FileSize) ||
+			(r.YEnc.Part < r.YEnc.Total && partEnd >= r.YEnc.FileSize) {
+			return fmt.Errorf("%w: incoherent multipart size", ErrBodyCorrupt)
+		}
+	} else if r.YEnc.FileSize != int64(r.BytesDecoded) {
+		return fmt.Errorf("%w: decoded size %d does not match file size %d", ErrBodyCorrupt, r.BytesDecoded, r.YEnc.FileSize)
+	}
+	if r.EndSize != int64(r.BytesDecoded) {
+		return fmt.Errorf("%w: trailer size %d does not match decoded size %d", ErrBodyCorrupt, r.EndSize, r.BytesDecoded)
+	}
+	if r.hasCrc && r.CRC != r.ExpectedCRC {
+		return fmt.Errorf("%w: %w", ErrBodyCorrupt, ErrCRCMismatch)
+	}
+	return nil
 }
 
 func extractString(data, substr []byte) (string, error) {

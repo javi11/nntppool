@@ -23,7 +23,9 @@ const (
 
 // ArticleBody holds the decoded result of a BODY command.
 type ArticleBody struct {
-	MessageID string
+	MessageID  string
+	ProviderID string
+	Attempts   []AttemptEvidence
 
 	// Decoded payload bytes. Nil when the body was streamed to an io.Writer.
 	Bytes []byte
@@ -37,7 +39,8 @@ type ArticleBody struct {
 
 	CRC         uint32
 	ExpectedCRC uint32
-	CRCValid    bool // true when ExpectedCRC != 0 && CRC == ExpectedCRC
+	CRCProvided bool
+	CRCValid    bool // true when a supplied CRC (including 00000000) matches
 
 	byteBuf []byte // internal; transferred to Bytes in Body()
 }
@@ -50,14 +53,23 @@ type ArticleHead struct {
 
 // StatResult holds the parsed result of a STAT command.
 type StatResult struct {
-	MessageID string
-	Number    int64 // article number from response (0 if no group selected)
+	MessageID  string
+	ProviderID string
+	Attempts   []AttemptEvidence
+	Number     int64 // article number from response (0 if no group selected)
 }
 
 // BodyResult is the result type for BodyAsync.
 type BodyResult struct {
 	Body *ArticleBody
 	Err  error
+}
+
+// TargetedBodyOptions confines a validated BODY request to one provider.
+type TargetedBodyOptions struct {
+	Provider       string
+	FreshTransport bool
+	Priority       bool
 }
 
 // Body retrieves and decodes an article body, buffering the decoded bytes in memory.
@@ -81,9 +93,9 @@ func (c *Client) BodyPriority(ctx context.Context, messageID string, onMeta ...f
 	payload := []byte("BODY <" + messageID + ">\r\n")
 	var respCh <-chan Response
 	if len(onMeta) > 0 {
-		respCh = c.SendPriority(ctx, payload, nil, onMeta[0])
+		respCh = c.sendValidatedBody(ctx, payload, nil, onMeta[0], true)
 	} else {
-		respCh = c.SendPriority(ctx, payload, nil)
+		respCh = c.sendValidatedBody(ctx, payload, nil, nil, true)
 	}
 	body, err := c.finishBody(messageID, nil, respCh)
 	if body != nil {
@@ -91,6 +103,56 @@ func (c *Client) BodyPriority(ctx context.Context, messageID string, onMeta ...f
 		body.byteBuf = nil
 	}
 	return body, err
+}
+
+// BodyTargeted retrieves and validates a BODY from exactly one provider. A
+// fresh transport may be required when revalidating prior corruption.
+func (c *Client) BodyTargeted(ctx context.Context, messageID string, opts TargetedBodyOptions, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	group := c.findGroup(opts.Provider)
+	if group == nil {
+		return nil, fmt.Errorf("nntp: provider %q not found", opts.Provider)
+	}
+	var metaFn func(YEncMeta)
+	if len(onMeta) > 0 {
+		metaFn = onMeta[0]
+	}
+	payload := []byte("BODY <" + messageID + ">\r\n")
+	resp, ok, cancelled := c.tryGroupResilient(
+		ctx,
+		group,
+		payload,
+		nil,
+		metaFn,
+		opts.Priority,
+		true,
+		opts.FreshTransport,
+	)
+	if cancelled {
+		err := ctx.Err()
+		if err == nil {
+			err = c.ctx.Err()
+		}
+		return nil, &TransportError{
+			Kind:       OutcomeCancellation,
+			ProviderID: group.id,
+			Attempts:   cloneAttempts(resp.Attempts),
+			Cause:      err,
+		}
+	}
+	if !ok {
+		return nil, newTransportError(resp.Attempts, ErrConnectionDied)
+	}
+	return c.finishBody(messageID, nil, oneResponse(resp))
+}
+
+func oneResponse(resp Response) <-chan Response {
+	ch := make(chan Response, 1)
+	ch <- resp
+	close(ch)
+	return ch
 }
 
 // BodyStream retrieves and decodes an article body, streaming decoded bytes to w.
@@ -131,10 +193,7 @@ func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, erro
 	respCh := c.Send(ctx, payload, nil)
 
 	resp := <-respCh
-	if resp.Err != nil {
-		return nil, resp.Err
-	}
-	if err := toError(resp.StatusCode, resp.Status); err != nil {
+	if err := responseError(resp); err != nil {
 		return nil, err
 	}
 
@@ -153,14 +212,15 @@ func statPayload(messageID string) []byte {
 // is returned as ErrArticleNotFound with a nil result; callers doing bulk
 // existence checks treat that as a normal miss rather than a fatal error.
 func parseStat(messageID string, resp Response) (*StatResult, error) {
-	if resp.Err != nil {
-		return nil, resp.Err
-	}
-	if err := toError(resp.StatusCode, resp.Status); err != nil {
+	if err := responseError(resp); err != nil {
 		return nil, err
 	}
 
-	result := &StatResult{MessageID: messageID}
+	result := &StatResult{
+		MessageID:  messageID,
+		ProviderID: resp.ProviderID,
+		Attempts:   cloneAttempts(resp.Attempts),
+	}
 
 	// Parse "223 <number> <message-id>" from the status line.
 	parts := strings.SplitN(resp.Status, " ", 4)
@@ -206,9 +266,9 @@ func (c *Client) doBody(ctx context.Context, messageID string, w io.Writer, onMe
 	payload := []byte("BODY <" + messageID + ">\r\n")
 	var respCh <-chan Response
 	if onMeta != nil {
-		respCh = c.Send(ctx, payload, w, onMeta)
+		respCh = c.sendValidatedBody(ctx, payload, w, onMeta, false)
 	} else {
-		respCh = c.Send(ctx, payload, w)
+		respCh = c.sendValidatedBody(ctx, payload, w, nil, false)
 	}
 	return c.finishBody(messageID, w, respCh)
 }
@@ -216,23 +276,23 @@ func (c *Client) doBody(ctx context.Context, messageID string, w io.Writer, onMe
 // finishBody waits on respCh and builds the ArticleBody result.
 func (c *Client) finishBody(messageID string, w io.Writer, respCh <-chan Response) (*ArticleBody, error) {
 	resp := <-respCh
-	if resp.Err != nil {
-		return nil, resp.Err
-	}
-	if err := toError(resp.StatusCode, resp.Status); err != nil {
+	if err := responseError(resp); err != nil {
 		return nil, err
 	}
 
 	body := &ArticleBody{
 		MessageID:     messageID,
+		ProviderID:    resp.ProviderID,
+		Attempts:      cloneAttempts(resp.Attempts),
 		BytesDecoded:  resp.Meta.BytesDecoded,
 		BytesConsumed: resp.Meta.BytesConsumed,
 		Encoding:      mapFormat(resp.Meta.Format),
 		YEnc:          resp.Meta.YEnc,
 		CRC:           resp.Meta.CRC,
 		ExpectedCRC:   resp.Meta.ExpectedCRC,
+		CRCProvided:   resp.Meta.hasCrc,
 	}
-	body.CRCValid = body.ExpectedCRC != 0 && body.CRC == body.ExpectedCRC
+	body.CRCValid = body.CRCProvided && body.CRC == body.ExpectedCRC
 
 	// When w was nil, the decoded bytes were buffered in resp.Body.
 	if w == nil {
@@ -240,11 +300,6 @@ func (c *Client) finishBody(messageID string, w io.Writer, respCh <-chan Respons
 		if len(buf) > 0 {
 			body.byteBuf = buf
 		}
-	}
-
-	// Return both the body and a CRC error so callers get data but are warned.
-	if body.ExpectedCRC != 0 && body.CRC != body.ExpectedCRC {
-		return body, ErrCRCMismatch
 	}
 
 	return body, nil
