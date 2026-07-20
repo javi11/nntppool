@@ -1368,6 +1368,7 @@ type Provider struct {
 	StatInflight    int           // 0 defaults to Inflight; deeper pipeline depth for bodyless STAT commands. Because STAT carries no payload, many can be in flight per connection at negligible memory cost, amortising round-trips. Set higher than Inflight (e.g. 50-100) for STAT-heavy workloads without inflating BODY memory.
 	Factory         ConnFactory   // overrides Host/TLSConfig when set
 	Backup          bool          // if true, only used when main providers return 430
+	StorageGroup    string        // optional label for providers sharing upstream storage (same backbone); a 430 from one skips the rest in the group for that request
 	SkipPing        bool          // if true, skip the DATE ping on startup (for providers that don't support DATE)
 	IdleTimeout     time.Duration // 0 means no idle disconnect
 	ThrottleRestore time.Duration // 0 defaults to 30s
@@ -1426,6 +1427,7 @@ type Provider struct {
 type providerGroup struct {
 	name      string
 	host      string // raw Provider.Host; empty for Factory-based providers
+	skipID    string // Provider.StorageGroup when set, else host; identity used for 430 skipping
 	maxConns  int
 	ctx       context.Context // cancelled on removal/close
 	reqCh     chan *Request
@@ -1637,6 +1639,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	g := &providerGroup{
 		name:        name,
 		host:        p.Host,
+		skipID:      providerSkipID(p),
 		maxConns:    p.Connections,
 		ctx:         gctx,
 		reqCh:       make(chan *Request, p.Connections),
@@ -1880,7 +1883,7 @@ func (c *Client) raceCandidates(
 	live := make([]*providerGroup, 0, len(candidates))
 	seen := make(map[string]bool)
 	for _, g := range candidates {
-		if hostSkipped(g.host, skipHosts, *skipCount) {
+		if hostSkipped(g.skipID, skipHosts, *skipCount) {
 			continue
 		}
 		if g.isQuotaExceeded() {
@@ -1921,8 +1924,8 @@ func (c *Client) raceCandidates(
 			return false, false, fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 		}
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
-			if g.host != "" && *skipCount < len(skipHosts) {
-				skipHosts[*skipCount] = g.host
+			if g.skipID != "" && *skipCount < len(skipHosts) {
+				skipHosts[*skipCount] = g.skipID
 				*skipCount++
 			}
 			c.nextIdx.Add(1)
@@ -1966,8 +1969,8 @@ func (c *Client) raceCandidates(
 			}
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 		case 430, 423:
-			if g.host != "" && *skipCount < len(skipHosts) {
-				skipHosts[*skipCount] = g.host
+			if g.skipID != "" && *skipCount < len(skipHosts) {
+				skipHosts[*skipCount] = g.skipID
 				*skipCount++
 			}
 			c.nextIdx.Add(1)
@@ -2008,8 +2011,8 @@ func (c *Client) raceCandidates(
 	}
 	if resp.StatusCode == 430 || resp.StatusCode == 423 {
 		// Rare: article expired between STAT and BODY.
-		if winner.host != "" && *skipCount < len(skipHosts) {
-			skipHosts[*skipCount] = winner.host
+		if winner.skipID != "" && *skipCount < len(skipHosts) {
+			skipHosts[*skipCount] = winner.skipID
 			*skipCount++
 		}
 		c.nextIdx.Add(1)
@@ -2135,8 +2138,19 @@ func (c *Client) tryGroup(
 	}
 }
 
-// hostSkipped reports whether host is already in the skip list.
-// Empty hosts (Factory-based providers) are never skipped.
+// providerSkipID returns the identity used to suppress further attempts after a
+// 430. Providers on the same host share article availability; so do providers
+// that resell the same upstream storage under different hostnames (e.g. two
+// brands on one backbone). StorageGroup lets an operator declare the latter.
+func providerSkipID(p Provider) string {
+	if p.StorageGroup != "" {
+		return p.StorageGroup
+	}
+	return p.Host
+}
+
+// hostSkipped reports whether the skip identity is already in the skip list.
+// Empty identities (Factory-based providers with no StorageGroup) are never skipped.
 func hostSkipped(host string, skipHosts *[4]string, count int) bool {
 	if host == "" || count == 0 {
 		return false
@@ -2262,8 +2276,9 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	var lastErr error
 	post430 := false
 
-	// Track hosts that returned 430 so we can skip other providers on
-	// the same server (different credentials won't help).
+	// Track providers that returned 430 so we can skip others sharing the same
+	// article availability — same host (different credentials won't help), or
+	// same declared StorageGroup (same upstream storage behind another brand).
 	var skipHosts [4]string
 	skipCount := 0
 
@@ -2304,7 +2319,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	for attempt := range n {
 		idx := (start + attempt) % n
 		g := mains[idx]
-		if hostSkipped(g.host, &skipHosts, skipCount) {
+		if hostSkipped(g.skipID, &skipHosts, skipCount) {
 			continue
 		}
 		if g.isQuotaExceeded() {
@@ -2347,8 +2362,8 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 		if resp.StatusCode == 430 {
 			c.nextIdx.Add(1) // bias next request away from this provider
-			if g.host != "" && skipCount < len(skipHosts) {
-				skipHosts[skipCount] = g.host
+			if g.skipID != "" && skipCount < len(skipHosts) {
+				skipHosts[skipCount] = g.skipID
 				skipCount++
 			}
 			lastResp = resp
@@ -2412,7 +2427,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	} else {
 		for i := range backups {
 			g := backups[i]
-			if hostSkipped(g.host, &skipHosts, skipCount) {
+			if hostSkipped(g.skipID, &skipHosts, skipCount) {
 				continue
 			}
 			if g.isQuotaExceeded() {
