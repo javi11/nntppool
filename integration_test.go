@@ -481,7 +481,7 @@ func TestClient_SendRetryFallbackBackup(t *testing.T) {
 	}
 
 	c, err := NewClient(context.Background(), []Provider{
-		{Factory: makeFactory(430), Connections: 1},        // main: always 430
+		{Factory: makeFactory(430), Connections: 1},               // main: always 430
 		{Factory: makeFactory(223), Connections: 1, Backup: true}, // backup: 223
 	})
 	if err != nil {
@@ -804,7 +804,6 @@ func TestClient_FIFODispatch(t *testing.T) {
 		t.Errorf("FIFO: p1=%d p2=%d, want p1=%d p2=0", hits["p1"], hits["p2"], N)
 	}
 }
-
 
 func TestClient_FIFO430Fallthrough(t *testing.T) {
 	// Provider #1 returns 430, provider #2 returns 223.
@@ -1314,8 +1313,8 @@ func TestClient_502CommandFallsBackToBackup(t *testing.T) {
 	}
 
 	c, err := NewClient(context.Background(), []Provider{
-		{Factory: makeFactory(502), Connections: 1},                // main: always 502
-		{Factory: makeFactory(223), Connections: 1, Backup: true},  // backup: success
+		{Factory: makeFactory(502), Connections: 1},               // main: always 502
+		{Factory: makeFactory(223), Connections: 1, Backup: true}, // backup: success
 	})
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
@@ -1447,3 +1446,106 @@ func TestKeepalive_DeadConnection(t *testing.T) {
 	}
 }
 
+func TestClient_Skip430SameStorageGroup(t *testing.T) {
+	// Two providers on different hosts that resell the same upstream storage.
+	// A 430 from the first means the second holds the same article set, so it
+	// should be skipped.
+	var counts [2]atomic.Int64
+	make430Factory := func(idx int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					if bytes.Contains(buf[:n], []byte("STAT")) {
+						counts[idx].Add(1)
+					}
+					_, _ = server.Write([]byte("430 no such article\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "news1.example.com:563", StorageGroup: "backbone-a", Factory: make430Factory(0), Connections: 1},
+		{Host: "news2.example.com:563", StorageGroup: "backbone-a", Factory: make430Factory(1), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.StatusCode != 430 {
+		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+
+	// Dispatch picks the starting provider, so assert on the total rather than
+	// which one went first: exactly one of the pair may be tried.
+	if got := counts[0].Load() + counts[1].Load(); got != 1 {
+		t.Errorf("requests = [%d, %d], total %d, want exactly 1 (same StorageGroup should be skipped)",
+			counts[0].Load(), counts[1].Load(), got)
+	}
+}
+
+func TestClient_Skip430StorageGroupDoesNotSkipOtherGroups(t *testing.T) {
+	// Two mains sharing a group, plus a backup on its own storage. The grouped
+	// main is skipped after the first 430, but the independent backup must still
+	// be tried — that provider is the only one that can hold a different answer.
+	var counts [3]atomic.Int64
+	make430Factory := func(idx int) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					n, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					if bytes.Contains(buf[:n], []byte("STAT")) {
+						counts[idx].Add(1)
+					}
+					_, _ = server.Write([]byte("430 no such article\r\n"))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Host: "news1.example.com:563", StorageGroup: "backbone-a", Factory: make430Factory(0), Connections: 1},
+		{Host: "news2.example.com:563", StorageGroup: "backbone-a", Factory: make430Factory(1), Connections: 1},
+		{Host: "news3.example.com:563", StorageGroup: "backbone-b", Factory: make430Factory(2), Connections: 1, Backup: true},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.StatusCode != 430 {
+		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
+	}
+
+	if got := counts[0].Load() + counts[1].Load(); got != 1 {
+		t.Errorf("grouped mains = [%d, %d], total %d, want exactly 1",
+			counts[0].Load(), counts[1].Load(), got)
+	}
+	if counts[2].Load() != 1 {
+		t.Errorf("independent backup requests = %d, want 1 (must not be skipped)", counts[2].Load())
+	}
+}
