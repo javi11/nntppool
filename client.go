@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
@@ -383,12 +384,16 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh c
 		idx := (start + attempt) % n
 		g := mains[idx]
 		innerCh := make(chan Response, 1)
+		// attemptDeadline is what bounds the pre-first-byte read: with a
+		// cancel-only caller context and a server that never answers the POST,
+		// a deadline-less request would block the reader in Read forever.
 		req := &Request{
-			Ctx:         ctx,
-			Payload:     []byte("POST\r\n"),
-			RespCh:      innerCh,
-			PayloadBody: payloadBody,
-			PostMode:    true,
+			Ctx:             ctx,
+			Payload:         []byte("POST\r\n"),
+			RespCh:          innerCh,
+			PayloadBody:     payloadBody,
+			PostMode:        true,
+			attemptDeadline: time.Now().Add(g.attemptTimeout()),
 		}
 
 		// Try hot channel first (non-blocking), then cold channel.
