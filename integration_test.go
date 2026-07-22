@@ -1446,6 +1446,44 @@ func TestKeepalive_DeadConnection(t *testing.T) {
 	}
 }
 
+// TestKeepalive_SilentServer verifies the probe cannot park the connection:
+// a server that ACCEPTS the keepalive command but never answers (half-open
+// connection, stale provider session) must be detected via the probe's
+// attempt deadline — Run() returns so the pool replaces the connection.
+// Without the deadline the reader blocks in a deadline-less Read forever,
+// holding the connection slot and the provider session indefinitely.
+func TestKeepalive_SilentServer(t *testing.T) {
+	conn := mockServer(t, func(s net.Conn) {
+		_, _ = s.Write([]byte("200 server ready\r\n"))
+
+		buf := make([]byte, 256)
+		for {
+			// Read commands and never respond — the silent half-open server.
+			if _, err := s.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+
+	reqCh := make(chan *Request)
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
+	if err != nil {
+		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
+	}
+	nc.keepaliveInterval = 20 * time.Millisecond
+	nc.keepaliveCommand = "DATE"
+	nc.stallTimeout = 100 * time.Millisecond // bounds the probe via keepaliveProbeTimeout
+
+	go nc.Run()
+
+	select {
+	case <-nc.Done():
+		// Good: the probe deadline expired, the connection closed, Run() returned.
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: a silent server parked the keepalive probe — Run() never returned")
+	}
+}
+
 func TestClient_Skip430SameStorageGroup(t *testing.T) {
 	// Two providers on different hosts that resell the same upstream storage.
 	// A 430 from the first means the second holds the same article set, so it

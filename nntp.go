@@ -368,6 +368,17 @@ func safeClose[T any](ch chan T) {
 	close(ch)
 }
 
+// keepaliveProbeTimeout bounds a keepalive probe's round trip. The probe is a
+// trivial command (DATE/HELP), so the connection's stall timeout is ample as a
+// time-to-first-byte bound; with stall disabled, a fixed 30s fallback still
+// guarantees the probe can never park the connection forever.
+func (c *NNTPConnection) keepaliveProbeTimeout() time.Duration {
+	if c.stallTimeout > 0 {
+		return c.stallTimeout
+	}
+	return 30 * time.Second
+}
+
 // keepaliveExpectedCode returns the expected NNTP status code for the given
 // keepalive command: DATE→111, HELP→100, CAPABILITIES→101, default→111.
 func keepaliveExpectedCode(cmd string) int {
@@ -955,10 +966,20 @@ mainLoop:
 		if didKeepalive {
 			keepaliveCh = time.After(c.keepaliveInterval) // reset regardless of outcome
 			kaCh := make(chan Response, 1)
+			// The probe MUST carry an attempt deadline: with a background context
+			// and no deadline, a server that accepts the command but never
+			// answers (half-open connection, stale provider session) leaves the
+			// reader in a deadline-less Read forever — the connection parks
+			// "busy" holding its slot and its provider session, and the feature
+			// meant to detect dead connections becomes the thing that wedges
+			// them. On expiry the reader surfaces a timeout, closes the
+			// connection, and the pool replaces it — exactly what a keepalive
+			// is for.
 			kaReq := &Request{
-				Payload: []byte(c.keepaliveCommand + "\r\n"),
-				RespCh:  kaCh,
-				Ctx:     context.Background(),
+				Payload:         []byte(c.keepaliveCommand + "\r\n"),
+				RespCh:          kaCh,
+				Ctx:             context.Background(),
+				attemptDeadline: time.Now().Add(c.keepaliveProbeTimeout()),
 			}
 			if _, err := bw.Write(kaReq.Payload); err != nil {
 				_ = c.conn.Close()
