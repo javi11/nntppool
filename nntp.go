@@ -71,6 +71,15 @@ const (
 	// retry uses a fresh connection on the same provider.
 	maxConnDiedRetries = 2
 
+	// maxAttemptEscalations bounds same-provider retries of a response-phase
+	// attempt expiry, doubling the window each time (base → 2× → 4×, capped at
+	// maxAttemptTimeout): at the 2s adaptive floor that is 2s+4s+8s = 14s of
+	// patience before failing over, which clears real-world slow spool lookups
+	// (~7.5s to a 430 for aged articles) without any new configuration. An
+	// explicit Provider.AttemptTimeout at or above maxAttemptTimeout leaves no
+	// room to grow, so escalation is a no-op there by construction.
+	maxAttemptEscalations = 2
+
 	// minAttemptTimeout is the floor (and default) for the per-attempt timeout
 	// that bounds dispatch + time-to-first-response-byte. Once response bytes
 	// start flowing, the rolling stall timeout takes over instead.
@@ -1932,6 +1941,9 @@ func (c *Client) raceCandidates(
 			return false, true, lastErr
 		}
 		if !ok {
+			if resp.Err != nil {
+				lastErr = resp.Err // expired attempts keep their reason
+			}
 			return false, false, lastErr
 		}
 		if resp.Err != nil {
@@ -2088,10 +2100,24 @@ func (c *Client) tryGroup(
 	onMeta func(YEncMeta),
 	priority bool,
 ) (resp Response, ok bool, done bool) {
+	return c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, g.attemptTimeout())
+}
+
+// tryGroupTimeout is tryGroup with an explicit attempt window — the seam that
+// lets tryGroupResilient escalate the window on response-phase expiry instead
+// of abandoning a slow-but-honest server at the adaptive default.
+func (c *Client) tryGroupTimeout(
+	ctx context.Context,
+	g *providerGroup,
+	payload []byte,
+	bodyWriter io.Writer,
+	onMeta func(YEncMeta),
+	priority bool,
+	attemptTimeout time.Duration,
+) (resp Response, ok bool, done bool) {
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
 
-	attemptTimeout := g.attemptTimeout()
 	innerCh := make(chan Response, 1)
 	req := &Request{
 		Ctx:             reqCtx,
@@ -2127,8 +2153,9 @@ func (c *Client) tryGroup(
 			return Response{}, false, false
 		case <-timer.C:
 			// Could not be dispatched within the attempt window: the provider
-			// is saturated. Fail over.
-			return Response{}, false, false
+			// is saturated. Fail over — with the reason preserved, so the
+			// terminal error names the saturation instead of arriving bare.
+			return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: "dispatch"}}, false, false
 		case coldCh <- req:
 		}
 	}
@@ -2146,11 +2173,15 @@ func (c *Client) tryGroup(
 		case <-timer.C:
 			if req.attemptState.CompareAndSwap(attemptPending, attemptAbandoned) {
 				// No response byte arrived in time: hung or too-slow to start.
-				// Cancel so the reader drops the request, and fail over.
+				// Cancel so the reader drops the request, and fail over. The
+				// typed error both survives into the terminal error and lets
+				// tryGroupResilient escalate the window — this phase cannot
+				// distinguish a hung connection from a server legitimately
+				// taking longer than the window to produce its status line.
 				reqCancel()
 				// done only when the caller's or the pool's context was
 				// cancelled (true shutdown), not on a plain attempt timeout.
-				return Response{}, false, ctx.Err() != nil || c.ctx.Err() != nil
+				return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: "response"}}, false, ctx.Err() != nil || c.ctx.Err() != nil
 			}
 			// Reader already committed (first byte arrived): the body is
 			// streaming. Do not fail over; keep waiting for it to finish. The
@@ -2261,10 +2292,39 @@ func (c *Client) tryGroupResilient(
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
 	priority bool,
+	timeoutScale int,
 ) (resp Response, ok bool, cancelled bool) {
+	// timeoutScale widens the attempt window (base → 2× → 4×, capped at
+	// maxAttemptTimeout) on escalation passes — see doSendWithRetry: a pass in
+	// which EVERY provider expired awaiting its first response byte is re-run
+	// with a wider window, because that shape is a slow-but-honest answer
+	// (cold spool lookups for aged articles measure ~7.5s to a 430 while the
+	// TTFB EWMA — dominated by cache-hot serving — derives a 2s window) at
+	// least as often as it is dead infrastructure. Failover order is
+	// untouched: within a pass a quiet provider still costs one base window.
+	timeout := g.attemptTimeout()
+	for range timeoutScale {
+		if next := min(timeout*2, maxAttemptTimeout); next > timeout {
+			timeout = next
+		}
+	}
 	for r := 0; ; r++ {
-		resp, ok, cancelled = c.tryGroup(ctx, g, payload, bodyWriter, onMeta, priority)
-		if cancelled || !ok {
+		resp, ok, cancelled = c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, timeout)
+		if cancelled {
+			return
+		}
+		if expiredAwaitingResponse(resp, ok) {
+			// Normalize both expiry surfaces (the attempt timer, or the
+			// connection's own read deadline racing it) into one shape: a
+			// failover carrying the typed story — never a deliverable
+			// response, never a bare error.
+			var at *AttemptTimeoutError
+			if !errors.As(resp.Err, &at) {
+				resp.Err = &AttemptTimeoutError{Provider: g.name, Timeout: timeout, Phase: "response", Cause: resp.Err}
+			}
+			return resp, false, false
+		}
+		if !ok {
 			return
 		}
 		// If the attempt already streamed bytes into the caller's writer, never
@@ -2279,6 +2339,25 @@ func (c *Client) tryGroupResilient(
 		}
 		return
 	}
+}
+
+// expiredAwaitingResponse reports whether an attempt died awaiting its first
+// response byte — whichever side noticed first: the attempt timer (ok=false,
+// typed error) or the connection's own read deadline (ok=true, a transport
+// timeout on a request whose reader never committed).
+func expiredAwaitingResponse(resp Response, ok bool) bool {
+	if !ok {
+		var at *AttemptTimeoutError
+		return errors.As(resp.Err, &at) && at.Phase == "response"
+	}
+	// Anything short of committed counts: the attempt timer may have CASed
+	// pending→abandoned in the same instant the reader delivered its deadline
+	// error — both interleavings mean "no first byte ever arrived".
+	if resp.Err == nil || resp.Request == nil || resp.Request.attemptState.Load() == attemptCommitted {
+		return false
+	}
+	var ne net.Error
+	return errors.As(resp.Err, &ne) && ne.Timeout()
 }
 
 func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool) {
@@ -2337,91 +2416,124 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 	}
 
-	for attempt := range n {
-		idx := (start + attempt) % n
-		g := mains[idx]
-		if hostSkipped(g.skipID, &skipHosts, skipCount) {
-			continue
-		}
-		if g.isQuotaExceeded() {
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
-			continue
-		}
-		resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430)
-		if cancelled {
-			err := ctx.Err()
-			if err == nil {
-				err = c.ctx.Err()
+	// Escalation passes: pass 0 runs every provider at its base attempt window
+	// (a quiet provider costs one window before failover, exactly as before).
+	// Only when a WHOLE pass produced nothing but expired-awaiting-response
+	// failures — the signature of a slow spool lookup, not of dead infra — is
+	// the pass re-run with the window doubled (capped at maxAttemptTimeout),
+	// so a server that needs 7s to say 430 eventually gets heard while a
+	// genuinely hung pool still fails in bounded time.
+	for scale := 0; ; scale++ {
+		sawExpired, sawOther := false, false
+		for attempt := range n {
+			idx := (start + attempt) % n
+			g := mains[idx]
+			if hostSkipped(g.skipID, &skipHosts, skipCount) {
+				continue
 			}
-			respCh <- Response{Err: err}
-			return
-		}
-		if !ok {
-			// Connection died — try next provider.
-			continue
-		}
-		if resp.Err != nil {
-			// A committed attempt with a caller writer already streamed partial
-			// bytes; deliver the error rather than re-streaming into the same
-			// writer on another provider.
-			if bodyWriter != nil && attemptCommittedResp(resp) {
-				respCh <- resp
+			if g.isQuotaExceeded() {
+				lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
+				sawOther = true
+				continue
+			}
+			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, scale)
+			if cancelled {
+				err := ctx.Err()
+				if err == nil {
+					err = c.ctx.Err()
+				}
+				respCh <- Response{Err: err}
 				return
 			}
-			lastErr = resp.Err
-			continue
-		}
-		if resp.StatusCode == 502 {
-			// Provider returned "service unavailable" — remove it from the
-			// pool immediately so no further requests are routed to it.
-			_ = c.RemoveProvider(g.name)
-			if g.p.ReconnectDelay > 0 {
-				c.scheduleReconnect(g)
+			if !ok {
+				// Connection died or the attempt window expired — try the next
+				// provider, keeping the reason: an all-attempts-expired request
+				// used to surface as a BARE "all providers exhausted", which
+				// reads as total infrastructure death and hides the one thread
+				// worth pulling (the per-attempt timeout).
+				if resp.Err != nil {
+					lastErr = resp.Err
+				}
+				var at *AttemptTimeoutError
+				if errors.As(resp.Err, &at) && at.Phase == "response" {
+					sawExpired = true
+				} else {
+					sawOther = true
+				}
+				continue
 			}
-			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
-			continue
-		}
-		if resp.StatusCode == 430 {
-			c.nextIdx.Add(1) // bias next request away from this provider
-			if g.skipID != "" && skipCount < len(skipHosts) {
-				skipHosts[skipCount] = g.skipID
-				skipCount++
+			sawOther = true
+			if resp.Err != nil {
+				// A committed attempt with a caller writer already streamed partial
+				// bytes; deliver the error rather than re-streaming into the same
+				// writer on another provider.
+				if bodyWriter != nil && attemptCommittedResp(resp) {
+					respCh <- resp
+					return
+				}
+				lastErr = resp.Err
+				continue
 			}
-			lastResp = resp
-			hasResp = true
-			post430 = true
+			if resp.StatusCode == 502 {
+				// Provider returned "service unavailable" — remove it from the
+				// pool immediately so no further requests are routed to it.
+				_ = c.RemoveProvider(g.name)
+				if g.p.ReconnectDelay > 0 {
+					c.scheduleReconnect(g)
+				}
+				lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
+				continue
+			}
+			if resp.StatusCode == 430 {
+				c.nextIdx.Add(1) // bias next request away from this provider
+				if g.skipID != "" && skipCount < len(skipHosts) {
+					skipHosts[skipCount] = g.skipID
+					skipCount++
+				}
+				lastResp = resp
+				hasResp = true
+				post430 = true
 
-			if raceable {
-				// Build remaining mains and race them in parallel via STAT.
-				rest := make([]*providerGroup, 0, n-attempt-1)
-				for a := attempt + 1; a < n; a++ {
-					rest = append(rest, mains[(start+a)%n])
-				}
-				delivered, cancelled, raceErr := c.raceCandidates(
-					ctx, rest, statPayload, payload, bodyWriter, onMeta,
-					&skipHosts, &skipCount, respCh,
-				)
-				if cancelled {
-					err := ctx.Err()
-					if err == nil {
-						err = c.ctx.Err()
+				if raceable {
+					// Build remaining mains and race them in parallel via STAT.
+					rest := make([]*providerGroup, 0, n-attempt-1)
+					for a := attempt + 1; a < n; a++ {
+						rest = append(rest, mains[(start+a)%n])
 					}
-					respCh <- Response{Err: err}
-					return
+					delivered, cancelled, raceErr := c.raceCandidates(
+						ctx, rest, statPayload, payload, bodyWriter, onMeta,
+						&skipHosts, &skipCount, respCh,
+					)
+					if cancelled {
+						err := ctx.Err()
+						if err == nil {
+							err = c.ctx.Err()
+						}
+						respCh <- Response{Err: err}
+						return
+					}
+					if delivered {
+						return
+					}
+					if raceErr != nil {
+						lastErr = raceErr
+					}
+					break // all remaining mains were probed in the race
 				}
-				if delivered {
-					return
-				}
-				if raceErr != nil {
-					lastErr = raceErr
-				}
-				break // all remaining mains were probed in the race
+				continue
 			}
-			continue
+			// Success.
+			respCh <- resp
+			return
 		}
-		// Success.
-		respCh <- resp
-		return
+		// Escalate only on the pure slow-lookup signature: every attempted
+		// provider expired awaiting its first response byte. Any other outcome
+		// (430, quota, conn death, saturation) means the pass learned
+		// something and the normal flow — backups, then the terminal error —
+		// proceeds at once.
+		if !sawExpired || sawOther || scale >= maxAttemptEscalations {
+			break
+		}
 	}
 
 	// 2. All main providers returned 430 (or died) — try backup providers.
@@ -2455,7 +2567,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 				continue
 			}
-			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430)
+			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, 0)
 			if cancelled {
 				err := ctx.Err()
 				if err == nil {
@@ -2465,6 +2577,9 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				return
 			}
 			if !ok {
+				if resp.Err != nil {
+					lastErr = resp.Err // expired attempts keep their reason (see the mains loop)
+				}
 				continue
 			}
 			if resp.Err != nil {
