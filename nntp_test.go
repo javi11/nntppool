@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -2205,5 +2206,92 @@ func TestClient_ResetProviderQuota_SchedulesNextPeriod(t *testing.T) {
 	latest := after.Add(period)
 	if resetAt.Before(earliest) || resetAt.After(latest) {
 		t.Errorf("quotaResetAt = %v, want in [%v, %v]", resetAt, earliest, latest)
+	}
+}
+
+// --- MinConnections (pre-warm) tests ---
+
+func TestMinConnections_PreWarmsWithoutTraffic(t *testing.T) {
+	var dials atomic.Int32
+
+	factory := func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				cmd := string(buf[:n])
+				if len(cmd) >= 4 && cmd[:4] == "DATE" {
+					_, _ = server.Write([]byte("111 20240315120000\r\n"))
+				} else {
+					_, _ = server.Write([]byte("223 exists\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 3, MinConnections: 2},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// No requests are sent. Only the pre-warmed slots (plus the startup
+	// ping, which shares the same factory) should dial.
+	deadline := time.After(2 * time.Second)
+	for {
+		if dials.Load() >= 3 { // 1 ping + 2 pre-warmed connections
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("dials = %d, want >= 3 (ping + 2 pre-warmed) before timeout", dials.Load())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// Give any (incorrect) lazy dial of the third slot a chance to happen.
+	time.Sleep(100 * time.Millisecond)
+
+	if got := dials.Load(); got != 3 {
+		t.Errorf("dials = %d, want exactly 3 (ping + 2 pre-warmed, third slot stays cold)", got)
+	}
+}
+
+func TestMinConnections_Validation(t *testing.T) {
+	dummyFactory := func(ctx context.Context) (net.Conn, error) {
+		return nil, nil
+	}
+
+	if _, err := NewClient(context.Background(), []Provider{
+		{Factory: dummyFactory, Connections: 2, MinConnections: 3},
+	}); err == nil {
+		t.Error("expected error when MinConnections > Connections")
+	}
+
+	if _, err := NewClient(context.Background(), []Provider{
+		{Factory: dummyFactory, Connections: 2, MinConnections: -1},
+	}); err == nil {
+		t.Error("expected error when MinConnections is negative")
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: dummyFactory, Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	if err := c.AddProvider(Provider{Host: "host:119", Connections: 2, MinConnections: 5}); err == nil {
+		t.Error("expected AddProvider error when MinConnections > Connections")
 	}
 }
