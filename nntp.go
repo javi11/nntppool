@@ -591,49 +591,74 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 
 // runConnSlot is the slot goroutine that manages the lifecycle of a single
 // connection: IDLE → CONNECTING → ACTIVE → (death/idle) → IDLE.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup) {
+//
+// preWarm slots skip the IDLE wait and dial immediately (and again
+// immediately on death), giving the provider a floor of connections that
+// stay hot independent of traffic. Callers pair preWarm with idleTimeout==0
+// so these connections are never torn down for being idle.
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
 	var sharedBuf readBuffer
 
 	for {
-		// IDLE: wait for a request (zero TCP resources).
-		// Prefer priority requests over normal ones.
+		// preWarm slots have no request to wait on, so unlike the cold path
+		// below they never block on a select that observes ctx.Done(). Check
+		// explicitly here so a cancelled group context stops the goroutine
+		// instead of spinning through gate.enter on every loop iteration.
+		if preWarm {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+
+		// IDLE: wait for a request (zero TCP resources) — unless this is a
+		// pre-warmed slot, which dials immediately without waiting for real
+		// traffic so a minimum number of connections stay hot.
 		var firstReq *Request
 		var ok bool
-		select {
-		case firstReq, ok = <-prioCh:
-			if !ok {
-				return
-			}
-		default:
+		gateCtx := ctx
+		if !preWarm {
+			// Prefer priority requests over normal ones.
 			select {
 			case firstReq, ok = <-prioCh:
 				if !ok {
 					return
 				}
-			case firstReq, ok = <-reqCh:
-				if !ok {
-					return // channel closed, shut down
+			default:
+				select {
+				case firstReq, ok = <-prioCh:
+					if !ok {
+						return
+					}
+				case firstReq, ok = <-reqCh:
+					if !ok {
+						return // channel closed, shut down
+					}
+				case <-ctx.Done():
+					return
 				}
-			case <-ctx.Done():
-				return
+			}
+			gateCtx = firstReq.Ctx
+
+			// Check if the request is already cancelled.
+			select {
+			case <-firstReq.Ctx.Done():
+				failRequest(firstReq.RespCh, firstReq.Ctx.Err())
+				continue
+			default:
 			}
 		}
 
-		// Check if the request is already cancelled.
-		select {
-		case <-firstReq.Ctx.Done():
-			failRequest(firstReq.RespCh, firstReq.Ctx.Err())
-			continue
-		default:
-		}
-
 		// GATE: block if we're at the throttled capacity limit.
-		if !gate.enter(ctx, firstReq.Ctx) {
+		if !gate.enter(ctx, gateCtx) {
 			// Slot or request context cancelled while waiting at the gate.
-			failRequest(firstReq.RespCh, context.Canceled)
+			if firstReq != nil {
+				failRequest(firstReq.RespCh, context.Canceled)
+			}
 			continue
 		}
 
@@ -641,7 +666,9 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		conn, err := factory(ctx)
 		if err != nil {
 			gate.exit()
-			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			if firstReq != nil {
+				failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			}
 			// Backoff before retrying to avoid thrashing.
 			select {
 			case <-time.After(connFailureBackoff):
@@ -657,7 +684,9 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc, err := newNNTPConnectionFromConn(ctx, conn, statInflight, reqCh, prioCh, auth, userAgent, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
-			failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			if firstReq != nil {
+				failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+			}
 
 			if errors.Is(err, ErrMaxConnections) {
 				// Server said "max connections" — throttle and use longer backoff.
@@ -1385,6 +1414,14 @@ type Provider struct {
 	TLSConfig       *tls.Config
 	Auth            Auth
 	Connections     int
+	// MinConnections is the number of connections to this provider that are
+	// dialed eagerly at startup (and re-dialed immediately on death) instead
+	// of waiting for the first request. These slots ignore IdleTimeout, so
+	// they stay connected indefinitely once established, giving the provider
+	// a warm floor of ready connections. 0 disables pre-warming — all
+	// connections then dial lazily on demand, up to Connections, as before.
+	// Must be <= Connections.
+	MinConnections  int
 	Inflight        int           // 0 defaults to 1; max concurrent BODY (and other body-bearing) commands per connection
 	StatInflight    int           // 0 defaults to Inflight; deeper pipeline depth for bodyless STAT commands. Because STAT carries no payload, many can be in flight per connection at negligible memory cost, amortising round-trips. Set higher than Inflight (e.g. 50-100) for STAT-heavy workloads without inflating BODY memory.
 	Factory         ConnFactory   // overrides Host/TLSConfig when set
@@ -1723,9 +1760,20 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		}
 	}
 
-	for range p.Connections {
+	minConns := p.MinConnections
+	if minConns > p.Connections {
+		minConns = p.Connections
+	}
+	for i := range p.Connections {
+		preWarm := i < minConns
+		idleTimeout := p.IdleTimeout
+		if preWarm {
+			// Pre-warmed slots stay connected indefinitely; idle disconnect
+			// would defeat the point of keeping a minimum floor hot.
+			idleTimeout = 0
+		}
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, p.IdleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg, preWarm)
 	}
 
 	return g
@@ -1753,6 +1801,9 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	for i, p := range providers {
 		if p.Connections <= 0 {
 			return nil, fmt.Errorf("nntp: provider connections must be > 0")
+		}
+		if p.MinConnections < 0 || p.MinConnections > p.Connections {
+			return nil, fmt.Errorf("nntp: provider min connections must be between 0 and connections")
 		}
 		if p.Factory == nil && p.Host == "" {
 			return nil, fmt.Errorf("nntp: provider must have Host or Factory")
@@ -2559,6 +2610,9 @@ func (c *Client) Stats() ClientStats {
 func (c *Client) AddProvider(p Provider) error {
 	if p.Connections <= 0 {
 		return fmt.Errorf("nntp: provider connections must be > 0")
+	}
+	if p.MinConnections < 0 || p.MinConnections > p.Connections {
+		return fmt.Errorf("nntp: provider min connections must be between 0 and connections")
 	}
 	if p.Factory == nil && p.Host == "" {
 		return fmt.Errorf("nntp: provider must have Host or Factory")
