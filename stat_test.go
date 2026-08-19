@@ -129,6 +129,36 @@ func TestStatMany_MissingIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestStatReportsSuccessfulProviderAfterFallback(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Host:        "primary.example:119",
+			Factory:     makeStatByIDFactory(t, nil, nil, nil),
+			Connections: 1,
+		},
+		{
+			Host: "backup.example:119",
+			Factory: makeStatByIDFactory(t, nil, nil, map[string]string{
+				"x@h": "223 1 <x@h> exists",
+			}),
+			Connections: 1,
+			Backup:      true,
+		},
+	}, WithStatProbe(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	result, err := c.Stat(context.Background(), "x@h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Provider != "backup.example:119" {
+		t.Fatalf("Provider = %q, want backup.example:119", result.Provider)
+	}
+}
+
 func TestStatMany_Completeness(t *testing.T) {
 	const total = 200
 	ids := make([]string, total)
