@@ -106,6 +106,35 @@ func TestNNTPConnection_AuthReject(t *testing.T) {
 	}
 }
 
+func TestNNTPConnection_AuthMaxConnections(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+	}{
+		{name: "temporary", code: 400},
+		{name: "permanent", code: 502},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := mockServer(t, func(s net.Conn) {
+				_, _ = s.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 1024)
+				_, _ = s.Read(buf) // AUTHINFO USER
+				_, _ = s.Write([]byte("381 password required\r\n"))
+				_, _ = s.Read(buf) // AUTHINFO PASS
+				_, _ = fmt.Fprintf(s, "%d too many connections\r\n", tc.code)
+			})
+
+			_, err := newNNTPConnectionFromConn(context.Background(), conn, 1, make(chan *Request), nil, Auth{
+				Username: "testuser",
+				Password: "testpass",
+			}, "", nil, nil)
+			if !errors.Is(err, ErrMaxConnections) {
+				t.Fatalf("error = %v, want ErrMaxConnections", err)
+			}
+		})
+	}
+}
+
 func TestNNTPConnection_RunSingleRequest(t *testing.T) {
 	conn := mockServer(t, func(s net.Conn) {
 		_, _ = s.Write([]byte("200 server ready\r\n"))

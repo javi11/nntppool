@@ -116,6 +116,24 @@ func (e *greetingError) Is(target error) bool {
 	return target == ErrMaxConnections && (e.StatusCode == 502 || e.StatusCode == 400)
 }
 
+// authResponseError preserves the NNTP status code returned during AUTHINFO.
+// Some providers report an account connection ceiling here rather than in the
+// initial greeting, so callers must be able to match ErrMaxConnections in both
+// places.
+type authResponseError struct {
+	Command    string
+	StatusCode int
+	Message    string
+}
+
+func (e *authResponseError) Error() string {
+	return fmt.Sprintf("nntp auth: unexpected response to %s: %s", e.Command, e.Message)
+}
+
+func (e *authResponseError) Is(target error) bool {
+	return target == ErrMaxConnections && (e.StatusCode == 502 || e.StatusCode == 400)
+}
+
 type Request struct {
 	Ctx context.Context
 
@@ -340,7 +358,7 @@ func (c *NNTPConnection) auth(auth Auth) error {
 	case 381:
 		// need pass
 	default:
-		return fmt.Errorf("nntp auth: unexpected response to AUTHINFO USER: %s", resp.Message)
+		return &authResponseError{Command: "AUTHINFO USER", StatusCode: resp.StatusCode, Message: resp.Message}
 	}
 
 	// AUTHINFO PASS
@@ -352,7 +370,7 @@ func (c *NNTPConnection) auth(auth Auth) error {
 		return fmt.Errorf("nntp auth: AUTHINFO PASS: %w", err)
 	}
 	if resp.StatusCode != 281 {
-		return fmt.Errorf("nntp auth: unexpected response to AUTHINFO PASS: %s", resp.Message)
+		return &authResponseError{Command: "AUTHINFO PASS", StatusCode: resp.StatusCode, Message: resp.Message}
 	}
 	return nil
 }
