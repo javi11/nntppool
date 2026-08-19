@@ -2292,3 +2292,46 @@ func TestMinConnections_Validation(t *testing.T) {
 		t.Error("expected AddProvider error when MinConnections > Connections")
 	}
 }
+
+func TestMinConnections_ZeroKeepsAllSlotsLazy(t *testing.T) {
+	var dials atomic.Int32
+
+	factory := func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				cmd := string(buf[:n])
+				if len(cmd) >= 4 && cmd[:4] == "DATE" {
+					_, _ = server.Write([]byte("111 20240315120000\r\n"))
+				} else {
+					_, _ = server.Write([]byte("223 exists\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	// MinConnections unset (0) must behave exactly as before the feature
+	// existed: every slot stays cold until a request arrives, so the only
+	// dial is the startup ping.
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: factory, Connections: 3},
+	})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	if got := dials.Load(); got != 1 {
+		t.Errorf("dials = %d, want exactly 1 (startup ping only; no slot should pre-warm)", got)
+	}
+}
