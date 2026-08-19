@@ -2247,10 +2247,7 @@ func TestMinConnections_PreWarmsWithoutTraffic(t *testing.T) {
 	// No requests are sent. Only the pre-warmed slots (plus the startup
 	// ping, which shares the same factory) should dial.
 	deadline := time.After(2 * time.Second)
-	for {
-		if dials.Load() >= 3 { // 1 ping + 2 pre-warmed connections
-			break
-		}
+	for dials.Load() < 3 { // 1 ping + 2 pre-warmed connections
 		select {
 		case <-deadline:
 			t.Fatalf("dials = %d, want >= 3 (ping + 2 pre-warmed) before timeout", dials.Load())
