@@ -1398,7 +1398,8 @@ func TestKeepalive_KeepsConnectionAlive(t *testing.T) {
 	})
 
 	reqCh := make(chan *Request, 1)
-	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, nil)
+	stats := &providerStats{}
+	nc, err := newNNTPConnectionFromConn(context.Background(), conn, 1, reqCh, nil, Auth{}, "", nil, stats)
 	if err != nil {
 		t.Fatalf("newNNTPConnectionFromConn() error = %v", err)
 	}
@@ -1432,6 +1433,9 @@ func TestKeepalive_KeepsConnectionAlive(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout: real request after keepalive timed out")
+	}
+	if got := stats.Errors.Load(); got != 0 {
+		t.Errorf("provider errors after successful keepalive = %d, want 0", got)
 	}
 }
 
