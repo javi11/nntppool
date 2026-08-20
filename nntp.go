@@ -178,6 +178,9 @@ type Request struct {
 	// bodySem slot, so readerLoop releases exactly the slots that were taken.
 	// Bodyless STAT requests never acquire bodySem and leave this false.
 	heldBody bool
+
+	// providerName identifies the provider group selected for this attempt.
+	providerName string
 }
 
 type Response struct {
@@ -2169,6 +2172,7 @@ func (c *Client) tryGroup(
 		BodyWriter:      bodyWriter,
 		OnMeta:          onMeta,
 		attemptDeadline: time.Now().Add(attemptTimeout),
+		providerName:    g.name,
 	}
 
 	timer := time.NewTimer(attemptTimeout)

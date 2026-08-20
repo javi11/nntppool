@@ -52,7 +52,8 @@ type ArticleHead struct {
 // StatResult holds the parsed result of a STAT command.
 type StatResult struct {
 	MessageID string
-	Number    int64 // article number from response (0 if no group selected)
+	Number    int64  // article number from response (0 if no group selected)
+	Provider  string // provider name that returned the successful response
 }
 
 // BodyResult is the result type for BodyAsync.
@@ -162,6 +163,9 @@ func parseStat(messageID string, resp Response) (*StatResult, error) {
 	}
 
 	result := &StatResult{MessageID: messageID}
+	if resp.Request != nil {
+		result.Provider = resp.Request.providerName
+	}
 
 	// Parse "223 <number> <message-id>" from the status line.
 	parts := strings.SplitN(resp.Status, " ", 4)
