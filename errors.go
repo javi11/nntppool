@@ -3,7 +3,33 @@ package nntppool
 import (
 	"errors"
 	"fmt"
+	"time"
 )
+
+// AttemptTimeoutError reports an attempt that expired inside its attempt
+// window: either it could not be dispatched to a connection ("dispatch"
+// phase — the provider is saturated) or it was sent and no first response
+// byte arrived ("response" phase — a hung connection, or a server taking
+// longer than the window to answer; slow spool lookups for aged articles
+// have been measured at ~7.5s to a 430 on a healthy connection). Typed so
+// retry logic can escalate the window on response-phase expiry, and so the
+// terminal "all providers exhausted" error names what actually happened
+// instead of arriving bare.
+type AttemptTimeoutError struct {
+	Provider string
+	Timeout  time.Duration
+	Phase    string // "dispatch" | "response"
+	Cause    error  // the transport-level error, when the connection's own read deadline noticed first
+}
+
+func (e *AttemptTimeoutError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%s: attempt expired after %s awaiting %s (%v)", e.Provider, e.Timeout, e.Phase, e.Cause)
+	}
+	return fmt.Sprintf("%s: attempt expired after %s awaiting %s", e.Provider, e.Timeout, e.Phase)
+}
+
+func (e *AttemptTimeoutError) Unwrap() error { return e.Cause }
 
 // Error represents an NNTP protocol-level error with a status code.
 type Error struct {

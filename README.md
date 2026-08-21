@@ -909,6 +909,30 @@ nntppool.WithDispatchStrategy(nntppool.DispatchFIFO)
 
 `ErrCRCMismatch` is returned alongside a non-nil `*ArticleBody` so callers can inspect the decoded data and decide whether to discard or use it.
 
+### AttemptTimeoutError
+
+When every provider's attempt expires before a first response byte arrives, the
+terminal error wraps `*AttemptTimeoutError` instead of surfacing as a bare
+"all providers exhausted":
+
+```go
+var at *nntppool.AttemptTimeoutError
+if errors.As(err, &at) {
+    // at.Provider — which provider's attempt expired last
+    // at.Timeout  — the attempt window that expired
+    // at.Phase    — "dispatch" (saturated: never got a connection) or
+    //               "response" (sent, but no first byte within the window)
+    // at.Cause    — the underlying transport error, when one exists
+}
+```
+
+`Phase == "response"` is the slow-spool signature: aged articles can take
+several seconds to answer 430 on an otherwise healthy provider. The pool
+already reacts on its own — after a pass in which every provider expired this
+way, the expired providers are retried once with a wider window (bounded by a
+single shared wall-clock budget) — so this error means even the widened window
+went unanswered.
+
 ---
 
 ## Testing
