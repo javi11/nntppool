@@ -71,14 +71,19 @@ const (
 	// retry uses a fresh connection on the same provider.
 	maxConnDiedRetries = 2
 
-	// maxAttemptEscalations bounds same-provider retries of a response-phase
-	// attempt expiry, doubling the window each time (base → 2× → 4×, capped at
-	// maxAttemptTimeout): at the 2s adaptive floor that is 2s+4s+8s = 14s of
-	// patience before failing over, which clears real-world slow spool lookups
-	// (~7.5s to a 430 for aged articles) without any new configuration. An
-	// explicit Provider.AttemptTimeout at or above maxAttemptTimeout leaves no
-	// room to grow, so escalation is a no-op there by construction.
-	maxAttemptEscalations = 2
+	// escalationFactor sizes the escalated pass after every attempted provider
+	// expired awaiting its first response byte (the slow-spool signature): the
+	// whole pass shares one wall-clock budget of escalationFactor × the widest
+	// window that expired, capped at maxAttemptTimeout — so escalation adds a
+	// bounded, provider-count-independent amount of patience to a request,
+	// never a multiple of it. At the 2s adaptive floor that is 8s, which
+	// clears real-world slow spool lookups (~7.5s to a 430 for aged articles)
+	// without any new configuration; an explicit sub-second
+	// Provider.AttemptTimeout escalates proportionately instead of jumping to
+	// the cap. A provider whose escalated window could not exceed the window
+	// it already expired at is skipped, so an explicit Provider.AttemptTimeout
+	// at or above maxAttemptTimeout makes escalation a true no-op.
+	escalationFactor = 4
 
 	// minAttemptTimeout is the floor (and default) for the per-attempt timeout
 	// that bounds dispatch + time-to-first-response-byte. Once response bytes
@@ -2404,21 +2409,19 @@ func (c *Client) tryGroupResilient(
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
 	priority bool,
-	timeoutScale int,
+	window time.Duration,
 ) (resp Response, ok bool, cancelled bool) {
-	// timeoutScale widens the attempt window (base → 2× → 4×, capped at
-	// maxAttemptTimeout) on escalation passes — see doSendWithRetry: a pass in
-	// which EVERY provider expired awaiting its first response byte is re-run
+	// window == 0 uses the provider's adaptive attempt window. A positive
+	// window is the escalation seam — see doSendWithRetry: a pass in which
+	// EVERY provider expired awaiting its first response byte is re-run once
 	// with a wider window, because that shape is a slow-but-honest answer
 	// (cold spool lookups for aged articles measure ~7.5s to a 430 while the
 	// TTFB EWMA — dominated by cache-hot serving — derives a 2s window) at
 	// least as often as it is dead infrastructure. Failover order is
 	// untouched: within a pass a quiet provider still costs one base window.
-	timeout := g.attemptTimeout()
-	for range timeoutScale {
-		if next := min(timeout*2, maxAttemptTimeout); next > timeout {
-			timeout = next
-		}
+	timeout := window
+	if timeout <= 0 {
+		timeout = g.attemptTimeout()
 	}
 	for r := 0; ; r++ {
 		resp, ok, cancelled = c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, timeout)
@@ -2429,7 +2432,13 @@ func (c *Client) tryGroupResilient(
 			// Normalize both expiry surfaces (the attempt timer, or the
 			// connection's own read deadline racing it) into one shape: a
 			// failover carrying the typed story — never a deliverable
-			// response, never a bare error.
+			// response, never a bare error. Deliberately NOT retried on a
+			// fresh connection (the read-deadline surface used to fall
+			// through to the isConnectionDeathError retry below): re-dialing
+			// restarts the server-side lookup under the same window it just
+			// expired against, so it can only re-pay the dial to learn
+			// nothing. Failing over — and, on the mains path, the escalated
+			// pass — answers the same question wider instead.
 			var at *AttemptTimeoutError
 			if !errors.As(resp.Err, &at) {
 				resp.Err = &AttemptTimeoutError{Provider: g.name, Timeout: timeout, Phase: "response", Cause: resp.Err}
@@ -2528,14 +2537,19 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 	}
 
-	// Escalation passes: pass 0 runs every provider at its base attempt window
-	// (a quiet provider costs one window before failover, exactly as before).
-	// Only when a WHOLE pass produced nothing but expired-awaiting-response
+	// Escalation: pass 0 runs every provider at its base attempt window (a
+	// quiet provider costs one window before failover, exactly as before).
+	// Only when the WHOLE pass produced nothing but expired-awaiting-response
 	// failures — the signature of a slow spool lookup, not of dead infra — is
-	// the pass re-run with the window doubled (capped at maxAttemptTimeout),
-	// so a server that needs 7s to say 430 eventually gets heard while a
-	// genuinely hung pool still fails in bounded time.
-	for scale := 0; ; scale++ {
+	// it re-run ONCE, all expired providers sharing a single wall-clock budget
+	// (escalationFactor × the widest expired window, capped at
+	// maxAttemptTimeout), so a server that needs 7s to say 430 gets heard
+	// while a genuinely hung pool costs at most one budget of extra latency,
+	// however many providers it holds.
+	expiredWin := make([]time.Duration, n) // widest response-phase expiry per provider; 0 = none
+	escalated := false
+	var budget time.Duration
+	for {
 		sawExpired, sawOther := false, false
 		for attempt := range n {
 			idx := (start + attempt) % n
@@ -2548,7 +2562,21 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				sawOther = true
 				continue
 			}
-			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, scale)
+			var window time.Duration // 0 = the provider's base window
+			if escalated {
+				if expiredWin[idx] == 0 {
+					continue // answered definitively in pass 0 — nothing to re-ask
+				}
+				window = min(budget, maxAttemptTimeout)
+				if window <= expiredWin[idx] {
+					continue // cannot out-wait the window that already expired
+				}
+			}
+			attemptStart := time.Now()
+			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, window)
+			if escalated {
+				budget -= time.Since(attemptStart)
+			}
 			if cancelled {
 				err := ctx.Err()
 				if err == nil {
@@ -2569,6 +2597,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				var at *AttemptTimeoutError
 				if errors.As(resp.Err, &at) && at.Phase == "response" {
 					sawExpired = true
+					expiredWin[idx] = max(expiredWin[idx], at.Timeout)
 				} else {
 					sawOther = true
 				}
@@ -2642,10 +2671,30 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		// provider expired awaiting its first response byte. Any other outcome
 		// (430, quota, conn death, saturation) means the pass learned
 		// something and the normal flow — backups, then the terminal error —
-		// proceeds at once.
-		if !sawExpired || sawOther || scale >= maxAttemptEscalations {
+		// proceeds at once. One escalated pass only, and only when the budget
+		// can actually widen at least one provider's window: when every base
+		// window is already at maxAttemptTimeout there is nothing wider to
+		// ask, and re-running an identical pass would buy latency, not
+		// information.
+		if escalated || !sawExpired || sawOther {
 			break
 		}
+		var widest time.Duration
+		for _, w := range expiredWin {
+			widest = max(widest, w)
+		}
+		budget = min(escalationFactor*widest, maxAttemptTimeout)
+		grows := false
+		for _, w := range expiredWin {
+			if w > 0 && w < budget {
+				grows = true
+				break
+			}
+		}
+		if !grows {
+			break
+		}
+		escalated = true
 	}
 
 	// 2. All main providers returned 430 (or died) — try backup providers.
