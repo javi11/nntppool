@@ -445,28 +445,38 @@ func failRequest(ch chan Response, err error) {
 }
 
 func (c *NNTPConnection) failOutstanding() {
-	c.failMu.Do(func() {
-		connErr := error(ErrConnectionDied)
-		if c.providerName != "" {
-			connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
-		}
-		for {
-			select {
-			case req := <-c.pending:
-				if req == nil {
-					continue
-				}
-				failRequest(req.RespCh, connErr)
-				// Best-effort inflight release (not strictly needed once we're shutting down).
-				select {
-				case <-c.inflightSem:
-				default:
-				}
-			default:
-				return
+	c.failMu.Do(c.drainPending)
+}
+
+// drainPending fails every request sitting in the pending queue. Deliberately
+// callable OUTSIDE failOutstanding's once-guard: the writer loop can accept a
+// request from a hot channel and enqueue it into pending AFTER the dying
+// reader's failOutstanding sweep already ran — the once had fired, so the
+// request was stranded silently and only the caller's attempt window ever
+// recovered it. The writer's flush-error exits drain for themselves instead.
+// Concurrent drains are safe: each request is received by exactly one, and
+// failRequest tolerates an already-closed channel.
+func (c *NNTPConnection) drainPending() {
+	connErr := error(ErrConnectionDied)
+	if c.providerName != "" {
+		connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
+	}
+	for {
+		select {
+		case req := <-c.pending:
+			if req == nil {
+				continue
 			}
+			failRequest(req.RespCh, connErr)
+			// Best-effort inflight release (not strictly needed once we're shutting down).
+			select {
+			case <-c.inflightSem:
+			default:
+			}
+		default:
+			return
 		}
-	})
+	}
 }
 
 func (c *NNTPConnection) Close() error {
@@ -780,6 +790,14 @@ func (c *NNTPConnection) Run() {
 		c.cancel()
 		_ = c.conn.Close()
 		c.failOutstanding()
+		// failOutstanding is once-guarded and the reader's death path may
+		// have already spent the once — while the writer, dying slightly
+		// later, could still have enqueued one final request into pending
+		// (stolen from a hot channel mid-teardown). This defer runs strictly
+		// after the writer can no longer enqueue, so a drain HERE is the
+		// last word: nothing left in pending, ever, or the caller stalls a
+		// whole attempt window on a request nobody owns.
+		c.drainPending()
 		c.closeDone()
 	}()
 
@@ -947,9 +965,14 @@ mainLoop:
 		default:
 		}
 
-		// Flush buffered writes before blocking on semaphore.
+		// Flush buffered writes before blocking on semaphore. A flush failure
+		// means the connection is dead and requests already enqueued into
+		// pending may never be read by anyone — the reader's failOutstanding
+		// sweep can have ALREADY run, so drain here or they strand silently.
 		if bw.Buffered() > 0 {
 			if err := bw.Flush(); err != nil {
+				_ = c.conn.Close()
+				c.drainPending()
 				return
 			}
 		}
@@ -961,10 +984,13 @@ mainLoop:
 			return
 		}
 
-		// Flush buffered writes before blocking on channel read.
+		// Flush buffered writes before blocking on channel read. Same
+		// drain-or-strand rule as the flush above.
 		if bw.Buffered() > 0 {
 			if err := bw.Flush(); err != nil {
 				<-c.inflightSem
+				_ = c.conn.Close()
+				c.drainPending()
 				return
 			}
 		}
@@ -1103,7 +1129,20 @@ mainLoop:
 				failRequest(req.RespCh, req.Ctx.Err())
 				continue
 			case <-c.ctx.Done():
+				// The connection died with a request in hand. This arm is
+				// reachable with a request because a select whose conn-death
+				// arm and request arm are BOTH ready picks randomly — a dying
+				// writer can steal one last request from a hot channel, then
+				// land here when the dead reader's bodySem slot never frees.
+				// Fail it back (ErrConnectionDied retries it on a fresh
+				// connection at once); a bare return stranded it silently
+				// until the caller's whole attempt window expired.
 				<-c.inflightSem
+				connErr := error(ErrConnectionDied)
+				if c.providerName != "" {
+					connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
+				}
+				failRequest(req.RespCh, connErr)
 				return
 			}
 		}
