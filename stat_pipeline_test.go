@@ -279,3 +279,101 @@ func TestStatInflight_NoSemaphoreLeak(t *testing.T) {
 		t.Fatalf("sentinel STAT failed after mixed workload: %v", err)
 	}
 }
+
+// TestStatMany_DefaultConcurrencyFillsPipeline verifies that StatMany's
+// default dispatch bound scales to the pool's aggregate STAT pipeline
+// capacity (connections × StatInflight) instead of a flat constant. One
+// connection with StatInflight=128 must end up with all 128 STATs on the
+// wire before any reply: the server withholds replies until it has received
+// them all, with a watchdog flush so a capped client fails the depth
+// assertion instead of hanging.
+func TestStatMany_DefaultConcurrencyFillsPipeline(t *testing.T) {
+	const depth = 128
+	var highWater int32
+
+	factory := func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+
+			var mu sync.Mutex
+			received, replied := 0, 0
+			flush := func() {
+				mu.Lock()
+				defer mu.Unlock()
+				for ; replied < received; replied++ {
+					_, _ = server.Write([]byte("223 0 <x@h> exists\r\n"))
+				}
+			}
+			// Watchdog: a client whose dispatch is capped below depth can
+			// never get all commands on the wire; keep unblocking it so the
+			// test fails on the recorded depth rather than a hang.
+			watchdogDone := make(chan struct{})
+			defer close(watchdogDone)
+			go func() {
+				tick := time.NewTicker(400 * time.Millisecond)
+				defer tick.Stop()
+				for {
+					select {
+					case <-watchdogDone:
+						return
+					case <-tick.C:
+						flush()
+					}
+				}
+			}()
+
+			buf := make([]byte, 16384)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				received += strings.Count(string(buf[:n]), "\r\n")
+				// Outstanding = commands on the wire with no reply yet: the
+				// pipeline depth the client actually achieved.
+				if outstanding := received - replied; outstanding > int(atomic.LoadInt32(&highWater)) {
+					atomic.StoreInt32(&highWater, int32(outstanding))
+				}
+				full := received-replied >= depth
+				mu.Unlock()
+				if full {
+					flush()
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:      factory,
+		Connections:  1,
+		Inflight:     2,
+		StatInflight: depth,
+		SkipPing:     true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ids := make([]string, depth)
+	for i := range ids {
+		ids[i] = "x@h"
+	}
+
+	got := 0
+	for r := range c.StatMany(context.Background(), ids, StatManyOptions{}) {
+		if r.Err == nil && r.Result != nil {
+			got++
+		}
+	}
+	if got != depth {
+		t.Fatalf("successful STATs = %d, want %d", got, depth)
+	}
+	if d := atomic.LoadInt32(&highWater); d < depth {
+		t.Errorf("max STATs on the wire before a reply = %d, want %d — default concurrency is not filling the pipeline", d, depth)
+	}
+}
