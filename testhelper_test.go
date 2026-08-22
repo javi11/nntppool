@@ -7,7 +7,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/mnightingale/rapidyenc"
+	"github.com/javi11/rapidyenc"
 )
 
 // mockNNTPResponse builds a full NNTP response byte sequence.
@@ -73,7 +73,7 @@ func yencMultiPart(data []byte, fileName string, part, total int, offset int64) 
 	var encoded bytes.Buffer
 	enc, err := rapidyenc.NewEncoder(&encoded, rapidyenc.Meta{
 		FileName:   fileName,
-		FileSize:   int64(len(data)*total), // approximate total
+		FileSize:   int64(len(data) * total), // approximate total
 		PartNumber: int64(part),
 		TotalParts: int64(total),
 		Offset:     offset,
