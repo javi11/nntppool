@@ -6,11 +6,37 @@ import (
 	"sync"
 )
 
-// defaultStatConcurrency bounds in-flight STATs when StatManyOptions.Concurrency
-// is unset. STAT is a single-line request with a single-line reply and no body,
-// so it is purely round-trip-latency bound; a high default lets the pool amortise
-// RTT by keeping many checks outstanding across all connections at once.
-const defaultStatConcurrency = 64
+// minStatConcurrency floors the derived in-flight STAT bound when
+// StatManyOptions.Concurrency is unset. STAT is a single-line request with a
+// single-line reply and no body, so it is purely round-trip-latency bound; a
+// high floor lets even a small pool amortise RTT by keeping many checks
+// outstanding at once.
+const minStatConcurrency = 64
+
+// maxStatConcurrency caps the derived bound: past a few thousand outstanding
+// STATs the connections' own pipelines are saturated and more dispatch
+// goroutines only cost memory.
+const maxStatConcurrency = 4096
+
+// statCapacity is the pool's aggregate STAT pipeline depth — for every
+// provider, connections × the per-connection bodyless-STAT inflight cap —
+// clamped to [minStatConcurrency, maxStatConcurrency]. It is what a sweep must
+// keep outstanding to fill every connection's pipeline: a flat dispatch bound
+// below it leaves wire idle exactly on the STAT-heavy workloads StatInflight
+// exists for.
+func (c *Client) statCapacity() int {
+	total := 0
+	for _, groups := range [...]*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
+		for _, g := range *groups {
+			// Mirror startProviderGroup's effective depth: Inflight floors at
+			// 1, and StatInflight below it means "same as Inflight".
+			inflight := max(g.p.Inflight, 1)
+			statInflight := max(g.p.StatInflight, inflight)
+			total += max(g.maxConns, 1) * statInflight
+		}
+	}
+	return min(max(total, minStatConcurrency), maxStatConcurrency)
+}
 
 // StatManyResult is the per-message outcome streamed by StatMany and StatAsync.
 // A genuine miss (article not found, NNTP 430/423) is reported as
@@ -25,7 +51,9 @@ type StatManyResult struct {
 // StatManyOptions tunes a StatMany sweep.
 type StatManyOptions struct {
 	// Concurrency bounds the number of STATs outstanding across the whole pool
-	// at once. <= 0 uses defaultStatConcurrency.
+	// at once. <= 0 derives the bound from the pool's aggregate STAT pipeline
+	// capacity (connections × StatInflight per provider), so every
+	// connection's pipeline can fill.
 	Concurrency int
 
 	// Priority routes each STAT through the priority channel so idle connections
@@ -52,7 +80,7 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 	}
 	conc := opts.Concurrency
 	if conc <= 0 {
-		conc = defaultStatConcurrency
+		conc = c.statCapacity()
 	}
 	if conc > len(messageIDs) && len(messageIDs) > 0 {
 		conc = len(messageIDs)
