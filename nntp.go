@@ -2144,6 +2144,9 @@ func (c *Client) raceCandidates(
 			continue
 		}
 		if !pr.ok {
+			if pr.resp.Err != nil {
+				lastErr = pr.resp.Err // expired probes keep their reason
+			}
 			continue
 		}
 		if pr.resp.Err != nil {
@@ -2187,6 +2190,9 @@ func (c *Client) raceCandidates(
 		return false, true, lastErr
 	}
 	if !ok {
+		if resp.Err != nil {
+			lastErr = resp.Err // expired attempts keep their reason
+		}
 		return false, false, lastErr
 	}
 	if resp.Err != nil {

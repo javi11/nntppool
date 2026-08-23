@@ -141,6 +141,9 @@ func (c *Client) statViaGroup(ctx context.Context, g *providerGroup, payload []b
 		}
 		return Response{Err: err}
 	case !ok:
+		if resp.Err != nil {
+			return resp // expired attempts keep their typed reason
+		}
 		return Response{Err: ErrConnectionDied}
 	default:
 		return resp
