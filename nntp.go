@@ -1431,10 +1431,13 @@ func WithSpeedAwareDispatch(enabled bool) ClientOption {
 
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
-	Host            string
-	TLSConfig       *tls.Config
-	Auth            Auth
-	Connections     int
+	Host string
+	// Name is the stable external identity used in stats and errors. When empty,
+	// the name falls back to the legacy host+username derivation.
+	Name        string
+	TLSConfig   *tls.Config
+	Auth        Auth
+	Connections int
 	// MinConnections is the number of connections to this provider that are
 	// dialed eagerly at startup (and re-dialed immediately on death) instead
 	// of waiting for the first request. These slots ignore IdleTimeout, so
@@ -1677,6 +1680,9 @@ func TestProvider(ctx context.Context, p Provider) PingResult {
 
 // resolveProviderName builds a unique name for a provider based on host and auth.
 func resolveProviderName(p Provider, index int) string {
+	if p.Name != "" {
+		return p.Name
+	}
 	if p.Host != "" {
 		if p.Auth.Username != "" {
 			return p.Host + "+" + p.Auth.Username
