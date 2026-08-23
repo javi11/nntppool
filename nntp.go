@@ -85,6 +85,15 @@ const (
 	// at or above maxAttemptTimeout makes escalation a true no-op.
 	escalationFactor = 4
 
+	// escalationBreakerThreshold is how many consecutive fruitless escalations a
+	// provider may cost before escalation is suppressed for it.
+	escalationBreakerThreshold = 2
+
+	// escalationBreakerCooldownDefault is how long escalation stays suppressed
+	// for a provider whose escalations proved fruitless, before one half-open
+	// re-probe is allowed.
+	escalationBreakerCooldownDefault = 30 * time.Second
+
 	// minAttemptTimeout is the floor (and default) for the per-attempt timeout
 	// that bounds dispatch + time-to-first-response-byte. Once response bytes
 	// start flowing, the rolling stall timeout takes over instead.
@@ -1482,6 +1491,11 @@ func WithSpeedAwareDispatch(enabled bool) ClientOption {
 	return func(cfg *clientConfig) { cfg.speedAwareOff = !enabled }
 }
 
+// escalationBreakerCooldown is the live escalation-breaker cooldown. A var
+// rather than a const so tests can shorten it; not exported, so callers cannot
+// depend on tuning it.
+var escalationBreakerCooldown = escalationBreakerCooldownDefault
+
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
 	Host            string
@@ -1598,6 +1612,33 @@ func (g *providerGroup) attemptTimeout() time.Duration {
 		return maxAttemptTimeout
 	}
 	return d
+}
+
+// escalationSuppressed reports whether this provider's escalation breaker is
+// open: escalating it has repeatedly cost a full budget and delivered nothing,
+// so the widened window is not worth re-paying yet. The breaker is half-open —
+// once the cooldown lapses one escalation is allowed through, so a provider
+// that recovers into the slow-spool shape is never locked out permanently.
+func (g *providerGroup) escalationSuppressed(now time.Time) bool {
+	until := g.stats.escSuppressedUntil.Load()
+	return until > 0 && now.UnixNano() < until
+}
+
+// noteEscalationFruitless records an escalated pass that expired without
+// delivering. At escalationBreakerThreshold consecutive fruitless escalations
+// the breaker opens (and re-arms on every later fruitless half-open probe).
+func (g *providerGroup) noteEscalationFruitless(now time.Time) {
+	if g.stats.escFruitless.Add(1) >= escalationBreakerThreshold {
+		g.stats.escSuppressedUntil.Store(now.Add(escalationBreakerCooldown).UnixNano())
+	}
+}
+
+// resetEscalationBreaker clears the breaker after the provider answers
+// definitively — including a body delivered on an escalated window, which is
+// exactly the slow-spool case escalation exists to serve.
+func (g *providerGroup) resetEscalationBreaker() {
+	g.stats.escFruitless.Store(0)
+	g.stats.escSuppressedUntil.Store(0)
 }
 
 // isQuotaExceeded reports whether this provider has consumed its download quota
@@ -2567,6 +2608,9 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				if expiredWin[idx] == 0 {
 					continue // answered definitively in pass 0 — nothing to re-ask
 				}
+				if g.escalationSuppressed(time.Now()) {
+					continue // breaker open: escalating this provider has proven fruitless
+				}
 				window = min(budget, maxAttemptTimeout)
 				if window <= expiredWin[idx] {
 					continue // cannot out-wait the window that already expired
@@ -2598,11 +2642,22 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				if errors.As(resp.Err, &at) && at.Phase == "response" {
 					sawExpired = true
 					expiredWin[idx] = max(expiredWin[idx], at.Timeout)
+					if escalated {
+						// A widened window bought nothing. Enough of these in a
+						// row and this provider stops being escalated, so a
+						// sustained outage costs one base window per request
+						// again instead of re-paying the budget every time.
+						g.noteEscalationFruitless(time.Now())
+					}
 				} else {
 					sawOther = true
 				}
 				continue
 			}
+			// A definitive answer — including a body delivered on an escalated
+			// window, the slow-spool case escalation exists for. The provider
+			// is talking, so escalating it is worth paying for again.
+			g.resetEscalationBreaker()
 			sawOther = true
 			if resp.Err != nil {
 				// A committed attempt with a caller writer already streamed partial
@@ -2685,8 +2740,9 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		}
 		budget = min(escalationFactor*widest, maxAttemptTimeout)
 		grows := false
-		for _, w := range expiredWin {
-			if w > 0 && w < budget {
+		now := time.Now()
+		for i, w := range expiredWin {
+			if w > 0 && w < budget && !mains[i].escalationSuppressed(now) {
 				grows = true
 				break
 			}
