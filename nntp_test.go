@@ -1560,6 +1560,7 @@ func TestResolveProviderName(t *testing.T) {
 	}{
 		{"host only", Provider{Host: "news.example.com:563"}, 0, "news.example.com:563"},
 		{"host with auth", Provider{Host: "news.example.com:563", Auth: Auth{Username: "myuser"}}, 0, "news.example.com:563+myuser"},
+		{"explicit name", Provider{Name: "provider-id-1", Host: "news.example.com:563", Auth: Auth{Username: "myuser"}}, 0, "provider-id-1"},
 		{"factory only", Provider{Factory: func(ctx context.Context) (net.Conn, error) { return nil, nil }}, 3, "provider-3"},
 	}
 	for _, tt := range tests {
