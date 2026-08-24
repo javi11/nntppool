@@ -37,18 +37,22 @@ type providerStats struct {
 	// math.Float64bits. 0 = no sample yet. Drives speed-aware dispatch weights.
 	speedEWMA atomic.Uint64
 
+	// Quota tracking. quotaBytes is set once at group init (0 = unlimited).
+	quotaBytes    int64
+	quotaUsed     atomic.Int64 // bytes consumed in the current quota period
+	quotaExceeded atomic.Bool  // cached flag: set when quotaUsed >= quotaBytes; cleared on period reset
+
 	// Escalation circuit breaker. escFruitless counts consecutive escalated
 	// passes that expired without delivering anything; once it reaches
 	// escalationBreakerThreshold, escSuppressedUntil holds the Unix-nanosecond
 	// deadline before which this provider is not escalated again. Any
 	// definitive answer from the provider clears both.
-	escFruitless       atomic.Int32
+	//
+	// Kept last, and widest-first, so these cold fields neither pad nor share
+	// a cache line with ttfbEWMA/speedEWMA/quotaUsed, which are CAS-updated on
+	// every transfer.
 	escSuppressedUntil atomic.Int64
-
-	// Quota tracking. quotaBytes is set once at group init (0 = unlimited).
-	quotaBytes    int64
-	quotaUsed     atomic.Int64 // bytes consumed in the current quota period
-	quotaExceeded atomic.Bool  // cached flag: set when quotaUsed >= quotaBytes; cleared on period reset
+	escFruitless       atomic.Int32
 }
 
 // recordTTFB updates the provider's time-to-first-byte EWMA. sample is the

@@ -5,46 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 )
-
-// slowStatusFactory returns a healthy server that answers every BODY with a
-// 430 — after `delay`. This is the real-world slow-spool-lookup shape: aged
-// articles have been measured taking ~7.5s to a 430 on a healthy Newshosting
-// connection while the TTFB EWMA (cache-hot serving) derives a 2s window.
-func slowStatusFactory(delay time.Duration) ConnFactory {
-	return func(ctx context.Context) (net.Conn, error) {
-		client, server := net.Pipe()
-		go func() {
-			_, _ = server.Write([]byte("200 ready\r\n"))
-			buf := make([]byte, 4096)
-			// The read loop never blocks on answering: each BODY is answered
-			// from its own goroutine after `delay`, exactly like a real server
-			// whose spool lookup runs while the connection stays responsive.
-			// (net.Pipe is unbuffered — a server that sleeps inline would
-			// deadlock a client command against its own pending answer.)
-			var wmu sync.Mutex
-			for {
-				n, err := server.Read(buf)
-				if err != nil {
-					return
-				}
-				if strings.HasPrefix(string(buf[:n]), "BODY") {
-					go func() {
-						time.Sleep(delay)
-						wmu.Lock()
-						defer wmu.Unlock()
-						_, _ = server.Write([]byte("430 No Such Article\r\n"))
-					}()
-				}
-			}
-		}()
-		return client, nil
-	}
-}
 
 // hungFactory returns a server that greets, swallows every command, and never
 // answers — the shape of genuinely dead infrastructure behind a live socket.
@@ -68,7 +31,7 @@ func hungFactory(ctx context.Context) (net.Conn, error) {
 // any retry count: every attempt re-asked with the same too-short window.
 func TestSlowStatusLineEscalates(t *testing.T) {
 	c, err := NewClient(context.Background(), []Provider{
-		{Factory: slowStatusFactory(300 * time.Millisecond), Connections: 1, SkipPing: true, AttemptTimeout: 200 * time.Millisecond},
+		{Factory: slowBodyFactory(300*time.Millisecond, noSuchArticle), Connections: 1, SkipPing: true, AttemptTimeout: 200 * time.Millisecond},
 	})
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)

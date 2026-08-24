@@ -920,8 +920,8 @@ var at *nntppool.AttemptTimeoutError
 if errors.As(err, &at) {
     // at.Provider — which provider's attempt expired last
     // at.Timeout  — the attempt window that expired
-    // at.Phase    — "dispatch" (saturated: never got a connection) or
-    //               "response" (sent, but no first byte within the window)
+    // at.Phase    — PhaseDispatch (saturated: never got a connection) or
+    //               PhaseResponse (sent, but no first byte within the window)
     // at.Cause    — the underlying transport error, when one exists
 }
 ```
