@@ -309,6 +309,24 @@ func parseHeaders(lines []string) map[string][]string {
 // The body reader is consumed exactly once; on failure, the caller must retry
 // with a fresh reader.
 func (c *Client) PostYenc(ctx context.Context, headers PostHeaders, body io.Reader, meta rapidyenc.Meta) (*PostResult, error) {
+	return c.postYenc(ctx, headers, body, meta, nil)
+}
+
+// PostYencTo sends a yEnc-encoded article to a specific provider using the
+// NNTP POST command. The provider name matches the provider's configured Name
+// (or its derived name when Name is empty) and may identify either a main or
+// backup provider. The request does not fall back to another provider.
+// The body reader is consumed exactly once; on failure, the caller must retry
+// with a fresh reader.
+func (c *Client) PostYencTo(ctx context.Context, provider string, headers PostHeaders, body io.Reader, meta rapidyenc.Meta) (*PostResult, error) {
+	target := c.findGroup(provider)
+	if target == nil {
+		return nil, fmt.Errorf("nntp: provider %q not found", provider)
+	}
+	return c.postYenc(ctx, headers, body, meta, target)
+}
+
+func (c *Client) postYenc(ctx context.Context, headers PostHeaders, body io.Reader, meta rapidyenc.Meta, target *providerGroup) (*PostResult, error) {
 	pr, pw := io.Pipe()
 	go func() {
 		var err error
@@ -334,26 +352,29 @@ func (c *Client) PostYenc(ctx context.Context, headers PostHeaders, body io.Read
 		_, err = pw.Write([]byte(".\r\n"))
 	}()
 
-	respCh := c.sendPost(ctx, pr)
+	respCh := c.sendPost(ctx, pr, target)
 	return c.finishPost(respCh)
 }
 
 // sendPost dispatches a POST request using the configured dispatch strategy
 // so concurrent calls are spread across all provider connections.
 // No backup fallback, no retry on protocol errors.
-func (c *Client) sendPost(ctx context.Context, payloadBody io.Reader) <-chan Response {
+func (c *Client) sendPost(ctx context.Context, payloadBody io.Reader, target *providerGroup) <-chan Response {
 	respCh := make(chan Response, 1)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	go c.doSendPost(ctx, payloadBody, respCh)
+	go c.doSendPost(ctx, payloadBody, target, respCh)
 	return respCh
 }
 
-func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, respCh chan Response) {
+func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, target *providerGroup, respCh chan Response) {
 	defer close(respCh)
 
 	mains := *c.mainGroups.Load()
+	if target != nil {
+		mains = []*providerGroup{target}
+	}
 	n := len(mains)
 	if n == 0 {
 		respCh <- Response{Err: errors.New("nntp: no main providers")}
