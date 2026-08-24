@@ -37,6 +37,14 @@ type providerStats struct {
 	// math.Float64bits. 0 = no sample yet. Drives speed-aware dispatch weights.
 	speedEWMA atomic.Uint64
 
+	// Escalation circuit breaker. escFruitless counts consecutive escalated
+	// passes that expired without delivering anything; once it reaches
+	// escalationBreakerThreshold, escSuppressedUntil holds the Unix-nanosecond
+	// deadline before which this provider is not escalated again. Any
+	// definitive answer from the provider clears both.
+	escFruitless       atomic.Int32
+	escSuppressedUntil atomic.Int64
+
 	// Quota tracking. quotaBytes is set once at group init (0 = unlimited).
 	quotaBytes    int64
 	quotaUsed     atomic.Int64 // bytes consumed in the current quota period
