@@ -2,10 +2,14 @@ package nntppool
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
@@ -73,7 +77,7 @@ func yencMultiPart(data []byte, fileName string, part, total int, offset int64) 
 	var encoded bytes.Buffer
 	enc, err := rapidyenc.NewEncoder(&encoded, rapidyenc.Meta{
 		FileName:   fileName,
-		FileSize:   int64(len(data)*total), // approximate total
+		FileSize:   int64(len(data) * total), // approximate total
 		PartNumber: int64(part),
 		TotalParts: int64(total),
 		Offset:     offset,
@@ -121,4 +125,48 @@ type mockFeeder struct {
 
 func (m *mockFeeder) Feed(in []byte, out io.Writer) (consumed int, done bool, err error) {
 	return m.feedFunc(in, out)
+}
+
+// slowBodyFactory returns a ConnFactory for a HEALTHY server that answers every
+// BODY with respond() — after `delay`. This is the real-world slow-spool-lookup
+// shape: aged articles have been measured taking ~7.5s to answer on a healthy
+// Newshosting connection while the TTFB EWMA (cache-hot serving) derives a 2s
+// window.
+//
+// Each BODY is answered from its own goroutine so the read loop never blocks on
+// answering, exactly like a real server whose spool lookup runs while the
+// connection stays responsive. (net.Pipe is unbuffered — a server that slept
+// inline would deadlock a client command against its own pending answer.)
+func slowBodyFactory(delay time.Duration, respond func() []byte) ConnFactory {
+	return func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 ready\r\n"))
+			buf := make([]byte, 4096)
+			var wmu sync.Mutex
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				if strings.HasPrefix(string(buf[:n]), "BODY") {
+					go func() {
+						time.Sleep(delay)
+						wmu.Lock()
+						defer wmu.Unlock()
+						_, _ = server.Write(respond())
+					}()
+				}
+			}
+		}()
+		return client, nil
+	}
+}
+
+// noSuchArticle and agedArticle are the two responses the escalation tests need
+// from slowBodyFactory: a definitive 430, and a real article body.
+func noSuchArticle() []byte { return []byte("430 No Such Article\r\n") }
+
+func agedArticle() []byte {
+	return yencSinglePart(bytes.Repeat([]byte("X"), 256), "aged.bin")
 }

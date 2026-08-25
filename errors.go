@@ -18,9 +18,23 @@ import (
 type AttemptTimeoutError struct {
 	Provider string
 	Timeout  time.Duration
-	Phase    string // "dispatch" | "response"
-	Cause    error  // the transport-level error, when the connection's own read deadline noticed first
+	Phase    AttemptPhase
+	Cause    error // the transport-level error, when the connection's own read deadline noticed first
 }
+
+// AttemptPhase names the point in an attempt's life at which its window
+// expired. Typed rather than a bare string so a mistyped phase is a compile
+// error instead of silently disabling escalation.
+type AttemptPhase string
+
+const (
+	// PhaseDispatch: the attempt never reached a connection — the provider is
+	// saturated.
+	PhaseDispatch AttemptPhase = "dispatch"
+	// PhaseResponse: the attempt was sent but no first response byte arrived
+	// within the window. The phase escalation widens the window for.
+	PhaseResponse AttemptPhase = "response"
+)
 
 func (e *AttemptTimeoutError) Error() string {
 	if e.Cause != nil {

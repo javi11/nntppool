@@ -1,45 +1,11 @@
 package nntppool
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"net"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 )
-
-// slowBodyFactory is a HEALTHY provider that genuinely holds the article but
-// needs `delay` before its first response byte — the slow-spool shape that
-// escalation exists to rescue.
-func slowBodyFactory(delay time.Duration) ConnFactory {
-	payload := bytes.Repeat([]byte("X"), 256)
-	return func(ctx context.Context) (net.Conn, error) {
-		client, server := net.Pipe()
-		go func() {
-			_, _ = server.Write([]byte("200 ready\r\n"))
-			buf := make([]byte, 4096)
-			var wmu sync.Mutex
-			for {
-				n, err := server.Read(buf)
-				if err != nil {
-					return
-				}
-				if strings.HasPrefix(string(buf[:n]), "BODY") {
-					go func() {
-						time.Sleep(delay)
-						wmu.Lock()
-						defer wmu.Unlock()
-						_, _ = server.Write(yencSinglePart(payload, "aged.bin"))
-					}()
-				}
-			}
-		}()
-		return client, nil
-	}
-}
 
 // TestEscalationBreakerStopsRepeatedOutageCost: during a sustained outage every
 // request pays base window + the full escalation budget, so a multi-segment
@@ -77,7 +43,7 @@ func TestEscalationBreakerStopsRepeatedOutageCost(t *testing.T) {
 // escalation was added to fix.
 func TestEscalationBreakerKeepsEscalatingWhenItPaysOff(t *testing.T) {
 	c, err := NewClient(context.Background(), []Provider{
-		{Factory: slowBodyFactory(300 * time.Millisecond), Connections: 1, SkipPing: true,
+		{Factory: slowBodyFactory(300*time.Millisecond, agedArticle), Connections: 1, SkipPing: true,
 			AttemptTimeout: 200 * time.Millisecond},
 	})
 	if err != nil {

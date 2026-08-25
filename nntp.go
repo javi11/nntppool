@@ -89,11 +89,6 @@ const (
 	// provider may cost before escalation is suppressed for it.
 	escalationBreakerThreshold = 2
 
-	// escalationBreakerCooldownDefault is how long escalation stays suppressed
-	// for a provider whose escalations proved fruitless, before one half-open
-	// re-probe is allowed.
-	escalationBreakerCooldownDefault = 30 * time.Second
-
 	// minAttemptTimeout is the floor (and default) for the per-attempt timeout
 	// that bounds dispatch + time-to-first-response-byte. Once response bytes
 	// start flowing, the rolling stall timeout takes over instead.
@@ -462,6 +457,16 @@ func (c *NNTPConnection) failOutstanding() {
 	c.failMu.Do(c.drainPending)
 }
 
+// connDiedErr is the connection-death error this connection reports, carrying
+// the provider prefix that isConnectionDeathError and every errors.Is consumer
+// downstream depend on. One definition so the wrapping cannot drift.
+func (c *NNTPConnection) connDiedErr() error {
+	if c.providerName == "" {
+		return ErrConnectionDied
+	}
+	return fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
+}
+
 // drainPending fails every request sitting in the pending queue. Deliberately
 // callable OUTSIDE failOutstanding's once-guard: the writer loop can accept a
 // request from a hot channel and enqueue it into pending AFTER the dying
@@ -471,10 +476,10 @@ func (c *NNTPConnection) failOutstanding() {
 // Concurrent drains are safe: each request is received by exactly one, and
 // failRequest tolerates an already-closed channel.
 func (c *NNTPConnection) drainPending() {
-	connErr := error(ErrConnectionDied)
-	if c.providerName != "" {
-		connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
+	if len(c.pending) == 0 {
+		return // nothing stranded; skip building the wrapped error
 	}
+	connErr := c.connDiedErr()
 	for {
 		select {
 		case req := <-c.pending:
@@ -980,13 +985,10 @@ mainLoop:
 		}
 
 		// Flush buffered writes before blocking on semaphore. A flush failure
-		// means the connection is dead and requests already enqueued into
-		// pending may never be read by anyone — the reader's failOutstanding
-		// sweep can have ALREADY run, so drain here or they strand silently.
+		// means the connection is dead; returning runs Run's defer, which
+		// closes the conn and drains pending so nothing strands.
 		if bw.Buffered() > 0 {
 			if err := bw.Flush(); err != nil {
-				_ = c.conn.Close()
-				c.drainPending()
 				return
 			}
 		}
@@ -999,12 +1001,10 @@ mainLoop:
 		}
 
 		// Flush buffered writes before blocking on channel read. Same
-		// drain-or-strand rule as the flush above.
+		// teardown-on-return rule as the flush above.
 		if bw.Buffered() > 0 {
 			if err := bw.Flush(); err != nil {
 				<-c.inflightSem
-				_ = c.conn.Close()
-				c.drainPending()
 				return
 			}
 		}
@@ -1152,11 +1152,7 @@ mainLoop:
 				// connection at once); a bare return stranded it silently
 				// until the caller's whole attempt window expired.
 				<-c.inflightSem
-				connErr := error(ErrConnectionDied)
-				if c.providerName != "" {
-					connErr = fmt.Errorf("%s: %w", c.providerName, ErrConnectionDied)
-				}
-				failRequest(req.RespCh, connErr)
+				failRequest(req.RespCh, c.connDiedErr())
 				return
 			}
 		}
@@ -1411,8 +1407,7 @@ func (c *NNTPConnection) readerLoop() {
 		// If we hit a timeout, cancellation-related network error, or protocol
 		// desync, close the connection so the pool replaces it with a fresh one.
 		if resp.Err != nil {
-			var ne net.Error
-			if errors.As(resp.Err, &ne) && ne.Timeout() {
+			if isTimeoutErr(resp.Err) {
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
@@ -1490,11 +1485,6 @@ func WithStatProbe(enabled bool) ClientOption {
 func WithSpeedAwareDispatch(enabled bool) ClientOption {
 	return func(cfg *clientConfig) { cfg.speedAwareOff = !enabled }
 }
-
-// escalationBreakerCooldown is the live escalation-breaker cooldown. A var
-// rather than a const so tests can shorten it; not exported, so callers cannot
-// depend on tuning it.
-var escalationBreakerCooldown = escalationBreakerCooldownDefault
 
 // Provider describes a single NNTP server with its own credentials and connection count.
 type Provider struct {
@@ -1617,6 +1607,23 @@ func (g *providerGroup) attemptTimeout() time.Duration {
 	return d
 }
 
+// windowOr resolves an attempt window: a positive d is used as-is, anything
+// else means "the provider's adaptive window". The single definition of the
+// zero-means-default convention that both tryGroupTimeout and
+// tryGroupResilient sit on.
+func (g *providerGroup) windowOr(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return g.attemptTimeout()
+}
+
+// escalationBreakerCooldown is how long escalation stays suppressed for a
+// provider whose escalations proved fruitless, before one half-open re-probe is
+// allowed. A var rather than a const so tests can shorten it; not exported, so
+// callers cannot depend on tuning it.
+var escalationBreakerCooldown = 30 * time.Second
+
 // escalationSuppressed reports whether this provider's escalation breaker is
 // open: escalating it has repeatedly cost a full budget and delivered nothing,
 // so the widened window is not worth re-paying yet. The breaker is half-open —
@@ -1639,9 +1646,31 @@ func (g *providerGroup) noteEscalationFruitless(now time.Time) {
 // resetEscalationBreaker clears the breaker after the provider answers
 // definitively — including a body delivered on an escalated window, which is
 // exactly the slow-spool case escalation exists to serve.
+// Load-guarded: this runs on every definitive answer (every successful body),
+// and providerStats is shared by all of the provider's connections — an
+// unconditional store would take that cache line exclusive on each download to
+// rewrite a zero with a zero.
 func (g *providerGroup) resetEscalationBreaker() {
-	g.stats.escFruitless.Store(0)
-	g.stats.escSuppressedUntil.Store(0)
+	if g.stats.escFruitless.Load() != 0 {
+		g.stats.escFruitless.Store(0)
+	}
+	if g.stats.escSuppressedUntil.Load() != 0 {
+		g.stats.escSuppressedUntil.Store(0)
+	}
+}
+
+// escalationWindow reports the window this provider should be re-asked at in
+// an escalated pass, given the window it already expired at (prev) and the
+// pass's remaining shared budget. ok is false when escalating it would buy
+// nothing: it answered definitively, its breaker is open, or the budget cannot
+// out-wait the window it just expired against. The single definition of
+// "may this provider be escalated?", consulted both when deciding to escalate
+// at all and when running the escalated pass.
+func (g *providerGroup) escalationWindow(prev, budget time.Duration, now time.Time) (time.Duration, bool) {
+	if prev == 0 || budget <= prev || g.escalationSuppressed(now) {
+		return 0, false
+	}
+	return budget, true
 }
 
 // isQuotaExceeded reports whether this provider has consumed its download quota
@@ -2104,9 +2133,7 @@ func (c *Client) raceCandidates(
 			return false, true, lastErr
 		}
 		if !ok {
-			if resp.Err != nil {
-				lastErr = resp.Err // expired attempts keep their reason
-			}
+			keepErr(&lastErr, resp)
 			return false, false, lastErr
 		}
 		if resp.Err != nil {
@@ -2150,9 +2177,7 @@ func (c *Client) raceCandidates(
 			continue
 		}
 		if !pr.ok {
-			if pr.resp.Err != nil {
-				lastErr = pr.resp.Err // expired probes keep their reason
-			}
+			keepErr(&lastErr, pr.resp)
 			continue
 		}
 		if pr.resp.Err != nil {
@@ -2196,9 +2221,7 @@ func (c *Client) raceCandidates(
 		return false, true, lastErr
 	}
 	if !ok {
-		if resp.Err != nil {
-			lastErr = resp.Err // expired attempts keep their reason
-		}
+		keepErr(&lastErr, resp)
 		return false, false, lastErr
 	}
 	if resp.Err != nil {
@@ -2269,7 +2292,7 @@ func (c *Client) tryGroup(
 	onMeta func(YEncMeta),
 	priority bool,
 ) (resp Response, ok bool, done bool) {
-	return c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, g.attemptTimeout())
+	return c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, 0)
 }
 
 // tryGroupTimeout is tryGroup with an explicit attempt window — the seam that
@@ -2284,6 +2307,7 @@ func (c *Client) tryGroupTimeout(
 	priority bool,
 	attemptTimeout time.Duration,
 ) (resp Response, ok bool, done bool) {
+	attemptTimeout = g.windowOr(attemptTimeout)
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
 
@@ -2325,7 +2349,7 @@ func (c *Client) tryGroupTimeout(
 			// Could not be dispatched within the attempt window: the provider
 			// is saturated. Fail over — with the reason preserved, so the
 			// terminal error names the saturation instead of arriving bare.
-			return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: "dispatch"}}, false, false
+			return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseDispatch}}, false, false
 		case coldCh <- req:
 		}
 	}
@@ -2351,7 +2375,7 @@ func (c *Client) tryGroupTimeout(
 				reqCancel()
 				// done only when the caller's or the pool's context was
 				// cancelled (true shutdown), not on a plain attempt timeout.
-				return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: "response"}}, false, ctx.Err() != nil || c.ctx.Err() != nil
+				return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseResponse}}, false, ctx.Err() != nil || c.ctx.Err() != nil
 			}
 			// Reader already committed (first byte arrived): the body is
 			// streaming. Do not fail over; keep waiting for it to finish. The
@@ -2472,10 +2496,7 @@ func (c *Client) tryGroupResilient(
 	// TTFB EWMA — dominated by cache-hot serving — derives a 2s window) at
 	// least as often as it is dead infrastructure. Failover order is
 	// untouched: within a pass a quiet provider still costs one base window.
-	timeout := window
-	if timeout <= 0 {
-		timeout = g.attemptTimeout()
-	}
+	timeout := g.windowOr(window)
 	for r := 0; ; r++ {
 		resp, ok, cancelled = c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, timeout)
 		if cancelled {
@@ -2494,7 +2515,7 @@ func (c *Client) tryGroupResilient(
 			// pass — answers the same question wider instead.
 			var at *AttemptTimeoutError
 			if !errors.As(resp.Err, &at) {
-				resp.Err = &AttemptTimeoutError{Provider: g.name, Timeout: timeout, Phase: "response", Cause: resp.Err}
+				resp.Err = &AttemptTimeoutError{Provider: g.name, Timeout: timeout, Phase: PhaseResponse, Cause: resp.Err}
 			}
 			return resp, false, false
 		}
@@ -2515,14 +2536,42 @@ func (c *Client) tryGroupResilient(
 	}
 }
 
+// responseExpiry returns the response-phase attempt timeout err carries, if
+// any. The single definition of "this attempt expired awaiting its first
+// response byte" — both the failover check and the escalation bookkeeping
+// (which also needs the expired window) read it through here.
+func responseExpiry(err error) (*AttemptTimeoutError, bool) {
+	var at *AttemptTimeoutError
+	if errors.As(err, &at) && at.Phase == PhaseResponse {
+		return at, true
+	}
+	return nil, false
+}
+
+// isTimeoutErr reports whether err is a transport-level timeout. Distinct from
+// isConnectionDeathError, which treats any net.Error as a dead socket.
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// keepErr preserves a failover attempt's reason in dst. An attempt that fails
+// over (!ok) may now carry a typed reason; dropping it is what made an
+// all-attempts-expired request surface as a bare "all providers exhausted".
+func keepErr(dst *error, resp Response) {
+	if resp.Err != nil {
+		*dst = resp.Err
+	}
+}
+
 // expiredAwaitingResponse reports whether an attempt died awaiting its first
 // response byte — whichever side noticed first: the attempt timer (ok=false,
 // typed error) or the connection's own read deadline (ok=true, a transport
 // timeout on a request whose reader never committed).
 func expiredAwaitingResponse(resp Response, ok bool) bool {
 	if !ok {
-		var at *AttemptTimeoutError
-		return errors.As(resp.Err, &at) && at.Phase == "response"
+		_, expired := responseExpiry(resp.Err)
+		return expired
 	}
 	// Anything short of committed counts: the attempt timer may have CASed
 	// pending→abandoned in the same instant the reader delivered its deadline
@@ -2530,8 +2579,7 @@ func expiredAwaitingResponse(resp Response, ok bool) bool {
 	if resp.Err == nil || resp.Request == nil || resp.Request.attemptState.Load() == attemptCommitted {
 		return false
 	}
-	var ne net.Error
-	return errors.As(resp.Err, &ne) && ne.Timeout()
+	return isTimeoutErr(resp.Err)
 }
 
 func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool) {
@@ -2599,14 +2647,31 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	// maxAttemptTimeout), so a server that needs 7s to say 430 gets heard
 	// while a genuinely hung pool costs at most one budget of extra latency,
 	// however many providers it holds.
-	expiredWin := make([]time.Duration, n) // widest response-phase expiry per provider; 0 = none
+	// expiredWin holds each provider's response-phase expiry window (0 = none),
+	// keyed by index into mains. Allocated only once escalation is actually in
+	// play — the pathological case — so the common download path stays
+	// allocation-free here.
+	var expiredWin []time.Duration
+	var widest time.Duration // widest expiry seen this pass; 0 = none
 	escalated := false
 	var budget time.Duration
+	// One clock read per pass, taken when the pass is decided on, rather than
+	// one per provider inside it.
+	var now time.Time
 	for {
-		sawExpired, sawOther := false, false
+		sawOther := false
 		for attempt := range n {
 			idx := (start + attempt) % n
 			g := mains[idx]
+			var window time.Duration // 0 = the provider's base window
+			if escalated {
+				// Cheapest discriminator first: a provider that answered
+				// definitively in pass 0 needs no re-filtering at all.
+				var mayEscalate bool
+				if window, mayEscalate = g.escalationWindow(expiredWin[idx], budget, now); !mayEscalate {
+					continue
+				}
+			}
 			if hostSkipped(g.skipID, &skipHosts, skipCount) {
 				continue
 			}
@@ -2615,20 +2680,10 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				sawOther = true
 				continue
 			}
-			var window time.Duration // 0 = the provider's base window
+			var attemptStart time.Time
 			if escalated {
-				if expiredWin[idx] == 0 {
-					continue // answered definitively in pass 0 — nothing to re-ask
-				}
-				if g.escalationSuppressed(time.Now()) {
-					continue // breaker open: escalating this provider has proven fruitless
-				}
-				window = min(budget, maxAttemptTimeout)
-				if window <= expiredWin[idx] {
-					continue // cannot out-wait the window that already expired
-				}
+				attemptStart = time.Now()
 			}
-			attemptStart := time.Now()
 			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, window)
 			if escalated {
 				budget -= time.Since(attemptStart)
@@ -2647,18 +2702,23 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				// used to surface as a BARE "all providers exhausted", which
 				// reads as total infrastructure death and hides the one thread
 				// worth pulling (the per-attempt timeout).
-				if resp.Err != nil {
-					lastErr = resp.Err
-				}
-				var at *AttemptTimeoutError
-				if errors.As(resp.Err, &at) && at.Phase == "response" {
-					sawExpired = true
-					expiredWin[idx] = max(expiredWin[idx], at.Timeout)
+				keepErr(&lastErr, resp)
+				if at, expired := responseExpiry(resp.Err); expired {
+					if expiredWin == nil {
+						expiredWin = make([]time.Duration, n)
+					}
+					// Each idx is visited at most once per pass, so this is an
+					// assignment, not an accumulation.
+					expiredWin[idx] = at.Timeout
+					widest = max(widest, at.Timeout)
 					if escalated {
 						// A widened window bought nothing. Enough of these in a
 						// row and this provider stops being escalated, so a
 						// sustained outage costs one base window per request
 						// again instead of re-paying the budget every time.
+						// Real clock, not the pass's hoisted `now`: this
+						// STORES a future deadline, and the pass may have been
+						// decided on a whole budget ago.
 						g.noteEscalationFruitless(time.Now())
 					}
 				} else {
@@ -2743,18 +2803,19 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		// window is already at maxAttemptTimeout there is nothing wider to
 		// ask, and re-running an identical pass would buy latency, not
 		// information.
-		if escalated || !sawExpired || sawOther {
+		if escalated || widest == 0 || sawOther {
 			break
 		}
-		var widest time.Duration
-		for _, w := range expiredWin {
-			widest = max(widest, w)
-		}
 		budget = min(escalationFactor*widest, maxAttemptTimeout)
+		// Only escalate if the budget can actually widen at least one
+		// provider's window: when every base window already sits at
+		// maxAttemptTimeout there is nothing wider to ask, and re-running an
+		// identical pass would buy latency, not information. Same predicate
+		// the escalated pass applies per provider, so the two cannot drift.
+		now = time.Now()
 		grows := false
-		now := time.Now()
 		for i, w := range expiredWin {
-			if w > 0 && w < budget && !mains[i].escalationSuppressed(now) {
+			if _, ok := mains[i].escalationWindow(w, budget, now); ok {
 				grows = true
 				break
 			}
@@ -2806,9 +2867,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				return
 			}
 			if !ok {
-				if resp.Err != nil {
-					lastErr = resp.Err // expired attempts keep their reason (see the mains loop)
-				}
+				keepErr(&lastErr, resp)
 				continue
 			}
 			if resp.Err != nil {
