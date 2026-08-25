@@ -424,6 +424,88 @@ func TestPostYenc_MultiPart(t *testing.T) {
 	}
 }
 
+func TestPostYencTo_TargetsNamedBackupProvider(t *testing.T) {
+	var primaryReceived bytes.Buffer
+	var backupReceived bytes.Buffer
+
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Name:        "primary",
+			Host:        "primary.example:119",
+			Factory:     makePostFactory(t, []string{"340 send article", "240 article posted ok"}, &primaryReceived),
+			Connections: 1,
+		},
+		{
+			Name:        "backup",
+			Host:        "backup.example:119",
+			Factory:     makePostFactory(t, []string{"340 send article", "240 article posted ok"}, &backupReceived),
+			Connections: 1,
+			Backup:      true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient error: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	headers := PostHeaders{
+		From:       "user@example.com",
+		Subject:    "targeted yEnc test",
+		Newsgroups: []string{"alt.binaries.test"},
+		MessageID:  "<targeted-yenc-test@example.com>",
+	}
+	data := bytes.Repeat([]byte("ABCDEFGHIJ"), 100)
+	meta := rapidyenc.Meta{
+		FileName:   "test.bin",
+		FileSize:   int64(len(data)),
+		PartNumber: 1,
+		TotalParts: 1,
+		PartSize:   int64(len(data)),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := c.PostYencTo(ctx, "backup", headers, bytes.NewReader(data), meta)
+	if err != nil {
+		t.Fatalf("PostYencTo error: %v", err)
+	}
+	if result.StatusCode != 240 {
+		t.Errorf("StatusCode = %d, want 240", result.StatusCode)
+	}
+	if primaryReceived.Len() != 0 {
+		t.Errorf("primary provider unexpectedly received %d bytes", primaryReceived.Len())
+	}
+	if !strings.Contains(backupReceived.String(), "=ybegin") {
+		t.Error("backup provider did not receive the article")
+	}
+}
+
+func TestPostYencTo_ProviderNotFound(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Host:        "primary.example:119",
+			Factory:     makePostFactory(t, []string{"340 send article", "240 article posted ok"}, nil),
+			Connections: 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient error: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	_, err = c.PostYencTo(
+		context.Background(),
+		"missing.example:119",
+		PostHeaders{},
+		bytes.NewReader(nil),
+		rapidyenc.Meta{},
+	)
+	if err == nil || !strings.Contains(err.Error(), `provider "missing.example:119" not found`) {
+		t.Fatalf("PostYencTo error = %v, want provider not found", err)
+	}
+}
+
 // --- NNTPConnection-level POST test ---
 
 func TestNNTPConnection_PostTwoPhase(t *testing.T) {

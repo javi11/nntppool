@@ -404,6 +404,13 @@ if errors.Is(err, nntppool.ErrPostingNotPermitted) {
 }
 ```
 
+Use `PostYencTo` with a provider's stable configured `Name` to post to a
+specific main or backup provider without fallback:
+
+```go
+result, err := client.PostYencTo(ctx, "uploads", headers, bytes.NewReader(data), meta)
+```
+
 ### Low-level raw send
 
 For NNTP commands not covered by the high-level API, use `Send` directly:
@@ -740,9 +747,10 @@ The `onMeta` optional callback is called once `=ybegin`/`=ypart` is fully parsed
 
 ```go
 func (c *Client) PostYenc(ctx context.Context, headers PostHeaders, body io.Reader, meta rapidyenc.Meta) (*PostResult, error)
+func (c *Client) PostYencTo(ctx context.Context, provider string, headers PostHeaders, body io.Reader, meta rapidyenc.Meta) (*PostResult, error)
 ```
 
-yEnc-encodes `body` on the fly and posts using the two-phase NNTP POST protocol. Uses the same dispatch strategy as normal requests. The body reader is consumed exactly once.
+yEnc-encodes `body` on the fly and posts using the two-phase NNTP POST protocol. `PostYenc` uses the configured dispatch strategy; `PostYencTo` restricts the request to the named main or backup provider without fallback. The provider's configured `Name` is preferred; the derived provider name remains available when `Name` is empty. The body reader is consumed exactly once.
 
 ### Low-level send
 
