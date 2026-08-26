@@ -328,6 +328,14 @@ func (c *Client) PostYencTo(ctx context.Context, provider string, headers PostHe
 
 func (c *Client) postYenc(ctx context.Context, headers PostHeaders, body io.Reader, meta rapidyenc.Meta, target *providerGroup) (*PostResult, error) {
 	pr, pw := io.Pipe()
+	// Ensure the read side is always closed when postYenc returns. If
+	// doSendPost fails before any connection ever reads pr (e.g. zero main
+	// providers), the pipe-writer goroutine below would otherwise block
+	// forever inside a write to pw, since closing only the write side does
+	// not unblock a write still waiting for a reader. On the success path
+	// this is a no-op: by the time finishPost returns, the connection has
+	// already read pr to EOF, so this Close has no effect on anything.
+	defer func() { _ = pr.CloseWithError(errors.New("nntp: post abandoned")) }()
 	go func() {
 		var err error
 		defer func() { _ = pw.CloseWithError(err) }()
@@ -393,15 +401,17 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, target *
 			}
 		}
 	default: // DispatchRoundRobin
-		var cumWeights [8]int
-		totalW := 0
-		for i, g := range mains {
-			avail := max(1, int(g.gate.available.Load()))
-			totalW += avail
-			cumWeights[i] = totalW
+		// Dynamic weighted round-robin, sized to the actual provider count
+		// (no fixed-size array to overflow past 8 main providers).
+		cumWeights, totalW := dispatchWeights(mains, c.speedAware)
+		if totalW == 0 {
+			// All providers are quota-exceeded; start at 0 and let the main
+			// loop below surface the failure for each.
+			start = 0
+		} else {
+			slot := int(c.nextIdx.Add(1) % uint64(totalW))
+			start = sort.SearchInts(cumWeights, slot+1)
 		}
-		slot := int(c.nextIdx.Add(1) % uint64(totalW))
-		start = sort.SearchInts(cumWeights[:n], slot+1)
 	}
 
 	var lastErr error
@@ -438,7 +448,33 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, target *
 			}
 		}
 
-		resp, ok := <-innerCh
+		// Guard the response wait the same way the send side above is
+		// guarded: g.reqCh is buffered (make(chan *Request, p.Connections)),
+		// so the send just above can succeed even when no connection is
+		// currently reading it — e.g. a provider whose dial is permanently
+		// stalled. In that case innerCh is never written to or closed, and
+		// an unguarded `<-innerCh` would block forever, ignoring ctx and
+		// c.ctx entirely. Select on both so this attempt bails out with the
+		// caller's context error instead of hanging.
+		//
+		// If we give up here, req may still be sitting in g.reqCh's buffer
+		// (or a connection may already be about to write to innerCh). That's
+		// safe to abandon: innerCh is a buffered chan Response (size 1), so a
+		// later write from the connection side (the `select ... default`
+		// send in nntp.go before safeClose(req.RespCh)) never blocks even
+		// though nobody is receiving anymore, and safeClose recovers from a
+		// double-close panic. No goroutine is leaked and nothing panics.
+		var resp Response
+		var ok bool
+		select {
+		case resp, ok = <-innerCh:
+		case <-c.ctx.Done():
+			respCh <- Response{Err: c.ctx.Err()}
+			return
+		case <-ctx.Done():
+			respCh <- Response{Err: ctx.Err()}
+			return
+		}
 		if !ok {
 			continue
 		}
