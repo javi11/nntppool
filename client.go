@@ -328,6 +328,9 @@ func (c *Client) PostYencTo(ctx context.Context, provider string, headers PostHe
 
 func (c *Client) postYenc(ctx context.Context, headers PostHeaders, body io.Reader, meta rapidyenc.Meta, target *providerGroup) (*PostResult, error) {
 	pr, pw := io.Pipe()
+	// Unblocks the writer goroutine below if pr is never read (e.g. dispatch
+	// never reaches a connection); no-op once the body has been read to EOF.
+	defer func() { _ = pr.CloseWithError(errors.New("nntp: post abandoned")) }()
 	go func() {
 		var err error
 		defer func() { _ = pw.CloseWithError(err) }()
@@ -393,15 +396,14 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, target *
 			}
 		}
 	default: // DispatchRoundRobin
-		var cumWeights [8]int
-		totalW := 0
-		for i, g := range mains {
-			avail := max(1, int(g.gate.available.Load()))
-			totalW += avail
-			cumWeights[i] = totalW
+		// Sized to len(mains), unlike a fixed-size array — never overflows.
+		cumWeights, totalW := dispatchWeights(mains, c.speedAware)
+		if totalW == 0 {
+			start = 0 // all providers quota-exceeded; let the loop below fail each
+		} else {
+			slot := int(c.nextIdx.Add(1) % uint64(totalW))
+			start = sort.SearchInts(cumWeights, slot+1)
 		}
-		slot := int(c.nextIdx.Add(1) % uint64(totalW))
-		start = sort.SearchInts(cumWeights[:n], slot+1)
 	}
 
 	var lastErr error
@@ -438,7 +440,22 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, target *
 			}
 		}
 
-		resp, ok := <-innerCh
+		// g.reqCh is buffered, so the send above can succeed with no
+		// connection reading it (e.g. a stalled dial) — guard the receive on
+		// ctx too, or it blocks forever. Abandoning innerCh here is safe: a
+		// late write from the connection side is non-blocking and its close
+		// is panic-safe (see safeClose in nntp.go).
+		var resp Response
+		var ok bool
+		select {
+		case resp, ok = <-innerCh:
+		case <-c.ctx.Done():
+			respCh <- Response{Err: c.ctx.Err()}
+			return
+		case <-ctx.Done():
+			respCh <- Response{Err: ctx.Err()}
+			return
+		}
 		if !ok {
 			continue
 		}
