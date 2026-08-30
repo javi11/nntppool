@@ -38,7 +38,8 @@ func (c *Client) statCapacity() int {
 	return min(max(total, minStatConcurrency), maxStatConcurrency)
 }
 
-// StatManyResult is the per-message outcome streamed by StatMany and StatAsync.
+// StatManyResult is the per-message outcome streamed by StatMany, StatStream
+// and StatAsync.
 // A genuine miss (article not found, NNTP 430/423) is reported as
 // Err == ErrArticleNotFound with a nil Result — it is a normal outcome of an
 // existence sweep, not a fatal error.
@@ -48,7 +49,7 @@ type StatManyResult struct {
 	Err       error
 }
 
-// StatManyOptions tunes a StatMany sweep.
+// StatManyOptions tunes a StatMany or StatStream sweep.
 type StatManyOptions struct {
 	// Concurrency bounds the number of STATs outstanding across the whole pool
 	// at once. <= 0 derives the bound from the pool's aggregate STAT pipeline
@@ -74,16 +75,61 @@ type StatManyOptions struct {
 // reported. If ctx is cancelled mid-sweep, dispatch stops, in-flight checks are
 // cancelled, and the channel is closed; message-ids not yet dispatched produce
 // no result, so callers should check ctx.Err() after draining.
+//
+// Every id is committed up front. A caller that decides mid-sweep to abandon
+// work — an availability sweep that has already condemned a file, say — wants
+// StatStream instead, which asks for each id only when it is about to run.
 func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatManyOptions) <-chan StatManyResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = c.statCapacity()
+	}
+	// The length is known here, so cap the pool at it: a sweep of 3 ids has no
+	// use for statCapacity() workers.
+	if len(messageIDs) > 0 && opts.Concurrency > len(messageIDs) {
+		opts.Concurrency = len(messageIDs)
+	}
+
+	ids := make(chan string)
+	go func() {
+		defer close(ids)
+		for _, id := range messageIDs {
+			select {
+			case ids <- id:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return c.StatStream(ctx, ids, opts)
+}
+
+// StatStream is StatMany fed by a channel rather than a slice, so the caller
+// decides whether an id is still worth checking at the moment it would be
+// dispatched rather than when the sweep is planned. A sweep that abandons work
+// as verdicts arrive — a file already past its acceptable-missing threshold, a
+// release already known dead — then stops paying for the ids it no longer
+// needs, at single-id granularity and independently of Concurrency.
+//
+// Backpressure runs the other way too: receives from ids only happen as
+// workers free up, so a caller blocked sending an id knows Concurrency checks
+// are already outstanding.
+//
+// One StatManyResult is produced per id received. The result channel closes
+// once ids is closed and every check has reported, or once ctx is cancelled —
+// ids received before cancellation may go unreported, so check ctx.Err() after
+// draining. The caller owns ids and must close it; a caller still blocked
+// sending on it when ctx is cancelled is released by the same cancellation.
+func (c *Client) StatStream(ctx context.Context, ids <-chan string, opts StatManyOptions) <-chan StatManyResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	conc := opts.Concurrency
 	if conc <= 0 {
 		conc = c.statCapacity()
-	}
-	if conc > len(messageIDs) && len(messageIDs) > 0 {
-		conc = len(messageIDs)
 	}
 
 	out := make(chan StatManyResult, conc)
@@ -102,37 +148,51 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 	go func() {
 		defer close(out)
 
-		// A fixed pool rather than a goroutine per message-id: conc bounds how
-		// many STATs may be outstanding either way, so spawning per id only
-		// adds a goroutine and a stack per article on the one workload whose
-		// defining trait is article count.
-		ids := make(chan string)
+		work := make(chan string)
 		var wg sync.WaitGroup
-		wg.Add(conc)
-		for range conc {
-			go func() {
-				defer wg.Done()
-				for id := range ids {
-					res := c.statOne(ctx, id, target, targetErr, opts.Priority)
-					select {
-					case out <- res:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}()
-		}
+		workers := 0
 
 	dispatch:
-		for _, id := range messageIDs {
+		for {
+			var id string
+			var ok bool
 			select {
 			case <-ctx.Done():
 				break dispatch
-			case ids <- id:
+			case id, ok = <-ids:
+				if !ok {
+					break dispatch
+				}
+			}
+
+			// Grow the pool on demand up to conc. A stream has no length to
+			// size from, and conc is the pool's whole STAT capacity by
+			// default, so spawning eagerly would cost thousands of goroutines
+			// to check a handful of ids.
+			if workers < conc {
+				workers++
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for id := range work {
+						res := c.statOne(ctx, id, target, targetErr, opts.Priority)
+						select {
+						case out <- res:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}()
+			}
+
+			select {
+			case <-ctx.Done():
+				break dispatch
+			case work <- id:
 			}
 		}
-		close(ids)
 
+		close(work)
 		wg.Wait()
 	}()
 

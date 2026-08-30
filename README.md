@@ -314,12 +314,42 @@ fmt.Printf("availability: %d/%d present\n", have, have+missing)
 
 | Field | Description |
 |-------|-------------|
-| `Concurrency` | Max STATs outstanding across the whole pool at once (0 ⇒ 64). |
+| `Concurrency` | Max STATs outstanding across the whole pool at once (0 ⇒ the pool's aggregate STAT capacity: Σ `Connections` × `StatInflight`, clamped to [64, 4096]). |
 | `Priority` | Route each STAT through the priority queue. |
 | `Provider` | Restrict every STAT to one named provider group (per-provider availability audit). Empty ⇒ pool-wide with the same failover as `Stat`. |
 
 If `ctx` is cancelled mid-sweep, dispatch stops and in-flight checks are cancelled;
 IDs not yet dispatched produce no result, so check `ctx.Err()` after draining.
+
+#### Deciding what to check as you go
+
+`StatMany` commits to every ID up front. When the sweep's own results determine
+whether the remaining IDs are still worth checking — an availability sweep that
+has already condemned a file, a release probe that has seen enough misses —
+`StatStream` takes a channel instead, and only receives from it as workers free
+up. An ID is committed at the moment it would run, so abandoned work never
+reaches the wire, at single-ID granularity and independently of `Concurrency`:
+
+```go
+ids := make(chan string)
+go func() {
+    defer close(ids)
+    for _, seg := range segments {
+        if settled(seg.File) { // verdict already reached; don't spend a STAT
+            continue
+        }
+        ids <- seg.MessageID
+    }
+}()
+
+for r := range client.StatStream(ctx, ids, nntppool.StatManyOptions{}) {
+    record(r) // may flip settled() for later segments
+}
+```
+
+The send blocks while `Concurrency` checks are outstanding, so the loop above is
+also the backpressure signal. The caller owns `ids` and must close it; a send
+still blocked when `ctx` is cancelled is released by that cancellation.
 
 #### Tuning STAT throughput
 
@@ -740,6 +770,7 @@ Provider names default to `host:port` or `host:port+username` (when auth is set)
 | `StatPriority` | `(ctx, messageID) (*StatResult, error)` | Like `Stat` but dispatched via the priority queue |
 | `StatAsync` | `(ctx, messageID) <-chan StatManyResult` | Non-blocking single existence check; channel receives exactly one result |
 | `StatMany` | `(ctx, messageIDs, StatManyOptions) <-chan StatManyResult` | Concurrent bulk existence check; streams one result per ID as it completes |
+| `StatStream` | `(ctx, <-chan string, StatManyOptions) <-chan StatManyResult` | Like `StatMany`, but fed by a channel so IDs are committed at dispatch time |
 
 The `onMeta` optional callback is called once `=ybegin`/`=ypart` is fully parsed (before any body bytes), enabling pre-allocation or filename routing.
 
