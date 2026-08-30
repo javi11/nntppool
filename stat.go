@@ -102,29 +102,36 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 	go func() {
 		defer close(out)
 
-		sem := make(chan struct{}, conc)
+		// A fixed pool rather than a goroutine per message-id: conc bounds how
+		// many STATs may be outstanding either way, so spawning per id only
+		// adds a goroutine and a stack per article on the one workload whose
+		// defining trait is article count.
+		ids := make(chan string)
 		var wg sync.WaitGroup
+		wg.Add(conc)
+		for range conc {
+			go func() {
+				defer wg.Done()
+				for id := range ids {
+					res := c.statOne(ctx, id, target, targetErr, opts.Priority)
+					select {
+					case out <- res:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+		}
 
 	dispatch:
 		for _, id := range messageIDs {
 			select {
 			case <-ctx.Done():
 				break dispatch
-			case sem <- struct{}{}:
+			case ids <- id:
 			}
-
-			wg.Add(1)
-			go func(id string) {
-				defer wg.Done()
-				defer func() { <-sem }()
-
-				res := c.statOne(ctx, id, target, targetErr, opts.Priority)
-				select {
-				case out <- res:
-				case <-ctx.Done():
-				}
-			}(id)
 		}
+		close(ids)
 
 		wg.Wait()
 	}()
@@ -134,7 +141,7 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 
 // statOne performs a single STAT and maps it to a StatManyResult. When target is
 // set the check is confined to that provider group; otherwise it uses the
-// pool-wide failover path (Send/SendPriority).
+// pool-wide failover path.
 func (c *Client) statOne(ctx context.Context, messageID string, target *providerGroup, targetErr error, priority bool) StatManyResult {
 	if targetErr != nil {
 		return StatManyResult{MessageID: messageID, Err: targetErr}
@@ -143,13 +150,10 @@ func (c *Client) statOne(ctx context.Context, messageID string, target *provider
 	payload := statPayload(messageID)
 
 	var resp Response
-	switch {
-	case target != nil:
+	if target != nil {
 		resp = c.statViaGroup(ctx, target, payload, priority)
-	case priority:
-		resp = <-c.SendPriority(ctx, payload, nil)
-	default:
-		resp = <-c.Send(ctx, payload, nil)
+	} else {
+		resp = c.sendSync(ctx, payload, priority)
 	}
 
 	result, err := parseStat(messageID, resp)

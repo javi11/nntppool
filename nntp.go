@@ -444,6 +444,36 @@ func isCheapCommand(payload []byte) bool {
 	return bytes.HasPrefix(payload, statCmdPrefix)
 }
 
+// tryNextRequest performs a non-blocking receive across the request channels,
+// preserving the preference order of the blocking select the writer falls back
+// to: hot channels first, so a request lands on an already-connected slot
+// rather than waking a cold one, then priority and normal with no bias between
+// them. Receives from nil channels are never ready, so the standalone path
+// (prioCh and the hot channels nil) probes reqCh alone.
+//
+// got reports whether any channel was ready; ok is false when the channel that
+// fired was closed.
+func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
+	select {
+	case req, ok = <-c.hotPrioCh:
+		return req, ok, true
+	default:
+	}
+	select {
+	case req, ok = <-c.hotReqCh:
+		return req, ok, true
+	default:
+	}
+	select {
+	case req, ok = <-c.prioCh:
+		return req, ok, true
+	case req, ok = <-c.reqCh:
+		return req, ok, true
+	default:
+	}
+	return nil, false, false
+}
+
 func failRequest(ch chan Response, err error) {
 	defer func() { _ = recover() }()
 	select {
@@ -826,9 +856,20 @@ func (c *NNTPConnection) Run() {
 		c.cancel()
 	}()
 
-	// Buffered writer coalesces multiple small BODY commands into fewer
-	// write syscalls when inflight > 1. Flushed before any blocking op.
+	// Buffered writer coalesces pipelined commands into fewer write syscalls.
+	// It only pays off if the buffer is allowed to fill, so the loop below
+	// flushes at the moment it is about to block and not before: a run of
+	// commands queued behind one another leaves in a single write, which under
+	// TLS is a single record rather than 29 bytes of framing per command.
 	bw := bufio.NewWriterSize(c.conn, 4096)
+
+	// flushBuffered empties the write buffer, if anything is in it.
+	flushBuffered := func() error {
+		if bw.Buffered() == 0 {
+			return nil
+		}
+		return bw.Flush()
+	}
 
 	// Cached write deadline state to avoid redundant SetWriteDeadline syscalls.
 	var lastWriteDL time.Time
@@ -956,10 +997,8 @@ func (c *NNTPConnection) Run() {
 
 mainLoop:
 	// Flush any buffered writes before blocking.
-	if bw.Buffered() > 0 {
-		if err := bw.Flush(); err != nil {
-			return
-		}
+	if err := flushBuffered(); err != nil {
+		return
 	}
 
 	// Set up idle timer (nil if no idle timeout configured).
@@ -984,27 +1023,21 @@ mainLoop:
 		default:
 		}
 
-		// Flush buffered writes before blocking on semaphore. A flush failure
-		// means the connection is dead; returning runs Run's defer, which
-		// closes the conn and drains pending so nothing strands.
-		if bw.Buffered() > 0 {
-			if err := bw.Flush(); err != nil {
-				return
-			}
-		}
-
-		// wait until we have inflight capacity
+		// Acquire inflight capacity. The non-blocking attempt comes first so
+		// that a writer with commands still to send does not flush: only when
+		// the pipeline is genuinely full is the buffer drained and the writer
+		// parked. A flush failure means the connection is dead; returning runs
+		// Run's defer, which closes the conn and drains pending so nothing
+		// strands.
 		select {
 		case c.inflightSem <- struct{}{}:
-		case <-c.ctx.Done():
-			return
-		}
-
-		// Flush buffered writes before blocking on channel read. Same
-		// teardown-on-return rule as the flush above.
-		if bw.Buffered() > 0 {
-			if err := bw.Flush(); err != nil {
-				<-c.inflightSem
+		default:
+			if err := flushBuffered(); err != nil {
+				return
+			}
+			select {
+			case c.inflightSem <- struct{}{}:
+			case <-c.ctx.Done():
 				return
 			}
 		}
@@ -1014,38 +1047,20 @@ mainLoop:
 		// prefer already-connected connections over waking cold slots.
 		// When hotReqCh/hotPrioCh are nil (standalone path), receives
 		// from nil channels block forever in select and are excluded.
-		var req *Request
-		var ok bool
 		var didKeepalive bool
-		if c.prioCh != nil {
-			// Try hot priority (non-blocking).
+		req, ok, got := c.tryNextRequest()
+		if !got {
+			// Nothing queued: this is the point the writer actually blocks, so
+			// it is the point the buffer has to leave. Everything written since
+			// the last flush goes out in one write.
+			if err := flushBuffered(); err != nil {
+				<-c.inflightSem
+				return
+			}
 			select {
 			case req, ok = <-c.hotPrioCh:
-			default:
-				// Try hot normal (non-blocking).
-				select {
-				case req, ok = <-c.hotReqCh:
-				default:
-					// Blocking: wait on all channels.
-					select {
-					case req, ok = <-c.hotPrioCh:
-					case req, ok = <-c.hotReqCh:
-					case req, ok = <-c.prioCh:
-					case req, ok = <-c.reqCh:
-					case <-c.ctx.Done():
-						<-c.inflightSem
-						return
-					case <-idleCh:
-						<-c.inflightSem
-						c.waitForInflightDrain()
-						return
-					case <-keepaliveCh:
-						didKeepalive = true
-					}
-				}
-			}
-		} else {
-			select {
+			case req, ok = <-c.hotReqCh:
+			case req, ok = <-c.prioCh:
 			case req, ok = <-c.reqCh:
 			case <-c.ctx.Done():
 				<-c.inflightSem
@@ -1138,22 +1153,37 @@ mainLoop:
 			select {
 			case c.bodySem <- struct{}{}:
 				req.heldBody = true
-			case <-req.Ctx.Done():
-				<-c.inflightSem
-				failRequest(req.RespCh, req.Ctx.Err())
-				continue
-			case <-c.ctx.Done():
-				// The connection died with a request in hand. This arm is
-				// reachable with a request because a select whose conn-death
-				// arm and request arm are BOTH ready picks randomly — a dying
-				// writer can steal one last request from a hot channel, then
-				// land here when the dead reader's bodySem slot never frees.
-				// Fail it back (ErrConnectionDied retries it on a fresh
-				// connection at once); a bare return stranded it silently
-				// until the caller's whole attempt window expired.
-				<-c.inflightSem
-				failRequest(req.RespCh, c.connDiedErr())
-				return
+			default:
+				// About to wait for a body slot, which only frees when a
+				// reply arrives — and a reply can only arrive for commands
+				// the server has actually seen. Anything still buffered must
+				// go out first or the wait is on a reply to a command that
+				// was never sent.
+				if err := flushBuffered(); err != nil {
+					<-c.inflightSem
+					failRequest(req.RespCh, err)
+					return
+				}
+				select {
+				case c.bodySem <- struct{}{}:
+					req.heldBody = true
+				case <-req.Ctx.Done():
+					<-c.inflightSem
+					failRequest(req.RespCh, req.Ctx.Err())
+					continue
+				case <-c.ctx.Done():
+					// The connection died with a request in hand. This arm is
+					// reachable with a request because a select whose conn-death
+					// arm and request arm are BOTH ready picks randomly — a dying
+					// writer can steal one last request from a hot channel, then
+					// land here when the dead reader's bodySem slot never frees.
+					// Fail it back (ErrConnectionDied retries it on a fresh
+					// connection at once); a bare return stranded it silently
+					// until the caller's whole attempt window expired.
+					<-c.inflightSem
+					failRequest(req.RespCh, c.connDiedErr())
+					return
+				}
 			}
 		}
 
@@ -2047,6 +2077,22 @@ func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io
 
 	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, true)
 	return respCh
+}
+
+// sendSync runs the full send path on the caller's goroutine and returns the
+// reply.
+//
+// Send and SendPriority spawn a goroutine and hand back a channel, which is
+// what a caller that wants to get on with something else meanwhile needs. A
+// caller that blocks on the reply immediately does not: the goroutine is pure
+// overhead, and on a sweep that is one goroutine per message-id.
+func (c *Client) sendSync(ctx context.Context, payload []byte, priority bool) Response {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	respCh := make(chan Response, 1)
+	c.doSendWithRetry(ctx, payload, nil, nil, respCh, priority)
+	return <-respCh
 }
 
 // extractProbeMsgID returns the "<id@host>" message-ID from a BODY, HEAD, or
