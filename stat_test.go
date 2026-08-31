@@ -322,3 +322,48 @@ func TestStatAsync(t *testing.T) {
 		t.Fatal("StatAsync timed out")
 	}
 }
+
+func TestStatCapacity(t *testing.T) {
+	replies := map[string]string{}
+	tests := []struct {
+		name      string
+		providers []Provider
+		want      int
+	}{
+		{
+			name: "sums connections times stat depth across providers",
+			providers: []Provider{
+				{Factory: makeStatByIDFactory(t, nil, nil, replies), Connections: 3, Inflight: 2, StatInflight: 100},
+				{Factory: makeStatByIDFactory(t, nil, nil, replies), Connections: 2, StatInflight: 50, Backup: true},
+			},
+			want: 3*100 + 2*50,
+		},
+		{
+			name: "floors at minStatConcurrency",
+			providers: []Provider{
+				{Factory: makeStatByIDFactory(t, nil, nil, replies), Connections: 1, Inflight: 1},
+			},
+			want: minStatConcurrency,
+		},
+		{
+			name: "caps at maxStatConcurrency",
+			providers: []Provider{
+				{Factory: makeStatByIDFactory(t, nil, nil, replies), Connections: 100, StatInflight: 100},
+			},
+			want: maxStatConcurrency,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := NewClient(context.Background(), tt.providers)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = c.Close() }()
+
+			if got := c.StatCapacity(); got != tt.want {
+				t.Errorf("StatCapacity() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
