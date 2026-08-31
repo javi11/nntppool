@@ -38,6 +38,17 @@ func (c *Client) statCapacity() int {
 	return min(max(total, minStatConcurrency), maxStatConcurrency)
 }
 
+// StatCapacity reports the pool's aggregate STAT pipeline depth: for every
+// provider (main and backup), connections × the per-connection bodyless-STAT
+// inflight cap, clamped to [64, 4096]. It is the number of STATs a sweep must
+// keep outstanding to fill every connection's pipeline, and the value StatMany
+// derives when StatManyOptions.Concurrency is unset. Callers sizing their own
+// dispatch bounds, chunk deadlines, or admission budgets should read it from
+// here rather than re-deriving it from provider configuration.
+func (c *Client) StatCapacity() int {
+	return c.statCapacity()
+}
+
 // StatManyResult is the per-message outcome streamed by StatMany and StatAsync.
 // A genuine miss (article not found, NNTP 430/423) is reported as
 // Err == ErrArticleNotFound with a nil Result — it is a normal outcome of an
