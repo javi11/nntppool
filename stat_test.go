@@ -428,6 +428,7 @@ func TestStatMany_CancelMidSweepClosesChannel(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	ch := c.StatMany(ctx, ids, StatManyOptions{Concurrency: 64})
 
 	got := 0
