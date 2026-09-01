@@ -162,6 +162,166 @@ func TestFeed_YencMultiPart(t *testing.T) {
 	}
 }
 
+// --- Feed: output buffer pre-sizing ---
+
+// yencHeaderPrefix truncates article just after the header line that switches
+// the decoder into body mode (=ypart for multi-part, =ybegin otherwise), so a
+// test can observe the destination buffer before any payload lands in it.
+func yencHeaderPrefix(t *testing.T, article []byte) []byte {
+	t.Helper()
+	i := bytes.Index(article, []byte("=ypart "))
+	if i < 0 {
+		i = bytes.Index(article, []byte("=ybegin "))
+	}
+	if i < 0 {
+		t.Fatal("no yEnc header found in article")
+	}
+	end := bytes.Index(article[i:], []byte("\r\n"))
+	if end < 0 {
+		t.Fatal("unterminated yEnc header line")
+	}
+	return article[:i+end+2]
+}
+
+func TestFeed_YencPresizesBuffer(t *testing.T) {
+	const payload = 700 * 1024
+
+	tests := []struct {
+		name    string
+		article []byte
+	}{
+		{"single part", yencSinglePart(bytes.Repeat([]byte("A"), payload), "big.bin")},
+		{"multi part", yencMultiPart(bytes.Repeat([]byte("B"), payload), "big.bin", 2, 5, payload)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &NNTPResponse{}
+			var decoded bytes.Buffer
+			if _, _, err := r.Feed(yencHeaderPrefix(t, tt.article), &decoded); err != nil {
+				t.Fatalf("Feed() error = %v", err)
+			}
+			if !r.body {
+				t.Fatal("expected decoder to be in body mode after the header")
+			}
+			if r.YEnc.PartSize != payload {
+				t.Fatalf("PartSize = %d, want %d", r.YEnc.PartSize, payload)
+			}
+			if decoded.Len() != 0 {
+				t.Fatalf("decoded.Len() = %d, want 0 (no payload fed yet)", decoded.Len())
+			}
+			if decoded.Cap() < payload {
+				t.Errorf("decoded.Cap() = %d, want >= %d", decoded.Cap(), payload)
+			}
+
+			// The rest of the article must still decode correctly.
+			if _, done, err := r.Feed(tt.article[len(yencHeaderPrefix(t, tt.article)):], &decoded); err != nil {
+				t.Fatalf("Feed(rest) error = %v", err)
+			} else if !done {
+				t.Error("expected done=true after feeding the rest")
+			}
+			if decoded.Len() != payload {
+				t.Errorf("decoded.Len() = %d, want %d", decoded.Len(), payload)
+			}
+		})
+	}
+}
+
+func TestFeed_YencPresizesThroughWriterRef(t *testing.T) {
+	const payload = 512 * 1024
+	article := yencSinglePart(bytes.Repeat([]byte("C"), payload), "wrapped.bin")
+
+	r := &NNTPResponse{}
+	var decoded bytes.Buffer
+	out := &writerRef{w: &decoded}
+	if _, _, err := r.Feed(yencHeaderPrefix(t, article), out); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	}
+	if decoded.Cap() < payload {
+		t.Errorf("decoded.Cap() = %d, want >= %d", decoded.Cap(), payload)
+	}
+}
+
+func TestFeed_YencPresizeRejectsOversizedHeader(t *testing.T) {
+	tests := []struct {
+		name string
+		size string
+	}{
+		{"over cap", "999999999999"},
+		{"negative", "-1"},
+		{"zero", "0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := []byte("222 0 <test@example.com> body\r\n=ybegin line=128 size=" + tt.size + " name=hostile.bin\r\n")
+
+			r := &NNTPResponse{}
+			var decoded bytes.Buffer
+			if _, _, err := r.Feed(input, &decoded); err != nil {
+				t.Fatalf("Feed() error = %v", err)
+			}
+			if decoded.Cap() > maxPresize {
+				t.Errorf("decoded.Cap() = %d, want <= %d", decoded.Cap(), maxPresize)
+			}
+		})
+	}
+}
+
+func TestFeed_YencPresizeSkipsNonBufferWriter(t *testing.T) {
+	// io.Discard has no capacity to grow; the presize path must not panic.
+	article := yencSinglePart(bytes.Repeat([]byte("D"), 4096), "discard.bin")
+
+	r := &NNTPResponse{}
+	if _, done, err := r.Feed(article, io.Discard); err != nil {
+		t.Fatalf("Feed() error = %v", err)
+	} else if !done {
+		t.Error("expected done=true")
+	}
+	if r.BytesDecoded != 4096 {
+		t.Errorf("BytesDecoded = %d, want 4096", r.BytesDecoded)
+	}
+}
+
+// BenchmarkFeed_YencBufferedBody decodes a typical ~700KB article into a
+// bytes.Buffer the way readerLoop does: in readBuffer-sized windows off the
+// wire, which is what makes the destination buffer grow incrementally.
+func BenchmarkFeed_YencBufferedBody(b *testing.B) {
+	article := yencSinglePart(bytes.Repeat([]byte("E"), 700*1024), "bench.bin")
+	// Feed decodes in place, so each iteration works on a reusable scratch copy
+	// (allocated once, outside the measurement) like the wire path does.
+	buf := make([]byte, len(article))
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(article)))
+	b.ResetTimer()
+	for range b.N {
+		copy(buf, article)
+		r := &NNTPResponse{}
+		var decoded bytes.Buffer
+
+		// pos is the first unconsumed byte, avail the end of what has "arrived".
+		pos, avail := 0, 0
+		for pos < len(buf) {
+			if avail < len(buf) {
+				avail = min(avail+defaultReadBufSize, len(buf))
+			}
+			n, done, err := r.Feed(buf[pos:avail], &decoded)
+			if err != nil {
+				b.Fatalf("Feed() error = %v", err)
+			}
+			pos += n
+			if done {
+				break
+			}
+			if n == 0 && avail == len(buf) {
+				b.Fatal("Feed() stalled with no bytes left to supply")
+			}
+		}
+		if decoded.Len() != 700*1024 {
+			b.Fatalf("decoded %d bytes, want %d", decoded.Len(), 700*1024)
+		}
+	}
+}
+
 func TestFeed_YencCRC(t *testing.T) {
 	original := []byte("CRC test data payload.")
 	input := yencSinglePart(original, "crc.bin")

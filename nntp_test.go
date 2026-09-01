@@ -874,6 +874,76 @@ func TestNewClient_PingFailureDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestNewClient_PingsProvidersInParallel pins the cost of startup pings to
+// ~max(RTT) rather than sum(RTT). Serial pinging made an unreachable host cost
+// a full handshake timeout each, and callers that hold a lock across NewClient
+// (AltMount does) stalled for N × that on every config change.
+func TestNewClient_PingsProvidersInParallel(t *testing.T) {
+	const (
+		numProviders = 4
+		pingDelay    = 300 * time.Millisecond
+	)
+
+	// Slots are not pre-warmed (MinConnections defaults to 0), so the ping is
+	// the only call this factory sees.
+	slowFactory := func(ctx context.Context) (net.Conn, error) {
+		select {
+		case <-time.After(pingDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		client, server := net.Pipe()
+		go func() {
+			_, _ = server.Write([]byte("200 server ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				if strings.Contains(string(buf[:n]), "DATE") {
+					_, _ = server.Write([]byte("111 20240315120000\r\n"))
+				}
+			}
+		}()
+		return client, nil
+	}
+
+	providers := make([]Provider, numProviders)
+	for i := range providers {
+		providers[i] = Provider{Name: fmt.Sprintf("p%d", i), Factory: slowFactory, Connections: 1}
+	}
+
+	start := time.Now()
+	c, err := NewClient(context.Background(), providers)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// Half the serial cost is a wide margin that still fails the old behaviour
+	// (which needed numProviders × pingDelay).
+	if limit := numProviders * pingDelay / 2; elapsed >= limit {
+		t.Errorf("NewClient took %v, want < %v (pings must run concurrently, not serially)", elapsed, limit)
+	}
+
+	// Callers read Ping right after NewClient returns; parallelising must not
+	// turn it into a result that lands later.
+	stats := c.Stats()
+	if len(stats.Providers) != numProviders {
+		t.Fatalf("Providers = %d, want %d", len(stats.Providers), numProviders)
+	}
+	for i, ps := range stats.Providers {
+		if ps.Ping.Err != nil {
+			t.Errorf("provider %d ping error = %v", i, ps.Ping.Err)
+		}
+		if ps.Ping.RTT <= 0 {
+			t.Errorf("provider %d RTT = %v, want > 0", i, ps.Ping.RTT)
+		}
+	}
+}
+
 // --- DispatchStrategy option wiring ---
 
 func TestNewClient_DefaultDispatchRoundRobin(t *testing.T) {
@@ -1236,6 +1306,76 @@ func TestSend_430StatProbeWinnerGetsBody(t *testing.T) {
 		}
 	}
 	// P3 should have received STAT then BODY.
+	if len(p3Cmds) < 2 {
+		t.Fatalf("P3 commands = %v, want at least STAT + BODY", p3Cmds)
+	}
+	if !strings.HasPrefix(p3Cmds[0], "STAT") {
+		t.Errorf("P3 first command = %q, want STAT", p3Cmds[0])
+	}
+	if !strings.HasPrefix(p3Cmds[1], "BODY") {
+		t.Errorf("P3 second command = %q, want BODY", p3Cmds[1])
+	}
+}
+
+// TestSend_423FailsOverLikeA430 mirrors TestSend_430StatProbeWinnerGetsBody
+// with 423 ("no article with that number"). Both codes map to
+// ErrArticleNotFound and raceCandidates already treats them alike; the main
+// dispatch loop used to match 430 only, so a 423 was delivered as a "success"
+// to the caller with no failover to the remaining mains.
+func TestSend_423FailsOverLikeA430(t *testing.T) {
+	// P1: BODY→423 (first attempt, must force the probe).
+	// P2: STAT→423.
+	// P3: STAT→223, BODY→222 (winner).
+	var mu sync.Mutex
+	var p1Cmds, p2Cmds, p3Cmds []string
+
+	c, err := NewClient(context.Background(), []Provider{
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p1Cmds, map[string]string{
+				"BODY": "423 no article with that number",
+				"STAT": "423 no article with that number",
+			}),
+			Connections: 1,
+		},
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p2Cmds, map[string]string{
+				"STAT": "423 no article with that number",
+			}),
+			Connections: 1,
+		},
+		{
+			Factory: makeStatProbeFactory(t, &mu, &p3Cmds, map[string]string{
+				"STAT": "223 0 <test@host> article exists",
+				"BODY": "222 0 <test@host> body follows\r\n.\r\n",
+			}),
+			Connections: 1,
+		},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("unexpected error: %v", resp.Err)
+	}
+	if resp.StatusCode != 222 {
+		t.Fatalf("StatusCode = %d, want 222 (423 must fail over, not be delivered)", resp.StatusCode)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(p1Cmds) == 0 || !strings.HasPrefix(p1Cmds[0], "BODY") {
+		t.Errorf("P1 commands = %v, want first to be BODY", p1Cmds)
+	}
+	if len(p2Cmds) == 0 || !strings.HasPrefix(p2Cmds[0], "STAT") {
+		t.Errorf("P2 commands = %v, want first to be STAT probe", p2Cmds)
+	}
 	if len(p3Cmds) < 2 {
 		t.Fatalf("P3 commands = %v, want at least STAT + BODY", p3Cmds)
 	}
