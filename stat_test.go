@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -280,6 +281,207 @@ func TestStatMany_UnknownProvider(t *testing.T) {
 		[]string{"a@h"}, StatManyOptions{Provider: "does-not-exist"}))
 	if r := got["a@h"]; r.Err == nil {
 		t.Errorf("want error for unknown provider, got result %v", r.Result)
+	}
+}
+
+// TestStatMany_SkipOmitsResult pins the contract: a skipped id emits no STAT
+// command and no result, while every non-skipped id still gets exactly one.
+func TestStatMany_SkipOmitsResult(t *testing.T) {
+	var mu sync.Mutex
+	var cmdLog []string
+	ids := []string{"a@h", "b@h", "c@h"}
+	replies := map[string]string{
+		"a@h": "223 1 <a@h> exists",
+		"b@h": "223 2 <b@h> exists",
+		"c@h": "223 3 <c@h> exists",
+	}
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, &mu, &cmdLog, replies),
+		Connections: 3,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+		Skip: func(messageID string) bool { return messageID == "b@h" },
+	}))
+
+	if _, ok := got["b@h"]; ok {
+		t.Errorf("skipped id b@h produced a result: %+v", got["b@h"])
+	}
+	for _, id := range []string{"a@h", "c@h"} {
+		r, ok := got[id]
+		if !ok {
+			t.Fatalf("missing result for non-skipped id %s", id)
+		}
+		if r.Err != nil || r.Result == nil {
+			t.Errorf("%s: err=%v result=%v", id, r.Err, r.Result)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d results, want 2 (skipped id must not appear)", len(got))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, cmd := range cmdLog {
+		if strings.Contains(cmd, "b@h") {
+			t.Errorf("skipped id b@h was STATed: %q", cmd)
+		}
+	}
+}
+
+// TestStatMany_SkipStopsFurtherDispatch confirms Skip can be flipped mid-sweep
+// to abandon the remaining ids without chunking: once it starts returning
+// true, none of the later ids should ever reach the wire.
+func TestStatMany_SkipStopsFurtherDispatch(t *testing.T) {
+	var mu sync.Mutex
+	var cmdLog []string
+	const n = 50
+	const cutoff = 20 // ids at/after this index are abandoned
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("s%02d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, &mu, &cmdLog, replies),
+		Connections: 2,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	var abandoned atomic.Bool
+	skip := func(messageID string) bool {
+		if abandoned.Load() {
+			return true
+		}
+		// Flip once we see the id that marks the cutoff, so every id from
+		// cutoff onward is abandoned (dispatch order isn't guaranteed, but the
+		// cutoff id itself is always observed by the predicate before being
+		// STATed, since Skip runs before dispatch).
+		if messageID == ids[cutoff] {
+			abandoned.Store(true)
+			return true
+		}
+		return false
+	}
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+		Concurrency: 1, // serial dispatch makes the cutoff point deterministic
+		Skip:        skip,
+	}))
+
+	for i := cutoff; i < n; i++ {
+		if _, ok := got[ids[i]]; ok {
+			t.Errorf("id %s at/after cutoff produced a result", ids[i])
+		}
+	}
+	for i := range cutoff {
+		if _, ok := got[ids[i]]; !ok {
+			t.Errorf("id %s before cutoff is missing a result", ids[i])
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := cutoff; i < n; i++ {
+		for _, cmd := range cmdLog {
+			if strings.Contains(cmd, ids[i]) {
+				t.Errorf("abandoned id %s was STATed: %q", ids[i], cmd)
+			}
+		}
+	}
+}
+
+// TestStatMany_SkipNil is a regression guard: a nil Skip must behave exactly
+// as if the option didn't exist.
+func TestStatMany_SkipNil(t *testing.T) {
+	ids := []string{"a@h", "b@h"}
+	replies := map[string]string{
+		"a@h": "223 1 <a@h> exists",
+		"b@h": "223 2 <b@h> exists",
+	}
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 2,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{Skip: nil}))
+	if len(got) != len(ids) {
+		t.Fatalf("got %d results, want %d", len(got), len(ids))
+	}
+	for _, id := range ids {
+		if r := got[id]; r.Err != nil || r.Result == nil {
+			t.Errorf("%s: err=%v result=%v", id, r.Err, r.Result)
+		}
+	}
+}
+
+// TestStatMany_SkipConcurrencySafety exercises Skip under -race with a wide
+// concurrency and a closure that reads/writes shared state behind a mutex, to
+// confirm Skip is safe to call from every dispatch goroutine concurrently.
+func TestStatMany_SkipConcurrencySafety(t *testing.T) {
+	const n = 300
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("r%03d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 8,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	var mu sync.Mutex
+	seenBySkip := make(map[string]bool, n)
+	skip := func(messageID string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		seenBySkip[messageID] = true
+		// Skip every other id (by parity of its numeric suffix) to exercise a
+		// mixed skip/non-skip workload under race detection.
+		var idx int
+		_, _ = fmt.Sscanf(messageID, "r%03d@h", &idx)
+		return idx%2 == 0
+	}
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+		Concurrency: 128,
+		Skip:        skip,
+	}))
+
+	for i, id := range ids {
+		_, hasResult := got[id]
+		wantSkipped := i%2 == 0
+		if wantSkipped && hasResult {
+			t.Errorf("%s: expected skip, got result", id)
+		}
+		if !wantSkipped && !hasResult {
+			t.Errorf("%s: expected result, got none", id)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenBySkip) != n {
+		t.Fatalf("Skip observed %d distinct ids, want %d", len(seenBySkip), n)
 	}
 }
 
