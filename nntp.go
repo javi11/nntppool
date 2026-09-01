@@ -444,12 +444,17 @@ func isCheapCommand(payload []byte) bool {
 	return bytes.HasPrefix(payload, statCmdPrefix)
 }
 
-// tryNextRequest performs a non-blocking receive across the request channels,
-// preserving the preference order of the blocking select the writer falls back
-// to: hot channels first, so a request lands on an already-connected slot
-// rather than waking a cold one, then priority and normal with no bias between
-// them. Receives from nil channels are never ready, so the standalone path
-// (prioCh and the hot channels nil) probes reqCh alone.
+// tryNextRequest performs a non-blocking receive across the request channels in
+// strict preference order: hot priority, cold priority, hot normal, cold normal.
+// Priority always outranks normal — including a cold priority request over a hot
+// normal one, because a stream waiting on a body cares far more about being
+// dispatched at all than about landing on an already-warm connection.
+//
+// Each lane is its own non-blocking select rather than one combined select,
+// because Go chooses uniformly among ready cases: a single select over prioCh
+// and reqCh makes "priority" a coin flip exactly when both lanes are busy.
+// Receives from nil channels are never ready, so the standalone path (prioCh and
+// the hot channels nil) probes reqCh alone.
 //
 // got reports whether any channel was ready; ok is false when the channel that
 // fired was closed.
@@ -460,13 +465,16 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	default:
 	}
 	select {
+	case req, ok = <-c.prioCh:
+		return req, ok, true
+	default:
+	}
+	select {
 	case req, ok = <-c.hotReqCh:
 		return req, ok, true
 	default:
 	}
 	select {
-	case req, ok = <-c.prioCh:
-		return req, ok, true
 	case req, ok = <-c.reqCh:
 		return req, ok, true
 	default:
