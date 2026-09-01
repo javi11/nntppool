@@ -1,6 +1,13 @@
 package nntppool
 
-import "testing"
+import (
+	"context"
+	"net"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
 
 // newLaneTestConn builds a bare NNTPConnection wired only with request
 // channels. Nothing else is touched, because tryNextRequest reads nothing else.
@@ -72,5 +79,131 @@ func TestTryNextRequest_EmptyReturnsNotGot(t *testing.T) {
 	c := newLaneTestConn(nil, nil, nil, nil)
 	if _, _, found := c.tryNextRequest(); found {
 		t.Fatal("all-nil channels must report got=false")
+	}
+}
+
+// bodySteeringServer answers BODY with a small yEnc article and records which
+// connection index served each message-id. The id in slowID blocks until
+// release is closed, holding that connection's reader busy.
+type bodySteeringServer struct {
+	mu       sync.Mutex
+	servedBy map[string]int // message-id -> connection index
+	conns    int
+	slowID   string
+	release  chan struct{}
+	started  chan struct{} // closed once slowID has reached the server
+}
+
+func (s *bodySteeringServer) factory(t *testing.T) ConnFactory {
+	t.Helper()
+	return func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		s.mu.Lock()
+		idx := s.conns
+		s.conns++
+		s.mu.Unlock()
+
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				cmd := strings.TrimRight(string(buf[:n]), "\r\n")
+				if strings.HasPrefix(cmd, "DATE") {
+					_, _ = server.Write([]byte("111 20240101000000\r\n"))
+					continue
+				}
+				if !strings.HasPrefix(cmd, "BODY ") {
+					_, _ = server.Write([]byte("500 unsupported\r\n"))
+					continue
+				}
+				id := strings.Trim(strings.TrimPrefix(cmd, "BODY "), "<>")
+				s.mu.Lock()
+				s.servedBy[id] = idx
+				s.mu.Unlock()
+
+				if id == s.slowID {
+					close(s.started)  // the connection is now genuinely busy
+					<-s.release       // hold its reader until the test releases it
+				}
+				_, _ = server.Write(yencSinglePart([]byte("payload"), "f.bin"))
+			}
+		}()
+		return client, nil
+	}
+}
+
+// TestPriorityBodyAvoidsBusyConnection pins the property phase 1b exists for:
+// while one connection is draining a body, a priority body must be steered to a
+// connection that is free, not queued behind the in-flight one.
+func TestPriorityBodyAvoidsBusyConnection(t *testing.T) {
+	srv := &bodySteeringServer{
+		servedBy: map[string]int{},
+		slowID:   "slow@h",
+		release:  make(chan struct{}),
+		started:  make(chan struct{}),
+	}
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:        srv.factory(t),
+		Connections:    2,
+		MinConnections: 2, // pre-warm both so neither has to dial mid-test
+		Inflight:       1,
+		SkipPing:       true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Occupy one connection with a normal-lane body that will not complete.
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		_, _ = c.Body(ctx, "slow@h")
+	}()
+
+	// Block on a signal rather than polling: the test must not proceed until a
+	// connection is genuinely busy, and a sleep would make that a race.
+	select {
+	case <-srv.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("slow body never reached the server")
+	}
+
+	if _, err := c.BodyPriority(ctx, "fast@h"); err != nil {
+		t.Fatalf("priority body: %v", err)
+	}
+
+	srv.mu.Lock()
+	slowConn, fastConn := srv.servedBy["slow@h"], srv.servedBy["fast@h"]
+	srv.mu.Unlock()
+
+	if slowConn == fastConn {
+		t.Fatalf("priority body landed on connection %d, which was already draining a body", fastConn)
+	}
+
+	close(srv.release)
+	<-slowDone
+}
+
+func TestIdleBodyChanNilWhenBusy(t *testing.T) {
+	hotIdle := make(chan *Request, 1)
+	c := &NNTPConnection{
+		hotIdleBodyCh: hotIdle,
+		bodySem:       make(chan struct{}, 1),
+	}
+	if c.idleBodyChan() == nil {
+		t.Fatal("a body-free connection must offer its idle-body channel")
+	}
+	c.bodySem <- struct{}{} // now a body is in flight
+	if c.idleBodyChan() != nil {
+		t.Fatal("a busy connection must not offer its idle-body channel")
 	}
 }

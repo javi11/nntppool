@@ -232,11 +232,12 @@ type NNTPConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	reqCh     <-chan *Request
-	prioCh    <-chan *Request // priority channel; nil for standalone connections
-	hotReqCh  <-chan *Request // unbuffered; set by runConnSlot before Run()
-	hotPrioCh <-chan *Request // unbuffered; set by runConnSlot before Run()
-	pending   chan *Request
+	reqCh         <-chan *Request
+	prioCh        <-chan *Request // priority channel; nil for standalone connections
+	hotReqCh      <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotPrioCh     <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotIdleBodyCh <-chan *Request // unbuffered; read ONLY while this connection has no body in flight
+	pending       chan *Request
 
 	// inflightSem bounds the total pipeline depth (cap = StatInflight, i.e.
 	// max(Inflight, StatInflight)). bodySem additionally bounds concurrent
@@ -460,6 +461,11 @@ func isCheapCommand(payload []byte) bool {
 // fired was closed.
 func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	select {
+	case req, ok = <-c.idleBodyChan():
+		return req, ok, true
+	default:
+	}
+	select {
 	case req, ok = <-c.hotPrioCh:
 		return req, ok, true
 	default:
@@ -480,6 +486,23 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	default:
 	}
 	return nil, false, false
+}
+
+// idleBodyChan returns the group's idle-body channel while this connection has
+// no body-bearing request outstanding, and nil otherwise. A nil channel is never
+// ready in a select, so a connection whose reader is busy draining a body simply
+// does not compete for priority bodies — which is the whole point: NNTP replies
+// are FIFO per connection, so a priority body queued behind a 750 KB article
+// waits for the entire transfer.
+//
+// len(bodySem) is the correct signal because readerLoop releases the slot only
+// after the full body has been read and delivered. The window where the writer
+// holds a slot but the reader has not started counts as busy — the safe side.
+func (c *NNTPConnection) idleBodyChan() <-chan *Request {
+	if len(c.bodySem) != 0 {
+		return nil
+	}
+	return c.hotIdleBodyCh
 }
 
 func failRequest(ch chan Response, err error) {
@@ -693,7 +716,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 // immediately on death), giving the provider a floor of connections that
 // stay hot independent of traffic. Callers pair preWarm with idleTimeout==0
 // so these connections are never torn down for being idle.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, hotIdleBodyCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -816,6 +839,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc.providerName = providerName
 		nc.hotReqCh = hotReqCh
 		nc.hotPrioCh = hotPrioCh
+		nc.hotIdleBodyCh = hotIdleBodyCh
 		nc.keepaliveInterval = keepaliveInterval
 		nc.keepaliveCommand = keepaliveCommand
 		gate.markRunning()
@@ -1066,6 +1090,7 @@ mainLoop:
 				return
 			}
 			select {
+			case req, ok = <-c.idleBodyChan():
 			case req, ok = <-c.hotPrioCh:
 			case req, ok = <-c.hotReqCh:
 			case req, ok = <-c.prioCh:
@@ -1607,11 +1632,12 @@ type providerGroup struct {
 	skipID    string // Provider.StorageGroup when set, else host; identity used for 430 skipping
 	maxConns  int
 	ctx       context.Context // cancelled on removal/close
-	reqCh     chan *Request
-	prioCh    chan *Request // priority requests; connections prefer this over reqCh
-	hotReqCh  chan *Request // unbuffered; hot (connected) connections read this
-	hotPrioCh chan *Request // unbuffered; hot priority connections read this
-	gate      *connGate
+	reqCh         chan *Request
+	prioCh        chan *Request // priority requests; connections prefer this over reqCh
+	hotReqCh      chan *Request // unbuffered; hot (connected) connections read this
+	hotPrioCh     chan *Request // unbuffered; hot priority connections read this
+	hotIdleBodyCh chan *Request // unbuffered; only connections with no body in flight read this
+	gate          *connGate
 	stats     providerStats
 	cancel    context.CancelFunc // cancels this group's slot goroutines
 	p         Provider           // original config; used for auto-reconnect
@@ -1883,19 +1909,20 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
-		name:        name,
-		host:        p.Host,
-		skipID:      providerSkipID(p),
-		maxConns:    p.Connections,
-		ctx:         gctx,
-		reqCh:       make(chan *Request, p.Connections),
-		prioCh:      make(chan *Request, p.Connections),
-		hotReqCh:    make(chan *Request),
-		hotPrioCh:   make(chan *Request),
-		gate:        gate,
-		cancel:      gcancel,
-		p:           p,
-		quotaPeriod: p.QuotaPeriod,
+		name:          name,
+		host:          p.Host,
+		skipID:        providerSkipID(p),
+		maxConns:      p.Connections,
+		ctx:           gctx,
+		reqCh:         make(chan *Request, p.Connections),
+		prioCh:        make(chan *Request, p.Connections),
+		hotReqCh:      make(chan *Request),
+		hotPrioCh:     make(chan *Request),
+		hotIdleBodyCh: make(chan *Request),
+		gate:          gate,
+		cancel:        gcancel,
+		p:             p,
+		quotaPeriod:   p.QuotaPeriod,
 	}
 	g.stats.quotaBytes = p.QuotaBytes
 	if p.QuotaBytes > 0 {
@@ -1961,7 +1988,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 			idleTimeout = 0
 		}
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg, preWarm)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, g.hotIdleBodyCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg, preWarm)
 	}
 
 	return g
@@ -2389,22 +2416,39 @@ func (c *Client) tryGroupTimeout(
 		coldCh = g.reqCh
 	}
 
-	select {
-	case hotCh <- req:
-	default:
+	// A priority BODY prefers a connection with no body in flight. NNTP replies
+	// are FIFO per connection, so landing behind an in-flight article costs the
+	// whole transfer. Only body-free connections read hotIdleBodyCh, and only
+	// while they stay body-free, so nothing is reserved: when no priority body
+	// is in play nothing is ever sent here and every connection serves the
+	// normal lane exactly as before.
+	dispatched := false
+	if priority && !isCheapCommand(payload) {
 		select {
-		case <-c.ctx.Done():
-			return Response{}, false, true
-		case <-reqCtx.Done():
-			return Response{}, false, ctx.Err() != nil
-		case <-g.ctx.Done():
-			return Response{}, false, false
-		case <-timer.C:
-			// Could not be dispatched within the attempt window: the provider
-			// is saturated. Fail over — with the reason preserved, so the
-			// terminal error names the saturation instead of arriving bare.
-			return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseDispatch}}, false, false
-		case coldCh <- req:
+		case g.hotIdleBodyCh <- req:
+			dispatched = true
+		default:
+		}
+	}
+
+	if !dispatched {
+		select {
+		case hotCh <- req:
+		default:
+			select {
+			case <-c.ctx.Done():
+				return Response{}, false, true
+			case <-reqCtx.Done():
+				return Response{}, false, ctx.Err() != nil
+			case <-g.ctx.Done():
+				return Response{}, false, false
+			case <-timer.C:
+				// Could not be dispatched within the attempt window: the provider
+				// is saturated. Fail over — with the reason preserved, so the
+				// terminal error names the saturation instead of arriving bare.
+				return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseDispatch}}, false, false
+			case coldCh <- req:
+			}
 		}
 	}
 
