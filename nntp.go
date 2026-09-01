@@ -1909,18 +1909,17 @@ func resolveProviderName(p Provider, index int) string {
 // startProviderGroup creates a providerGroup, pings the provider, and launches
 // connection slot goroutines. The caller is responsible for storing the group.
 func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
-	inflight := p.Inflight
-	if inflight <= 0 {
-		inflight = 1
-	}
-	// STAT (bodyless) may pipeline deeper than BODY. The overall pipeline cap is
-	// max(Inflight, StatInflight); 0 or a smaller value means "same as Inflight"
-	// (no separate STAT lane — fully backward compatible).
-	statInflight := p.StatInflight
-	if statInflight < inflight {
-		statInflight = inflight
-	}
+	g, factory := c.newProviderGroup(p, index)
+	c.pingProviderGroup(g, p, factory)
+	c.launchConnSlots(g, p, factory)
+	return g
+}
 
+// newProviderGroup builds the group and resolves its connection factory. It
+// performs no I/O and starts no goroutines, so a caller with many providers can
+// construct them all and then ping them concurrently (see NewClient) instead of
+// paying one handshake timeout per provider, serially.
+func (c *Client) newProviderGroup(p Provider, index int) (*providerGroup, ConnFactory) {
 	factory := p.Factory
 	if factory == nil {
 		host := p.Host
@@ -1968,16 +1967,40 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		}
 	}
 
+	return g, factory
+}
+
+// pingProviderGroup performs the startup handshake probe and records it on the
+// group. Safe to run concurrently for distinct groups: it only touches g.stats
+// for its own group, which no other goroutine reads until the group is stored.
+func (c *Client) pingProviderGroup(g *providerGroup, p Provider, factory ConnFactory) {
 	// Ping with a short timeout so we don't block forever.
-	if !p.SkipPing {
-		pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
-		g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
-		pingCancel()
-		// Seed the TTFB EWMA from the measured RTT so the adaptive attempt
-		// timeout has a sensible starting point before any request completes.
-		if g.stats.Ping.Err == nil && g.stats.Ping.RTT > 0 {
-			g.stats.ttfbEWMA.Store(int64(g.stats.Ping.RTT))
-		}
+	if p.SkipPing {
+		return
+	}
+	pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
+	g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
+	pingCancel()
+	// Seed the TTFB EWMA from the measured RTT so the adaptive attempt
+	// timeout has a sensible starting point before any request completes.
+	if g.stats.Ping.Err == nil && g.stats.Ping.RTT > 0 {
+		g.stats.ttfbEWMA.Store(int64(g.stats.Ping.RTT))
+	}
+}
+
+// launchConnSlots resolves the remaining per-connection settings and starts one
+// slot goroutine per configured connection.
+func (c *Client) launchConnSlots(g *providerGroup, p Provider, factory ConnFactory) {
+	inflight := p.Inflight
+	if inflight <= 0 {
+		inflight = 1
+	}
+	// STAT (bodyless) may pipeline deeper than BODY. The overall pipeline cap is
+	// max(Inflight, StatInflight); 0 or a smaller value means "same as Inflight"
+	// (no separate STAT lane — fully backward compatible).
+	statInflight := p.StatInflight
+	if statInflight < inflight {
+		statInflight = inflight
 	}
 
 	// Resolve the rolling stall timeout: 0 => default, negative => disabled.
@@ -2015,10 +2038,8 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 			idleTimeout = 0
 		}
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, g.hotIdleBodyCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg, preWarm)
+		go runConnSlot(g.ctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, g.hotIdleBodyCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, g.gate, &g.stats, g.name, &c.wg, preWarm)
 	}
-
-	return g
 }
 
 func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) (*Client, error) {
@@ -2079,9 +2100,32 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	c.mainGroups.Store(&[]*providerGroup{})
 	c.backupGroups.Store(&[]*providerGroup{})
 
+	// Build every group first (no I/O), then ping them all at once. The ping is
+	// bounded by defaultHandshakeTimeout per provider, so doing it serially cost
+	// N × 10s when the hosts are unreachable — with callers (AltMount) holding a
+	// write lock across NewClient, that stalled the whole app on a config
+	// change. Concurrent pings make the worst case ~one timeout, not N.
+	groups := make([]*providerGroup, len(providers))
+	factories := make([]ConnFactory, len(providers))
+	for pi, p := range providers {
+		groups[pi], factories[pi] = c.newProviderGroup(p, pi)
+	}
+	var pingWG sync.WaitGroup
+	for pi, p := range providers {
+		pingWG.Add(1)
+		go func() {
+			defer pingWG.Done()
+			c.pingProviderGroup(groups[pi], p, factories[pi])
+		}()
+	}
+	pingWG.Wait()
+
+	// Slots start only once every ping has landed, matching the previous
+	// ordering: g.stats.Ping is complete before any request can be dispatched.
 	var mainGs, backupGs []*providerGroup
 	for pi, p := range providers {
-		g := c.startProviderGroup(p, pi)
+		g := groups[pi]
+		c.launchConnSlots(g, p, factories[pi])
 		if p.Backup {
 			backupGs = append(backupGs, g)
 		} else {
@@ -2877,7 +2921,12 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 				continue
 			}
-			if resp.StatusCode == 430 {
+			// 423 ("no article with that number") is the same miss as 430 for
+			// dispatch purposes — errors.go folds both into ErrArticleNotFound
+			// and raceCandidates already treats them alike. Handling only 430
+			// here delivered a 423 straight to the caller with no failover to
+			// the remaining mains or the backups.
+			if resp.StatusCode == 430 || resp.StatusCode == 423 {
 				c.nextIdx.Add(1) // bias next request away from this provider
 				if g.skipID != "" && skipCount < len(skipHosts) {
 					skipHosts[skipCount] = g.skipID

@@ -874,6 +874,50 @@ func TestClient_FIFO430Fallthrough(t *testing.T) {
 	}
 }
 
+// TestClient_FIFO423Fallthrough mirrors TestClient_FIFO430Fallthrough with the
+// other article-not-found code. A STAT payload is not STAT-probe raceable, so
+// this pins the sequential failover branch of the main dispatch loop — the one
+// that used to compare against 430 alone and hand a 423 back as a success.
+func TestClient_FIFO423Fallthrough(t *testing.T) {
+	// Provider #1 returns 423, provider #2 returns 223.
+	makeFactory := func(statusLine string) ConnFactory {
+		return func(ctx context.Context) (net.Conn, error) {
+			client, server := net.Pipe()
+			go func() {
+				_, _ = server.Write([]byte("200 server ready\r\n"))
+				buf := make([]byte, 4096)
+				for {
+					_, err := server.Read(buf)
+					if err != nil {
+						return
+					}
+					_, _ = server.Write([]byte(statusLine))
+				}
+			}()
+			return client, nil
+		}
+	}
+
+	c, err := NewClient(context.Background(), []Provider{
+		{Factory: makeFactory("423 No article with that number\r\n"), Connections: 2},
+		{Factory: makeFactory("223 1 <id@test> exists\r\n"), Connections: 2},
+	}, WithDispatchStrategy(DispatchFIFO))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	if resp.Err != nil {
+		t.Fatalf("Send() error = %v", resp.Err)
+	}
+	if resp.StatusCode != 223 {
+		t.Errorf("StatusCode = %d, want 223 (should fall through from 423 provider)", resp.StatusCode)
+	}
+}
+
 // TestClient_RoundRobinMoreThan8Providers verifies that weighted round-robin
 // dispatch does not panic when more than 8 providers are configured.
 // Previously a fixed-size [8]int array caused an index-out-of-range panic.
