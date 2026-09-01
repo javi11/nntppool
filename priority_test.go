@@ -127,8 +127,8 @@ func (s *bodySteeringServer) factory(t *testing.T) ConnFactory {
 				s.mu.Unlock()
 
 				if id == s.slowID {
-					close(s.started)  // the connection is now genuinely busy
-					<-s.release       // hold its reader until the test releases it
+					close(s.started) // the connection is now genuinely busy
+					<-s.release      // hold its reader until the test releases it
 				}
 				_, _ = server.Write(yencSinglePart([]byte("payload"), "f.bin"))
 			}

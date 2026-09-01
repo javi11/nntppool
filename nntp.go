@@ -1627,20 +1627,20 @@ type Provider struct {
 }
 
 type providerGroup struct {
-	name      string
-	host      string // raw Provider.Host; empty for Factory-based providers
-	skipID    string // Provider.StorageGroup when set, else host; identity used for 430 skipping
-	maxConns  int
-	ctx       context.Context // cancelled on removal/close
+	name          string
+	host          string // raw Provider.Host; empty for Factory-based providers
+	skipID        string // Provider.StorageGroup when set, else host; identity used for 430 skipping
+	maxConns      int
+	ctx           context.Context // cancelled on removal/close
 	reqCh         chan *Request
 	prioCh        chan *Request // priority requests; connections prefer this over reqCh
 	hotReqCh      chan *Request // unbuffered; hot (connected) connections read this
 	hotPrioCh     chan *Request // unbuffered; hot priority connections read this
 	hotIdleBodyCh chan *Request // unbuffered; only connections with no body in flight read this
 	gate          *connGate
-	stats     providerStats
-	cancel    context.CancelFunc // cancels this group's slot goroutines
-	p         Provider           // original config; used for auto-reconnect
+	stats         providerStats
+	cancel        context.CancelFunc // cancels this group's slot goroutines
+	p             Provider           // original config; used for auto-reconnect
 
 	// Quota period configuration. quotaBytes/quotaUsed/quotaExceeded live in
 	// stats so that NNTPConnection can update them via its *providerStats pointer.
