@@ -137,9 +137,32 @@ func (s *bodySteeringServer) factory(t *testing.T) ConnFactory {
 	}
 }
 
-// TestPriorityBodyAvoidsBusyConnection pins the property phase 1b exists for:
-// while one connection is draining a body, a priority body must be steered to a
-// connection that is free, not queued behind the in-flight one.
+// TestPriorityBodyAvoidsBusyConnection is an end-to-end smoke/regression check
+// exercising the real dial, dispatch, and steering path through the public
+// API: while one connection is draining a body, a priority body should be
+// steered to the connection that is free.
+//
+// Inflight is 2, not 1: at Inflight 1, inflightSem (cap == StatInflight ==
+// max(Inflight, StatInflight) == 1) is fully held by the connection draining
+// slow@h, so its writer parks at "c.inflightSem <- struct{}{}" — invisible to
+// every request lane, hotPrioCh included. With only one connection able to
+// receive anything, the test would pass whether or not steering exists,
+// because there was never a second candidate to route to. Inflight 2 gives
+// the busy connection's writer a spare pipeline slot, so it keeps competing
+// on the request lanes while its body is still in flight.
+//
+// This test alone is NOT a reliable regression pin, and should not be read as
+// one: Go hands an unbuffered channel to whichever receiver registered first,
+// and the warm-up below always leaves the free connection registered before
+// the busy one (the busy one necessarily re-registers after dispatching
+// slow@h, strictly later). That means hotPrioCh's naive FIFO hand-off already
+// resolves to the free connection on its own, with or without the
+// hotIdleBodyCh steering added by this feature — confirmed by running this
+// exact test against the pre-feature commit (48f5b63), where it passes
+// consistently. See TestPriorityBodySendPrefersIdleReceiver for the
+// deterministic pin of the actual dispatch preference; this test remains as
+// an integration-level exercise of the real dial/warm-up/dispatch machinery
+// (it would still catch a deadlock, panic, or gross behavioral break).
 func TestPriorityBodyAvoidsBusyConnection(t *testing.T) {
 	srv := &bodySteeringServer{
 		servedBy: map[string]int{},
@@ -151,7 +174,7 @@ func TestPriorityBodyAvoidsBusyConnection(t *testing.T) {
 		Factory:        srv.factory(t),
 		Connections:    2,
 		MinConnections: 2, // pre-warm both so neither has to dial mid-test
-		Inflight:       1,
+		Inflight:       2,
 		SkipPing:       true,
 	}})
 	if err != nil {
@@ -161,6 +184,31 @@ func TestPriorityBodyAvoidsBusyConnection(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Warm-up barrier: wait for both pre-warmed connections to finish dialing,
+	// then settle them with a few ordinary bodies before measuring anything.
+	// Without this, pre-warm dialing can still be in flight when the
+	// measurement starts, which flakes independent of the fix under test —
+	// on both the fixed and the pre-fix code, purely from dial-completion
+	// timing.
+	dialDeadline := time.Now().Add(10 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := srv.conns
+		srv.mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(dialDeadline) {
+			t.Fatal("connections never finished pre-warm dialing")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, id := range []string{"warm0@h", "warm1@h", "warm2@h", "warm3@h"} {
+		if _, err := c.Body(ctx, id); err != nil {
+			t.Fatalf("warm-up body %q: %v", id, err)
+		}
+	}
 
 	// Occupy one connection with a normal-lane body that will not complete.
 	slowDone := make(chan struct{})
@@ -205,5 +253,81 @@ func TestIdleBodyChanNilWhenBusy(t *testing.T) {
 	c.bodySem <- struct{}{} // now a body is in flight
 	if c.idleBodyChan() != nil {
 		t.Fatal("a busy connection must not offer its idle-body channel")
+	}
+}
+
+// TestPriorityBodySendPrefersIdleReceiver pins tryGroupTimeout's dispatch
+// preference directly and deterministically, with no dependence on real dial
+// timing or on Go's channel FIFO hand-off order — see the comment on
+// TestPriorityBodyAvoidsBusyConnection for why that black-box path cannot be
+// trusted to discriminate this exact property (it structurally cannot: the
+// warm-up there always leaves the free connection registered on the request
+// lanes before the busy one, so naive FIFO hand-off resolves to the free
+// connection whether or not the fix exists).
+//
+// Here the busy stand-in is deliberately registered on hotPrioCh, and given
+// time to actually park, strictly BEFORE the free stand-in — so a naive FIFO
+// hand-off on hotPrioCh alone would always resolve to the busy stand-in, the
+// wrong outcome. A priority send must still land on hotIdleBodyCh, the
+// channel only a body-free connection (idleBodyChan() returning non-nil) ever
+// listens on, never on hotPrioCh.
+func TestPriorityBodySendPrefersIdleReceiver(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	g := &providerGroup{
+		ctx:           context.Background(),
+		reqCh:         make(chan *Request, 1),
+		prioCh:        make(chan *Request, 1),
+		hotReqCh:      make(chan *Request),
+		hotPrioCh:     make(chan *Request),
+		hotIdleBodyCh: make(chan *Request),
+	}
+	cl := &Client{ctx: context.Background()}
+
+	type receipt struct {
+		via string
+		req *Request
+	}
+	got := make(chan receipt, 2)
+
+	// Stand-in for a busy connection: every real connection, busy or not,
+	// always listens on hotPrioCh (idleBodyChan() only ever removes the
+	// hotIdleBodyCh case from the real writer's select, never this one).
+	go func() {
+		select {
+		case req := <-g.hotPrioCh:
+			got <- receipt{"hotPrioCh (busy stand-in)", req}
+		case <-ctx.Done():
+		}
+	}()
+	time.Sleep(50 * time.Millisecond) // let it genuinely park before the free stand-in registers
+
+	// Stand-in for the free connection: listens on both, exactly as the real
+	// writer's blocking select does (idleBodyChan() case alongside hotPrioCh).
+	go func() {
+		select {
+		case req := <-g.hotIdleBodyCh:
+			got <- receipt{"hotIdleBodyCh (free stand-in)", req}
+			req.RespCh <- Response{}
+		case req := <-g.hotPrioCh:
+			got <- receipt{"hotPrioCh (free stand-in)", req}
+			req.RespCh <- Response{}
+		case <-ctx.Done():
+		}
+	}()
+	time.Sleep(50 * time.Millisecond) // let it genuinely park before dispatch runs
+
+	go func() {
+		_, _, _ = cl.tryGroupTimeout(ctx, g, []byte("BODY <fast@h>\r\n"), nil, nil, true, 500*time.Millisecond)
+	}()
+
+	select {
+	case r := <-got:
+		if r.via != "hotIdleBodyCh (free stand-in)" {
+			t.Fatalf("priority body dispatched via %s, want hotIdleBodyCh (free stand-in)", r.via)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("neither stand-in ever received the priority dispatch")
 	}
 }

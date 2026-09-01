@@ -445,11 +445,20 @@ func isCheapCommand(payload []byte) bool {
 	return bytes.HasPrefix(payload, statCmdPrefix)
 }
 
-// tryNextRequest performs a non-blocking receive across the request channels in
-// strict preference order: hot priority, cold priority, hot normal, cold normal.
-// Priority always outranks normal — including a cold priority request over a hot
-// normal one, because a stream waiting on a body cares far more about being
-// dispatched at all than about landing on an already-warm connection.
+// tryNextRequest performs a non-blocking receive across the request channels,
+// probing idleBodyChan() first and then, among the four request lanes, in
+// strict preference order: hot priority, cold priority, hot normal, cold
+// normal. Priority always outranks normal — including a cold priority request
+// over a hot normal one, because a stream waiting on a body cares far more
+// about being dispatched at all than about landing on an already-warm
+// connection.
+//
+// The idleBodyChan() probe here can never actually fire: a send to it (see
+// tryGroupTimeout) is itself a non-blocking select with a default case, so it
+// only succeeds against a receiver that is genuinely parked (blocked, not
+// polling) on the channel — which this probe, by construction, never is. It
+// stays for symmetry with the same case in the writer's blocking select below,
+// where the real hand-off happens; it is harmless here, just unreachable.
 //
 // Each lane is its own non-blocking select rather than one combined select,
 // because Go chooses uniformly among ready cases: a single select over prioCh
@@ -495,9 +504,27 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 // are FIFO per connection, so a priority body queued behind a 750 KB article
 // waits for the entire transfer.
 //
-// len(bodySem) is the correct signal because readerLoop releases the slot only
-// after the full body has been read and delivered. The window where the writer
-// holds a slot but the reader has not started counts as busy — the safe side.
+// This only changes the outcome when inflightSem's cap (StatInflight, i.e.
+// max(Inflight, StatInflight)) exceeds the number of body slots a busy
+// connection is holding — i.e. Inflight >= 2, or StatInflight > Inflight. At
+// nntppool's own defaults (Inflight 1, StatInflight 0, so cap == 1) a
+// body-draining connection's writer has no spare inflightSem slot at all: it
+// parks at "c.inflightSem <- struct{}{}" in the writer loop, invisible to
+// every request lane including this one, and this method is never even
+// reached for it. This method only has anything to say about a connection
+// that still has pipeline room while a body is in flight.
+//
+// len(bodySem) == 0 means no BODY is in flight, but a bodyless STAT (which
+// takes only inflightSem, not bodySem — see isCheapCommand) can still have up
+// to StatInflight replies pipelined ahead of a request steered here, delaying
+// it FIFO-behind those replies. That cost is microseconds per STAT round trip,
+// not the ~94 ms a full body transfer costs, but it means "no body in flight"
+// is not quite the same claim as "the reader is not busy at all".
+//
+// len(bodySem) is the correct signal (rather than, say, bodySem's cap) because
+// readerLoop releases the slot only after the full body has been read and
+// delivered. The window where the writer holds a slot but the reader has not
+// started counts as busy — the safe side.
 func (c *NNTPConnection) idleBodyChan() <-chan *Request {
 	if len(c.bodySem) != 0 {
 		return nil
