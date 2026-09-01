@@ -232,11 +232,12 @@ type NNTPConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	reqCh     <-chan *Request
-	prioCh    <-chan *Request // priority channel; nil for standalone connections
-	hotReqCh  <-chan *Request // unbuffered; set by runConnSlot before Run()
-	hotPrioCh <-chan *Request // unbuffered; set by runConnSlot before Run()
-	pending   chan *Request
+	reqCh         <-chan *Request
+	prioCh        <-chan *Request // priority channel; nil for standalone connections
+	hotReqCh      <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotPrioCh     <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotIdleBodyCh <-chan *Request // unbuffered; read ONLY while this connection has no body in flight
+	pending       chan *Request
 
 	// inflightSem bounds the total pipeline depth (cap = StatInflight, i.e.
 	// max(Inflight, StatInflight)). bodySem additionally bounds concurrent
@@ -445,17 +446,41 @@ func isCheapCommand(payload []byte) bool {
 }
 
 // tryNextRequest performs a non-blocking receive across the request channels,
-// preserving the preference order of the blocking select the writer falls back
-// to: hot channels first, so a request lands on an already-connected slot
-// rather than waking a cold one, then priority and normal with no bias between
-// them. Receives from nil channels are never ready, so the standalone path
-// (prioCh and the hot channels nil) probes reqCh alone.
+// probing idleBodyChan() first and then, among the four request lanes, in
+// strict preference order: hot priority, cold priority, hot normal, cold
+// normal. Priority always outranks normal — including a cold priority request
+// over a hot normal one, because a stream waiting on a body cares far more
+// about being dispatched at all than about landing on an already-warm
+// connection.
+//
+// The idleBodyChan() probe here can never actually fire: a send to it (see
+// tryGroupTimeout) is itself a non-blocking select with a default case, so it
+// only succeeds against a receiver that is genuinely parked (blocked, not
+// polling) on the channel — which this probe, by construction, never is. It
+// stays for symmetry with the same case in the writer's blocking select below,
+// where the real hand-off happens; it is harmless here, just unreachable.
+//
+// Each lane is its own non-blocking select rather than one combined select,
+// because Go chooses uniformly among ready cases: a single select over prioCh
+// and reqCh makes "priority" a coin flip exactly when both lanes are busy.
+// Receives from nil channels are never ready, so the standalone path (prioCh and
+// the hot channels nil) probes reqCh alone.
 //
 // got reports whether any channel was ready; ok is false when the channel that
 // fired was closed.
 func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	select {
+	case req, ok = <-c.idleBodyChan():
+		return req, ok, true
+	default:
+	}
+	select {
 	case req, ok = <-c.hotPrioCh:
+		return req, ok, true
+	default:
+	}
+	select {
+	case req, ok = <-c.prioCh:
 		return req, ok, true
 	default:
 	}
@@ -465,13 +490,46 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	default:
 	}
 	select {
-	case req, ok = <-c.prioCh:
-		return req, ok, true
 	case req, ok = <-c.reqCh:
 		return req, ok, true
 	default:
 	}
 	return nil, false, false
+}
+
+// idleBodyChan returns the group's idle-body channel while this connection has
+// no body-bearing request outstanding, and nil otherwise. A nil channel is never
+// ready in a select, so a connection whose reader is busy draining a body simply
+// does not compete for priority bodies — which is the whole point: NNTP replies
+// are FIFO per connection, so a priority body queued behind a 750 KB article
+// waits for the entire transfer.
+//
+// This only changes the outcome when inflightSem's cap (StatInflight, i.e.
+// max(Inflight, StatInflight)) exceeds the number of body slots a busy
+// connection is holding — i.e. Inflight >= 2, or StatInflight > Inflight. At
+// nntppool's own defaults (Inflight 1, StatInflight 0, so cap == 1) a
+// body-draining connection's writer has no spare inflightSem slot at all: it
+// parks at "c.inflightSem <- struct{}{}" in the writer loop, invisible to
+// every request lane including this one, and this method is never even
+// reached for it. This method only has anything to say about a connection
+// that still has pipeline room while a body is in flight.
+//
+// len(bodySem) == 0 means no BODY is in flight, but a bodyless STAT (which
+// takes only inflightSem, not bodySem — see isCheapCommand) can still have up
+// to StatInflight replies pipelined ahead of a request steered here, delaying
+// it FIFO-behind those replies. That cost is microseconds per STAT round trip,
+// not the ~94 ms a full body transfer costs, but it means "no body in flight"
+// is not quite the same claim as "the reader is not busy at all".
+//
+// len(bodySem) is the correct signal (rather than, say, bodySem's cap) because
+// readerLoop releases the slot only after the full body has been read and
+// delivered. The window where the writer holds a slot but the reader has not
+// started counts as busy — the safe side.
+func (c *NNTPConnection) idleBodyChan() <-chan *Request {
+	if len(c.bodySem) != 0 {
+		return nil
+	}
+	return c.hotIdleBodyCh
 }
 
 func failRequest(ch chan Response, err error) {
@@ -685,7 +743,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 // immediately on death), giving the provider a floor of connections that
 // stay hot independent of traffic. Callers pair preWarm with idleTimeout==0
 // so these connections are never torn down for being idle.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, hotIdleBodyCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -808,6 +866,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc.providerName = providerName
 		nc.hotReqCh = hotReqCh
 		nc.hotPrioCh = hotPrioCh
+		nc.hotIdleBodyCh = hotIdleBodyCh
 		nc.keepaliveInterval = keepaliveInterval
 		nc.keepaliveCommand = keepaliveCommand
 		gate.markRunning()
@@ -1058,6 +1117,7 @@ mainLoop:
 				return
 			}
 			select {
+			case req, ok = <-c.idleBodyChan():
 			case req, ok = <-c.hotPrioCh:
 			case req, ok = <-c.hotReqCh:
 			case req, ok = <-c.prioCh:
@@ -1594,19 +1654,20 @@ type Provider struct {
 }
 
 type providerGroup struct {
-	name      string
-	host      string // raw Provider.Host; empty for Factory-based providers
-	skipID    string // Provider.StorageGroup when set, else host; identity used for 430 skipping
-	maxConns  int
-	ctx       context.Context // cancelled on removal/close
-	reqCh     chan *Request
-	prioCh    chan *Request // priority requests; connections prefer this over reqCh
-	hotReqCh  chan *Request // unbuffered; hot (connected) connections read this
-	hotPrioCh chan *Request // unbuffered; hot priority connections read this
-	gate      *connGate
-	stats     providerStats
-	cancel    context.CancelFunc // cancels this group's slot goroutines
-	p         Provider           // original config; used for auto-reconnect
+	name          string
+	host          string // raw Provider.Host; empty for Factory-based providers
+	skipID        string // Provider.StorageGroup when set, else host; identity used for 430 skipping
+	maxConns      int
+	ctx           context.Context // cancelled on removal/close
+	reqCh         chan *Request
+	prioCh        chan *Request // priority requests; connections prefer this over reqCh
+	hotReqCh      chan *Request // unbuffered; hot (connected) connections read this
+	hotPrioCh     chan *Request // unbuffered; hot priority connections read this
+	hotIdleBodyCh chan *Request // unbuffered; only connections with no body in flight read this
+	gate          *connGate
+	stats         providerStats
+	cancel        context.CancelFunc // cancels this group's slot goroutines
+	p             Provider           // original config; used for auto-reconnect
 
 	// Quota period configuration. quotaBytes/quotaUsed/quotaExceeded live in
 	// stats so that NNTPConnection can update them via its *providerStats pointer.
@@ -1875,19 +1936,20 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
-		name:        name,
-		host:        p.Host,
-		skipID:      providerSkipID(p),
-		maxConns:    p.Connections,
-		ctx:         gctx,
-		reqCh:       make(chan *Request, p.Connections),
-		prioCh:      make(chan *Request, p.Connections),
-		hotReqCh:    make(chan *Request),
-		hotPrioCh:   make(chan *Request),
-		gate:        gate,
-		cancel:      gcancel,
-		p:           p,
-		quotaPeriod: p.QuotaPeriod,
+		name:          name,
+		host:          p.Host,
+		skipID:        providerSkipID(p),
+		maxConns:      p.Connections,
+		ctx:           gctx,
+		reqCh:         make(chan *Request, p.Connections),
+		prioCh:        make(chan *Request, p.Connections),
+		hotReqCh:      make(chan *Request),
+		hotPrioCh:     make(chan *Request),
+		hotIdleBodyCh: make(chan *Request),
+		gate:          gate,
+		cancel:        gcancel,
+		p:             p,
+		quotaPeriod:   p.QuotaPeriod,
 	}
 	g.stats.quotaBytes = p.QuotaBytes
 	if p.QuotaBytes > 0 {
@@ -1953,7 +2015,7 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 			idleTimeout = 0
 		}
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg, preWarm)
+		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, g.hotIdleBodyCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg, preWarm)
 	}
 
 	return g
@@ -2381,22 +2443,39 @@ func (c *Client) tryGroupTimeout(
 		coldCh = g.reqCh
 	}
 
-	select {
-	case hotCh <- req:
-	default:
+	// A priority BODY prefers a connection with no body in flight. NNTP replies
+	// are FIFO per connection, so landing behind an in-flight article costs the
+	// whole transfer. Only body-free connections read hotIdleBodyCh, and only
+	// while they stay body-free, so nothing is reserved: when no priority body
+	// is in play nothing is ever sent here and every connection serves the
+	// normal lane exactly as before.
+	dispatched := false
+	if priority && !isCheapCommand(payload) {
 		select {
-		case <-c.ctx.Done():
-			return Response{}, false, true
-		case <-reqCtx.Done():
-			return Response{}, false, ctx.Err() != nil
-		case <-g.ctx.Done():
-			return Response{}, false, false
-		case <-timer.C:
-			// Could not be dispatched within the attempt window: the provider
-			// is saturated. Fail over — with the reason preserved, so the
-			// terminal error names the saturation instead of arriving bare.
-			return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseDispatch}}, false, false
-		case coldCh <- req:
+		case g.hotIdleBodyCh <- req:
+			dispatched = true
+		default:
+		}
+	}
+
+	if !dispatched {
+		select {
+		case hotCh <- req:
+		default:
+			select {
+			case <-c.ctx.Done():
+				return Response{}, false, true
+			case <-reqCtx.Done():
+				return Response{}, false, ctx.Err() != nil
+			case <-g.ctx.Done():
+				return Response{}, false, false
+			case <-timer.C:
+				// Could not be dispatched within the attempt window: the provider
+				// is saturated. Fail over — with the reason preserved, so the
+				// terminal error names the saturation instead of arriving bare.
+				return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseDispatch}}, false, false
+			case coldCh <- req:
+			}
 		}
 	}
 

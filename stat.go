@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // minStatConcurrency floors the derived in-flight STAT bound when
@@ -113,18 +114,29 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 	go func() {
 		defer close(out)
 
-		// A fixed pool rather than a goroutine per message-id: conc bounds how
-		// many STATs may be outstanding either way, so spawning per id only
-		// adds a goroutine and a stack per article on the one workload whose
-		// defining trait is article count.
-		ids := make(chan string)
+		// Workers pull their own index instead of being fed by a channel. The
+		// work is a fully-materialised slice, so a channel buys nothing and
+		// costs a great deal: with conc up to maxStatConcurrency, every send
+		// takes hchan.lock and wakes one goroutine out of a receive queue
+		// thousands deep. One uncontended atomic add replaces that hand-off.
+		//
+		// Worker count stays conc because statOne blocks until its reply
+		// arrives, so one goroutine per outstanding STAT is inherent.
+		var cursor atomic.Int64
 		var wg sync.WaitGroup
 		wg.Add(conc)
 		for range conc {
 			go func() {
 				defer wg.Done()
-				for id := range ids {
-					res := c.statOne(ctx, id, target, targetErr, opts.Priority)
+				for {
+					i := int(cursor.Add(1)) - 1
+					if i >= len(messageIDs) {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.Priority)
 					select {
 					case out <- res:
 					case <-ctx.Done():
@@ -133,16 +145,6 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 				}
 			}()
 		}
-
-	dispatch:
-		for _, id := range messageIDs {
-			select {
-			case <-ctx.Done():
-				break dispatch
-			case ids <- id:
-			}
-		}
-		close(ids)
 
 		wg.Wait()
 	}()
