@@ -78,6 +78,22 @@ type StatManyOptions struct {
 	// When empty, STATs dispatch across the whole pool with the same
 	// cross-provider/backup failover semantics as Stat ("exists anywhere").
 	Provider string
+
+	// Skip, when non-nil, is consulted immediately before each message-id is
+	// dispatched. Returning true abandons that id: no STAT is sent and no
+	// result is emitted for it. It lets a caller stop checking ids whose
+	// verdict is already settled without chunking the sweep, so sweep width
+	// and early-termination granularity stop competing.
+	//
+	// A skipped id emits no StatManyResult — same as an id left undispatched
+	// by context cancellation — so callers cannot assume one result per input
+	// id; check ctx.Err() or otherwise account for gaps after draining rather
+	// than relying on result count.
+	//
+	// Skip is called concurrently from every dispatch goroutine and must be
+	// safe for concurrent use. It should be cheap: it runs once per
+	// message-id.
+	Skip func(messageID string) bool
 }
 
 // StatMany checks the existence of many articles concurrently, streaming a
@@ -85,7 +101,10 @@ type StatManyOptions struct {
 // order). The returned channel is closed once every dispatched check has
 // reported. If ctx is cancelled mid-sweep, dispatch stops, in-flight checks are
 // cancelled, and the channel is closed; message-ids not yet dispatched produce
-// no result, so callers should check ctx.Err() after draining.
+// no result, so callers should check ctx.Err() after draining. Ids abandoned
+// via StatManyOptions.Skip likewise produce no result, so a caller cannot
+// assume one result per input id in general — count dispatched vs. total, or
+// otherwise account for gaps, rather than relying on result count alone.
 func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatManyOptions) <-chan StatManyResult {
 	if ctx == nil {
 		ctx = context.Background()
@@ -135,6 +154,9 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 					}
 					if ctx.Err() != nil {
 						return
+					}
+					if opts.Skip != nil && opts.Skip(messageIDs[i]) {
+						continue
 					}
 					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.Priority)
 					select {
