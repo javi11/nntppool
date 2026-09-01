@@ -15,8 +15,10 @@ import (
 // commands based on message-id. replies maps a bare message-id to the status
 // line to return; ids absent from the map get a 430. Every received command
 // (except DATE pings) is appended to cmdLog under mu.
-func makeStatByIDFactory(t *testing.T, mu *sync.Mutex, cmdLog *[]string, replies map[string]string) ConnFactory {
-	t.Helper()
+func makeStatByIDFactory(t testing.TB, mu *sync.Mutex, cmdLog *[]string, replies map[string]string) ConnFactory {
+	if t != nil {
+		t.Helper()
+	}
 	return func(ctx context.Context) (net.Conn, error) {
 		client, server := net.Pipe()
 		go func() {
@@ -365,5 +367,109 @@ func TestStatCapacity(t *testing.T) {
 				t.Errorf("StatCapacity() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestStatMany_CompletenessUnderWideConcurrency pins the property the dispatch
+// rewrite must preserve: every id yields exactly one result, with no duplicates
+// and none dropped, even when workers vastly outnumber the ids they share.
+func TestStatMany_CompletenessUnderWideConcurrency(t *testing.T) {
+	const n = 500
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("m%04d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 4,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	seen := make(map[string]int, n)
+	for res := range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: 256}) {
+		seen[res.MessageID]++
+	}
+
+	if len(seen) != n {
+		t.Fatalf("got %d distinct results, want %d", len(seen), n)
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Errorf("%s: %d results, want exactly 1", id, count)
+		}
+	}
+}
+
+// TestStatMany_CancelMidSweepClosesChannel pins the documented contract: on
+// cancellation dispatch stops, in-flight checks are cancelled, and the channel
+// is closed, so a caller ranging over it always terminates.
+func TestStatMany_CancelMidSweepClosesChannel(t *testing.T) {
+	const n = 2000
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("c%04d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 2,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := c.StatMany(ctx, ids, StatManyOptions{Concurrency: 64})
+
+	got := 0
+	for range ch {
+		got++
+		if got == 10 {
+			cancel()
+		}
+	}
+	// Reaching here at all is the assertion: the range terminated, so the
+	// channel was closed rather than leaked.
+	if got >= n {
+		t.Fatalf("drained all %d results despite cancelling after 10", n)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("context should be cancelled")
+	}
+}
+
+// BenchmarkStatManyDispatch isolates dispatch cost: every STAT is answered
+// immediately, so what it measures is the hand-off machinery, not the wire.
+func BenchmarkStatManyDispatch(b *testing.B) {
+	const n = 4096
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("b%04d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(nil, nil, nil, replies),
+		Connections: 8,
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	b.ResetTimer()
+	for range b.N {
+		for range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: n}) {
+		}
 	}
 }
