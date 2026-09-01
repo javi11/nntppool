@@ -43,6 +43,7 @@ type NNTPResponse struct {
 	hasEnd       bool
 	hasCrc       bool
 	hasEmptyline bool // for article requests has the empty line separating headers and body been seen
+	presized     bool // output buffer has already been grown to the announced part size
 	onMeta       func(YEncMeta)
 }
 
@@ -50,6 +51,10 @@ const nntpBody = 222
 const nntpArtiicle = 220
 const nntpHead = 221
 const nntpCapabilities = 101
+
+// maxPresize caps how much a yEnc header is allowed to pre-allocate, so a
+// corrupt or hostile size= field cannot force a huge allocation.
+const maxPresize = 64 << 20
 
 // Feed consumes raw NNTP protocol bytes from buf, writing any decoded payload bytes to out.
 // It returns (bytesConsumedFromBuf, done, error).
@@ -119,6 +124,7 @@ func (r *NNTPResponse) decode(buf []byte, out io.Writer) (read int, err error) {
 			case rapidyenc.FormatYenc:
 				r.processYencHeader(line)
 				if r.body {
+					r.presizeOutput(out)
 					n, err := r.decodeYenc(buf, out)
 					read += int(n)
 					buf = buf[n:]
@@ -297,6 +303,32 @@ func (r *NNTPResponse) decodeYenc(buf []byte, out io.Writer) (n int64, err error
 	}
 
 	return n, nil
+}
+
+// presizeOutput grows a buffered destination to the part size announced by
+// =ybegin/=ypart, once, just before body decoding starts. Parts are typically
+// ~700KB and a bytes.Buffer would otherwise reach that through a doubling chain
+// of intermediate allocations, leaving 2-3x the payload behind as garbage on
+// every article.
+func (r *NNTPResponse) presizeOutput(out io.Writer) {
+	if r.presized {
+		return
+	}
+	r.presized = true
+
+	size := r.YEnc.PartSize
+	if size <= 0 || size > maxPresize {
+		return
+	}
+
+	// readerLoop hands the destination over wrapped so it can be swapped for
+	// io.Discard mid-response; unwrap before looking for the buffer.
+	if wr, ok := out.(*writerRef); ok {
+		out = wr.w
+	}
+	if bb, ok := out.(*bytes.Buffer); ok {
+		bb.Grow(int(size))
+	}
 }
 
 func (r *NNTPResponse) processYencHeader(line []byte) {
