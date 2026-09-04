@@ -108,6 +108,16 @@ const (
 	// issues at most one SetReadDeadline syscall per quantum instead of one per
 	// read.
 	stallDeadlineQuantum = 250 * time.Millisecond
+
+	// defaultStreamInflight is the priority-lane body cap per connection when
+	// Provider.StreamInflight is unset: deep enough to pipeline, shallow
+	// enough that a demand read waits behind at most three stream bodies.
+	defaultStreamInflight = 4
+
+	// defaultAbortDrainBytes is the remaining-body size above which an
+	// abandoned drain is cut by closing the connection. A 750 KB article
+	// finishes draining in less time than a reconnect; a 4 MiB one does not.
+	defaultAbortDrainBytes int64 = 1 << 20
 )
 
 // Attempt lifecycle states, coordinating the race between tryGroup's attempt
@@ -205,6 +215,10 @@ type Request struct {
 	// bodySem slot, so readerLoop releases exactly the slots that were taken.
 	// Bodyless STAT requests never acquire bodySem and leave this false.
 	heldBody bool
+	// heldPrio is set when the request also took a prioBodySem slot.
+	heldPrio bool
+	// priority marks a priority-lane request (dispatched via prioCh/hotPrioCh).
+	priority bool
 
 	// providerName identifies the provider group selected for this attempt.
 	providerName string
@@ -256,6 +270,10 @@ type NNTPConnection struct {
 	// deeper StatInflight depth.
 	inflightSem chan struct{}
 	bodySem     chan struct{}
+	// prioBodySem additionally bounds priority-lane bodies (cap =
+	// StreamInflight); nil when the cap is disabled.
+	prioBodySem     chan struct{}
+	abortDrainBytes int64 // see Provider.AbortDrainBytes; 0 = never abort
 
 	rb readBuffer
 
@@ -757,7 +775,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 // immediately on death), giving the provider a floor of connections that
 // stay hot independent of traffic. Callers pair preWarm with idleTimeout==0
 // so these connections are never torn down for being idle.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, hotIdleBodyCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, hotIdleBodyCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, streamInflight int, abortDrainBytes int64, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
@@ -874,6 +892,10 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// allows STAT to reach statInflight. When statInflight == inflight this
 		// is identical to the default (both caps equal).
 		nc.bodySem = make(chan struct{}, inflight)
+		if streamInflight > 0 {
+			nc.prioBodySem = make(chan struct{}, streamInflight)
+		}
+		nc.abortDrainBytes = abortDrainBytes
 		nc.firstReq = firstReq
 		nc.idleTimeout = idleTimeout
 		nc.stallTimeout = stallTimeout
@@ -1004,6 +1026,25 @@ func (c *NNTPConnection) Run() {
 				<-c.inflightSem
 				failRequest(req.RespCh, c.ctx.Err())
 				return
+			}
+			// Priority-lane bodies are bounded tighter than Inflight so a
+			// demand read does not queue behind a connection's worth of
+			// read-ahead (replies are FIFO per connection).
+			if req.priority && c.prioBodySem != nil {
+				select {
+				case c.prioBodySem <- struct{}{}:
+					req.heldPrio = true
+				case <-req.Ctx.Done():
+					<-c.bodySem
+					<-c.inflightSem
+					failRequest(req.RespCh, req.Ctx.Err())
+					goto mainLoop
+				case <-c.ctx.Done():
+					<-c.bodySem
+					<-c.inflightSem
+					failRequest(req.RespCh, c.ctx.Err())
+					return
+				}
 			}
 		}
 
@@ -1260,6 +1301,37 @@ mainLoop:
 					return
 				}
 			}
+			// Priority-lane bodies are bounded tighter than Inflight so a
+			// demand read does not queue behind a connection's worth of
+			// read-ahead (replies are FIFO per connection). Same flush rule:
+			// a slot only frees when a reply arrives for a sent command.
+			if req.priority && c.prioBodySem != nil {
+				select {
+				case c.prioBodySem <- struct{}{}:
+					req.heldPrio = true
+				default:
+					if err := flushBuffered(); err != nil {
+						<-c.bodySem
+						<-c.inflightSem
+						failRequest(req.RespCh, err)
+						return
+					}
+					select {
+					case c.prioBodySem <- struct{}{}:
+						req.heldPrio = true
+					case <-req.Ctx.Done():
+						<-c.bodySem
+						<-c.inflightSem
+						failRequest(req.RespCh, req.Ctx.Err())
+						continue
+					case <-c.ctx.Done():
+						<-c.bodySem
+						<-c.inflightSem
+						failRequest(req.RespCh, c.connDiedErr())
+						return
+					}
+				}
+			}
 		}
 
 		// per-request write deadline (cached to avoid redundant syscalls)
@@ -1405,6 +1477,7 @@ func (c *NNTPConnection) readerLoop() {
 			}
 			return time.Time{}, false
 		}
+		abortDrain := false
 		drain := func() error {
 			return c.rb.feedUntilDone(c.conn, &decoder, outRef, func(wireBytes int) (time.Time, bool) {
 				if deliver {
@@ -1414,6 +1487,15 @@ func (c *NNTPConnection) readerLoop() {
 						outRef.w = io.Discard
 					default:
 					}
+				}
+				// Nobody wants this body any more. Draining keeps the
+				// connection in sync, but past a point a reconnect is far
+				// cheaper than the bytes: a closed player's read-ahead on
+				// 4 MiB parts would otherwise keep the wire busy for seconds.
+				if !deliver && c.abortDrainBytes > 0 && decoder.YEnc.PartSize > 0 &&
+					decoder.YEnc.PartSize-int64(decoder.BytesDecoded) > c.abortDrainBytes {
+					abortDrain = true
+					return time.Unix(0, 0), true
 				}
 				if wireBytes > lastBytes {
 					lastBytes = wireBytes
@@ -1455,6 +1537,11 @@ func (c *NNTPConnection) readerLoop() {
 			})
 		}
 		err := drain()
+		if abortDrain {
+			// Surface as connection death so the teardown below runs and
+			// pending neighbours are retried through the usual path.
+			err = c.connDiedErr()
+		}
 		// A read that timed out on a caller deadline may have raced the very
 		// abandonment that invalidates it (the tryGroup timer fires at the same
 		// instant the attempt deadline expires, and a caller ctx expiring IS the
@@ -1462,7 +1549,7 @@ func (c *NNTPConnection) readerLoop() {
 		// instead of surfacing a timeout that would kill the connection; a
 		// genuinely stalled server still runs out the drain-anchored window (or
 		// the stall clock) and dies below.
-		for err != nil && isTimeoutErr(err) && abandoned() {
+		for err != nil && !abortDrain && isTimeoutErr(err) && abandoned() {
 			bound, ok := ttfbBound()
 			if lastBytes > 0 {
 				bound, ok = stallDeadline, stall > 0
@@ -1565,11 +1652,14 @@ func (c *NNTPConnection) readerLoop() {
 		if req.heldBody {
 			<-c.bodySem
 		}
+		if req.heldPrio {
+			<-c.prioBodySem
+		}
 
 		// If we hit a timeout, cancellation-related network error, or protocol
 		// desync, close the connection so the pool replaces it with a fresh one.
 		if resp.Err != nil {
-			if isTimeoutErr(resp.Err) {
+			if isTimeoutErr(resp.Err) || abortDrain {
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
@@ -1675,6 +1765,19 @@ type Provider struct {
 	ThrottleRestore time.Duration // 0 defaults to 30s
 	KeepAlive       time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
 	ReconnectDelay  time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
+
+	// StreamInflight caps priority-lane bodies in flight per connection, so a
+	// demand read never queues behind more than StreamInflight-1 stream
+	// bodies on its connection while normal-lane bodies keep Inflight.
+	// 0 defaults to min(Inflight, 4); a value >= Inflight disables the cap.
+	StreamInflight int
+
+	// AbortDrainBytes: when a body's request is cancelled while its bytes are
+	// still arriving, the connection normally drains the rest to stay in sync.
+	// If more than this many bytes remain, the connection is closed instead
+	// and its slot reconnects; pending neighbours are retried by the caller's
+	// connection-death handling. 0 defaults to 1 MiB; negative disables.
+	AbortDrainBytes int64
 
 	// AttemptTimeout bounds dispatch plus time-to-first-response-byte for each
 	// attempt against this provider (it does NOT bound the body transfer, which
@@ -2101,6 +2204,20 @@ func (c *Client) launchConnSlots(g *providerGroup, p Provider, factory ConnFacto
 	if minConns > p.Connections {
 		minConns = p.Connections
 	}
+	streamInflight := p.StreamInflight
+	if streamInflight <= 0 {
+		streamInflight = min(inflight, defaultStreamInflight)
+	}
+	if streamInflight >= inflight {
+		streamInflight = 0 // no separate bound
+	}
+	abortDrain := p.AbortDrainBytes
+	switch {
+	case abortDrain == 0:
+		abortDrain = defaultAbortDrainBytes
+	case abortDrain < 0:
+		abortDrain = 0
+	}
 	for i := range p.Connections {
 		preWarm := i < minConns
 		idleTimeout := p.IdleTimeout
@@ -2110,7 +2227,7 @@ func (c *Client) launchConnSlots(g *providerGroup, p Provider, factory ConnFacto
 			idleTimeout = 0
 		}
 		c.wg.Add(1)
-		go runConnSlot(g.ctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, g.hotIdleBodyCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, g.gate, &g.stats, g.name, &c.wg, preWarm)
+		go runConnSlot(g.ctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, g.hotIdleBodyCh, factory, inflight, statInflight, streamInflight, abortDrain, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, g.gate, &g.stats, g.name, &c.wg, preWarm)
 	}
 }
 
@@ -2545,6 +2662,7 @@ func (c *Client) tryGroupTimeout(
 		attemptDeadline: time.Now().Add(attemptTimeout),
 		attemptWindow:   attemptTimeout,
 		providerName:    g.name,
+		priority:        priority,
 	}
 
 	timer := time.NewTimer(attemptTimeout)
