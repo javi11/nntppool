@@ -256,6 +256,37 @@ func TestIdleBodyChanNilWhenBusy(t *testing.T) {
 	}
 }
 
+// A body-free connection whose pipeline still holds unanswered requests is not
+// idle either: replies are FIFO, so a priority body steered here waits behind
+// every pending reply. That wait is not "microseconds per STAT" in practice —
+// Newshosting answers STAT for a missing article in ~1.2 s and serialises
+// them per connection, so a repair liveness sweep over a mostly-dead release
+// parks every connection it touches for seconds at a time. Those connections
+// are exactly the body-free ones, so the old bodySem-only test steered
+// playback bodies straight onto them (observed live: a stream collapsing from
+// ~70 MB/s to ~5 MB/s beside such a sweep). The writer holds one inflightSem
+// slot of its own while it is choosing a request, so "empty pipeline" is
+// len(inflightSem) <= 1.
+func TestIdleBodyChanNilWithPendingPipeline(t *testing.T) {
+	c := &NNTPConnection{
+		hotIdleBodyCh: make(chan *Request, 1),
+		bodySem:       make(chan struct{}, 1),
+		inflightSem:   make(chan struct{}, 4),
+	}
+	c.inflightSem <- struct{}{} // the writer's own slot
+	if c.idleBodyChan() == nil {
+		t.Fatal("a connection whose only inflight slot is the writer's own must offer its idle-body channel")
+	}
+	c.inflightSem <- struct{}{} // one bodyless request (STAT) awaiting its reply
+	if c.idleBodyChan() != nil {
+		t.Fatal("a connection with a pending reply must not offer its idle-body channel")
+	}
+	<-c.inflightSem // reply drained
+	if c.idleBodyChan() == nil {
+		t.Fatal("a drained pipeline must offer its idle-body channel again")
+	}
+}
+
 // TestPriorityBodySendPrefersIdleReceiver pins tryGroupTimeout's dispatch
 // preference directly and deterministically, with no dependence on real dial
 // timing or on Go's channel FIFO hand-off order — see the comment on

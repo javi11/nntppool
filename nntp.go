@@ -507,11 +507,11 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 }
 
 // idleBodyChan returns the group's idle-body channel while this connection has
-// no body-bearing request outstanding, and nil otherwise. A nil channel is never
-// ready in a select, so a connection whose reader is busy draining a body simply
-// does not compete for priority bodies — which is the whole point: NNTP replies
-// are FIFO per connection, so a priority body queued behind a 750 KB article
-// waits for the entire transfer.
+// nothing outstanding on the wire — no body-bearing request and no pipelined
+// reply still owed — and nil otherwise. A nil channel is never ready in a
+// select, so a connection whose reader is busy simply does not compete for
+// priority bodies — which is the whole point: NNTP replies are FIFO per
+// connection, so a priority body queued behind anything waits for all of it.
 //
 // This only changes the outcome when inflightSem's cap (StatInflight, i.e.
 // max(Inflight, StatInflight)) exceeds the number of body slots a busy
@@ -521,21 +521,26 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 // parks at "c.inflightSem <- struct{}{}" in the writer loop, invisible to
 // every request lane including this one, and this method is never even
 // reached for it. This method only has anything to say about a connection
-// that still has pipeline room while a body is in flight.
+// that still has pipeline room while something is in flight.
 //
-// len(bodySem) == 0 means no BODY is in flight, but a bodyless STAT (which
-// takes only inflightSem, not bodySem — see isCheapCommand) can still have up
-// to StatInflight replies pipelined ahead of a request steered here, delaying
-// it FIFO-behind those replies. That cost is microseconds per STAT round trip,
-// not the ~94 ms a full body transfer costs, but it means "no body in flight"
-// is not quite the same claim as "the reader is not busy at all".
+// The pending-reply check matters because a bodyless STAT (which takes only
+// inflightSem, not bodySem — see isCheapCommand) can have up to StatInflight
+// replies pipelined ahead of a request steered here. That wait is cheap only
+// when the server answers fast, and for a missing article it does not:
+// Newshosting takes ~1.2 s per 430 and serialises them per connection, so a
+// liveness sweep over a mostly-dead release parks every connection it touches
+// for seconds — and, being body-free, those were precisely the connections a
+// bodySem-only check steered priority bodies onto (observed live as playback
+// falling from ~70 MB/s to ~5 MB/s beside such a sweep).
 //
-// len(bodySem) is the correct signal (rather than, say, bodySem's cap) because
-// readerLoop releases the slot only after the full body has been read and
-// delivered. The window where the writer holds a slot but the reader has not
-// started counts as busy — the safe side.
+// The writer calls this while holding one inflightSem slot of its own (it
+// acquires capacity before choosing a request), so an empty pipeline reads as
+// len(inflightSem) <= 1. Both len() reads are the right signal (rather than
+// the caps) because readerLoop releases a slot only after the full reply has
+// been read and delivered; the window where the writer holds a slot but the
+// reader has not started counts as busy — the safe side.
 func (c *NNTPConnection) idleBodyChan() <-chan *Request {
-	if len(c.bodySem) != 0 {
+	if len(c.bodySem) != 0 || len(c.inflightSem) > 1 {
 		return nil
 	}
 	return c.hotIdleBodyCh
