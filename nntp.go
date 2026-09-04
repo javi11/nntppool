@@ -565,16 +565,28 @@ func (c *NNTPConnection) idleBodyChan() <-chan *Request {
 	return c.hotIdleBodyCh
 }
 
-// prioLanes returns the priority request channels while this connection can
-// still take a priority body, and nil channels once it holds StreamInflight of
-// them. The writer acquires prioBodySem only after it has a request in hand, so
-// without this a full connection would keep receiving priority requests and
-// park each behind its pipeline while other slots, idle ones that would dial
-// included, see nothing on the lane. Observed live at a 15-connection budget as
-// only 8-12 sockets ever carrying bytes.
+// prioLanes returns the priority request channels this connection may read.
+//
+// Full (StreamInflight priority bodies held): neither. The writer acquires
+// prioBodySem only after it has a request in hand, so without this a full
+// connection would keep receiving priority requests and park each behind its
+// pipeline while other slots, idle ones that would dial included, saw nothing.
+//
+// Busy (at least one priority body in flight): the cold lane only. The client
+// offers every request to the hot lane first, and a hot connection with room
+// would otherwise deepen its own pipeline while undialed slots stayed idle: at
+// a 15-connection budget only 8-12 sockets ever carried bytes. Leaving the hot
+// lane makes the request go cold, where idle slots compete for it and dial;
+// pipelines deepen only once every slot is busy.
 func (c *NNTPConnection) prioLanes() (hot, cold <-chan *Request) {
-	if c.prioBodySem != nil && len(c.prioBodySem) >= cap(c.prioBodySem) {
+	if c.prioBodySem == nil {
+		return c.hotPrioCh, c.prioCh
+	}
+	switch held := len(c.prioBodySem); {
+	case held >= cap(c.prioBodySem):
 		return nil, nil
+	case held > 0:
+		return nil, c.prioCh
 	}
 	return c.hotPrioCh, c.prioCh
 }
