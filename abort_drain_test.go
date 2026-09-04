@@ -216,3 +216,38 @@ func TestStreamInflightCapsPriorityBodies(t *testing.T) {
 		}
 	}
 }
+
+// A connection holding its StreamInflight priority bodies must leave further
+// priority requests on the lane for other slots, so a second connection dials
+// and takes them instead of the first parking them behind its full pipeline.
+func TestFullPriorityPipelineLeavesRequestsForIdleSlots(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		var dials atomic.Int32
+		srv := &heldServer{release: make(chan struct{}), article: yencSinglePart([]byte("x"), "x")}
+		factory := func(ctx context.Context) (net.Conn, error) {
+			dials.Add(1)
+			return srv.factory(ctx)
+		}
+		c, err := NewClient(context.Background(), []Provider{{
+			Factory: factory, Connections: 2, Inflight: 10, StatInflight: 10, StreamInflight: 2,
+			SkipPing: true, IdleTimeout: time.Hour,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		for i := 0; i < 4; i++ {
+			go func() { _, _ = c.BodyStreamPriority(ctx, "p@test", io.Discard) }()
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && srv.count() < 4 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		got, d := srv.count(), dials.Load()
+		cancel()
+		_ = c.Close()
+		if got != 4 || d != 2 {
+			t.Fatalf("round %d: %d BODY commands on the wire over %d connections, want 4 over 2", round, got, d)
+		}
+	}
+}

@@ -501,13 +501,14 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 		return req, ok, true
 	default:
 	}
+	hotPrio, coldPrio := c.prioLanes()
 	select {
-	case req, ok = <-c.hotPrioCh:
+	case req, ok = <-hotPrio:
 		return req, ok, true
 	default:
 	}
 	select {
-	case req, ok = <-c.prioCh:
+	case req, ok = <-coldPrio:
 		return req, ok, true
 	default:
 	}
@@ -562,6 +563,20 @@ func (c *NNTPConnection) idleBodyChan() <-chan *Request {
 		return nil
 	}
 	return c.hotIdleBodyCh
+}
+
+// prioLanes returns the priority request channels while this connection can
+// still take a priority body, and nil channels once it holds StreamInflight of
+// them. The writer acquires prioBodySem only after it has a request in hand, so
+// without this a full connection would keep receiving priority requests and
+// park each behind its pipeline while other slots, idle ones that would dial
+// included, see nothing on the lane. Observed live at a 15-connection budget as
+// only 8-12 sockets ever carrying bytes.
+func (c *NNTPConnection) prioLanes() (hot, cold <-chan *Request) {
+	if c.prioBodySem != nil && len(c.prioBodySem) >= cap(c.prioBodySem) {
+		return nil, nil
+	}
+	return c.hotPrioCh, c.prioCh
 }
 
 func failRequest(ch chan Response, err error) {
@@ -1171,11 +1186,12 @@ mainLoop:
 				<-c.inflightSem
 				return
 			}
+			hotPrio, coldPrio := c.prioLanes()
 			select {
 			case req, ok = <-c.idleBodyChan():
-			case req, ok = <-c.hotPrioCh:
+			case req, ok = <-hotPrio:
 			case req, ok = <-c.hotReqCh:
-			case req, ok = <-c.prioCh:
+			case req, ok = <-coldPrio:
 			case req, ok = <-c.reqCh:
 			case <-c.ctx.Done():
 				<-c.inflightSem
