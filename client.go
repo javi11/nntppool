@@ -95,6 +95,26 @@ func (c *Client) BodyPriority(ctx context.Context, messageID string, onMeta ...f
 	return body, err
 }
 
+// BodyStreamPriority is BodyStream on the priority lane: decoded bytes are
+// written to w as each wire read is decoded, so a caller can serve the head
+// of an article before its tail has arrived. Bytes is nil on the result. If a
+// provider fails after some bytes were written the client does not fail over,
+// since re-streaming into w would duplicate them, and returns the error;
+// callers wanting a second attempt must supply a fresh writer.
+func (c *Client) BodyStreamPriority(ctx context.Context, messageID string, w io.Writer, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
+	if w == nil {
+		return nil, fmt.Errorf("nntp: BodyStreamPriority requires a non-nil writer")
+	}
+	payload := []byte("BODY <" + messageID + ">\r\n")
+	var respCh <-chan Response
+	if len(onMeta) > 0 {
+		respCh = c.SendPriority(ctx, payload, w, onMeta[0])
+	} else {
+		respCh = c.SendPriority(ctx, payload, w)
+	}
+	return c.finishBody(messageID, w, respCh)
+}
+
 // BodyStream retrieves and decodes an article body, streaming decoded bytes to w.
 // The returned ArticleBody contains metadata but Bytes will be nil.
 // An optional onMeta callback is invoked with yEnc metadata before body decoding begins.
