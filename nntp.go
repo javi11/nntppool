@@ -182,6 +182,15 @@ type Request struct {
 	// deadline no longer applies — the connection's rolling stall timeout does.
 	attemptDeadline time.Time
 
+	// attemptWindow is the duration attemptDeadline was derived from. The
+	// reader re-anchors it at the moment it starts draining this request's
+	// response (drain start + attemptWindow), so time spent queued behind
+	// other pipelined responses never counts against the TTFB bound —
+	// dispatch-anchored read deadlines let one deep request burst expire the
+	// whole pipeline and tear the connection down. Zero falls back to
+	// attemptDeadline as-is.
+	attemptWindow time.Duration
+
 	// attemptState is one of attemptPending/attemptCommitted/attemptAbandoned.
 	// The reader CASes pending→committed on the first response byte; tryGroup's
 	// timer CASes pending→abandoned on expiry. Zero value is attemptPending.
@@ -1154,6 +1163,7 @@ mainLoop:
 				RespCh:          kaCh,
 				Ctx:             context.Background(),
 				attemptDeadline: time.Now().Add(c.keepaliveProbeTimeout()),
+				attemptWindow:   c.keepaliveProbeTimeout(),
 			}
 			if _, err := bw.Write(kaReq.Payload); err != nil {
 				_ = c.conn.Close()
@@ -1360,46 +1370,103 @@ func (c *NNTPConnection) readerLoop() {
 		outRef := &writerRef{w: out}
 
 		// Progress-aware deadline: before the first response byte we honor the
-		// attempt deadline (dispatch + TTFB bound); once bytes flow we switch to
-		// a rolling stall deadline that the wire progress keeps extending, so a
-		// healthy-but-slow body never trips it. The caller's own ctx deadline
-		// always still applies as an upper bound.
+		// attempt window as a TTFB bound — re-anchored at drain start, so time
+		// a request spent queued behind other pipelined responses never counts
+		// against it (replies are FIFO; the server has not even seen slowness).
+		// A dispatch-anchored deadline here lets one deep request burst arrive
+		// with its windows pre-expired, and the resulting read timeouts tear
+		// the connection down and fail every pipelined neighbour with
+		// "connection died" (observed live during wide STAT sweeps). Once bytes
+		// flow we switch to the rolling stall deadline. The caller's own ctx
+		// deadline applies as an upper bound only while the caller still wants
+		// the response: once the request is abandoned (attempt expired and
+		// failed over, or caller ctx done) its deadlines are stale and only the
+		// drain-anchored window / stall bound governs — the server must keep
+		// making progress, nothing more.
 		stall := c.stallTimeout
 		lastBytes := 0
 		var stallDeadline time.Time
 		var firstByteAt time.Time
 		respStart := time.Now()
-		err := c.rb.feedUntilDone(c.conn, &decoder, outRef, func(wireBytes int) (time.Time, bool) {
-			if deliver {
-				select {
-				case <-req.Ctx.Done():
-					deliver = false
-					outRef.w = io.Discard
-				default:
-				}
+		abandoned := func() bool {
+			return req.attemptState.Load() == attemptAbandoned || req.Ctx.Err() != nil
+		}
+		ttfbBound := func() (time.Time, bool) {
+			if req.attemptWindow > 0 {
+				return respStart.Add(req.attemptWindow), true
 			}
-			if wireBytes > lastBytes {
-				lastBytes = wireBytes
-				if firstByteAt.IsZero() {
-					firstByteAt = time.Now()
-				}
-				req.attemptState.CompareAndSwap(attemptPending, attemptCommitted)
-				if stall > 0 {
-					if dl := time.Now().Add(stall); dl.Sub(stallDeadline) >= stallDeadlineQuantum {
-						stallDeadline = dl
+			if !req.attemptDeadline.IsZero() {
+				return req.attemptDeadline, true
+			}
+			return time.Time{}, false
+		}
+		drain := func() error {
+			return c.rb.feedUntilDone(c.conn, &decoder, outRef, func(wireBytes int) (time.Time, bool) {
+				if deliver {
+					select {
+					case <-req.Ctx.Done():
+						deliver = false
+						outRef.w = io.Discard
+					default:
 					}
 				}
-			}
-			parentDL, hasParent := req.Ctx.Deadline()
-			switch {
-			case lastBytes == 0 && !req.attemptDeadline.IsZero():
-				return minDeadline(req.attemptDeadline, parentDL, hasParent)
-			case lastBytes > 0 && stall > 0:
-				return minDeadline(stallDeadline, parentDL, hasParent)
-			default:
+				if wireBytes > lastBytes {
+					lastBytes = wireBytes
+					if firstByteAt.IsZero() {
+						firstByteAt = time.Now()
+					}
+					req.attemptState.CompareAndSwap(attemptPending, attemptCommitted)
+					if stall > 0 {
+						if dl := time.Now().Add(stall); dl.Sub(stallDeadline) >= stallDeadlineQuantum {
+							stallDeadline = dl
+						}
+					}
+				}
+				if lastBytes > 0 {
+					// Committed: the attempt owns the wire and the caller's
+					// own deadline no longer applies at all, abandoned or
+					// not — see the field comment. Folding a live parentDL
+					// in here (the pre-fix behavior) raced the caller's
+					// timer against this exact deadline, since both target
+					// the same instant: whichever timer the Go runtime
+					// resolved first decided whether the read returned
+					// "abandoned" (parentDL fired, ctx.Err() not yet set)
+					// or genuinely abandoned, and a queued neighbor request
+					// paid for the wrong guess with the whole connection.
+					if stall > 0 {
+						return stallDeadline, true
+					}
+					return time.Time{}, false
+				}
+				parentDL, hasParent := req.Ctx.Deadline()
+				if abandoned() {
+					// Stale caller deadlines must not govern the drain.
+					parentDL, hasParent = time.Time{}, false
+				}
+				if bound, ok := ttfbBound(); ok {
+					return minDeadline(bound, parentDL, hasParent)
+				}
 				return parentDL, hasParent
+			})
+		}
+		err := drain()
+		// A read that timed out on a caller deadline may have raced the very
+		// abandonment that invalidates it (the tryGroup timer fires at the same
+		// instant the attempt deadline expires, and a caller ctx expiring IS the
+		// abandonment). Re-check and resume the drain under the surviving bound
+		// instead of surfacing a timeout that would kill the connection; a
+		// genuinely stalled server still runs out the drain-anchored window (or
+		// the stall clock) and dies below.
+		for err != nil && isTimeoutErr(err) && abandoned() {
+			bound, ok := ttfbBound()
+			if lastBytes > 0 {
+				bound, ok = stallDeadline, stall > 0
 			}
-		})
+			if !ok || !time.Now().Before(bound) {
+				break
+			}
+			err = drain()
+		}
 		if err != nil {
 			if c.providerName != "" {
 				resp.Err = fmt.Errorf("%s: %w", c.providerName, err)
@@ -2471,6 +2538,7 @@ func (c *Client) tryGroupTimeout(
 		BodyWriter:      bodyWriter,
 		OnMeta:          onMeta,
 		attemptDeadline: time.Now().Add(attemptTimeout),
+		attemptWindow:   attemptTimeout,
 		providerName:    g.name,
 	}
 
