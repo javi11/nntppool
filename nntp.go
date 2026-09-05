@@ -620,6 +620,23 @@ func resolveBackgroundFloor(connections, floor int) int32 {
 	return int32(floor)
 }
 
+// backgroundRecheckInterval is how often a parked writer whose background
+// gate was closed re-evaluates it while background work is queued.
+const backgroundRecheckInterval = 200 * time.Millisecond
+
+// backgroundRecheck returns a timer channel when background work is queued on
+// bgCh but the gate handed this writer a nil lane, and nil (never ready)
+// otherwise. A writer parks with the gate's verdict frozen into its select, and
+// the events that reopen the gate — a background reply completing, foreground
+// going quiet — wake no writer by themselves; without this the queued work
+// waits for an unrelated request or an idle timer.
+func backgroundRecheck(bgCh, lane <-chan *Request) <-chan time.Time {
+	if bgCh == nil || lane != nil || len(bgCh) == 0 {
+		return nil
+	}
+	return time.After(backgroundRecheckInterval)
+}
+
 // backgroundLaneFor gates a provider group's background lane: the channel
 // when this connection may take background work, nil (never ready in a
 // select) when it may not.
@@ -952,6 +969,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		gateCtx := ctx
 		if !preWarm {
 			// Prefer priority requests over normal ones.
+			bgLane := backgroundLaneFor(stats, bgCh)
 			select {
 			case firstReq, ok = <-prioCh:
 				if !ok {
@@ -967,10 +985,12 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 					if !ok {
 						return // channel closed, shut down
 					}
-				case firstReq, ok = <-backgroundLaneFor(stats, bgCh):
+				case firstReq, ok = <-bgLane:
 					if !ok {
 						return
 					}
+				case <-backgroundRecheck(bgCh, bgLane):
+					continue
 				case <-ctx.Done():
 					return
 				}
@@ -1328,13 +1348,19 @@ mainLoop:
 				return
 			}
 			hotPrio, coldPrio := c.prioLanes()
+			bgLane := c.bgLane()
 			select {
 			case req, ok = <-c.idleBodyChan():
 			case req, ok = <-hotPrio:
 			case req, ok = <-c.hotReqCh:
 			case req, ok = <-coldPrio:
 			case req, ok = <-c.reqCh:
-			case req, ok = <-c.bgLane():
+			case req, ok = <-bgLane:
+			case <-backgroundRecheck(c.bgCh, bgLane):
+				// The gate was closed when this writer parked; in-flight may
+				// have dropped since with nothing else to wake it. Re-evaluate.
+				<-c.inflightSem
+				continue
 			case <-c.ctx.Done():
 				<-c.inflightSem
 				return
@@ -2855,8 +2881,20 @@ func (c *Client) tryGroupTimeout(
 		lane:            ln,
 	}
 
+	// The attempt timer bounds dispatch plus time-to-first-byte. A background
+	// request is meant to wait — the lane holds it back for as long as
+	// foreground traffic keeps the gate closed — so queue time must not count
+	// against it: no client-side timer and no dispatch deadline. Once a
+	// connection starts draining its reply, the reader still applies
+	// attemptWindow from that moment, so a hung server is caught as usual.
 	timer := time.NewTimer(attemptTimeout)
 	defer timer.Stop()
+	var timerC <-chan time.Time
+	if ln == laneBackground {
+		req.attemptDeadline = time.Time{}
+	} else {
+		timerC = timer.C
+	}
 
 	var hotCh chan *Request
 	var coldCh chan *Request
@@ -2899,7 +2937,7 @@ func (c *Client) tryGroupTimeout(
 				return Response{}, false, ctx.Err() != nil
 			case <-g.ctx.Done():
 				return Response{}, false, false
-			case <-timer.C:
+			case <-timerC:
 				// Could not be dispatched within the attempt window: the provider
 				// is saturated. Fail over — with the reason preserved, so the
 				// terminal error names the saturation instead of arriving bare.
@@ -2919,7 +2957,7 @@ func (c *Client) tryGroupTimeout(
 			return Response{}, false, false
 		case <-reqCtx.Done():
 			return Response{}, false, ctx.Err() != nil
-		case <-timer.C:
+		case <-timerC:
 			if req.attemptState.CompareAndSwap(attemptPending, attemptAbandoned) {
 				// No response byte arrived in time: hung or too-slow to start.
 				// Cancel so the reader drops the request, and fail over. The

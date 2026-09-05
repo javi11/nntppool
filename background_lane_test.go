@@ -2,6 +2,7 @@ package nntppool
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -230,6 +231,113 @@ func TestProviderBackgroundFloorDefaultsToQuarter(t *testing.T) {
 	for _, tc := range cases {
 		if got := resolveBackgroundFloor(int(tc.conns), int(tc.floor)); got != tc.want {
 			t.Errorf("conns=%d floor=%d: got %d, want %d", tc.conns, tc.floor, got, tc.want)
+		}
+	}
+}
+
+// A background request is expected to wait: it must not expire at dispatch
+// after the attempt window the way a foreground request does. Only the
+// caller's context bounds how long it may queue.
+func TestBackgroundDispatchWaitsPastAttemptWindow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	g := &providerGroup{
+		ctx:      context.Background(),
+		reqCh:    make(chan *Request),
+		prioCh:   make(chan *Request),
+		hotReqCh: make(chan *Request),
+		bgCh:     make(chan *Request), // unbuffered: nobody is reading yet
+	}
+	cl := &Client{ctx: context.Background()}
+
+	go func() {
+		time.Sleep(400 * time.Millisecond) // four attempt windows with no reader
+		req := <-g.bgCh
+		req.RespCh <- Response{StatusCode: 223}
+	}()
+
+	resp, ok, done := cl.tryGroupTimeout(ctx, g, []byte("STAT <bg@h>\r\n"), nil, nil, laneBackground, 100*time.Millisecond)
+	if done || !ok || resp.Err != nil {
+		t.Fatalf("resp.Err=%v ok=%v done=%v: background dispatch must wait, not expire", resp.Err, ok, done)
+	}
+	if resp.StatusCode != 223 {
+		t.Fatalf("status = %d, want 223", resp.StatusCode)
+	}
+}
+
+// holdingServer answers BODY after holding it for a fixed delay.
+type holdingServer struct{ hold time.Duration }
+
+func (s holdingServer) factory() ConnFactory {
+	return func(ctx context.Context) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer func() { _ = server.Close() }()
+			_, _ = server.Write([]byte("200 ready\r\n"))
+			buf := make([]byte, 4096)
+			for {
+				n, err := server.Read(buf)
+				if err != nil {
+					return
+				}
+				for _, cmd := range strings.Split(strings.TrimRight(string(buf[:n]), "\r\n"), "\r\n") {
+					switch {
+					case strings.HasPrefix(cmd, "DATE"):
+						_, _ = server.Write([]byte("111 20240101000000\r\n"))
+					case strings.HasPrefix(cmd, "BODY "):
+						time.Sleep(s.hold)
+						_, _ = server.Write(yencSinglePart([]byte("payload"), "f.bin"))
+					default:
+						_, _ = server.Write([]byte("500 unsupported\r\n"))
+					}
+				}
+			}
+		}()
+		return client, nil
+	}
+}
+
+// A writer that parks with the background lane disarmed (gate closed at the
+// floor) must re-arm it once background in-flight drops, or queued background
+// work waits for an unrelated wake-up. Inflight 2 lets the writer park while
+// its background body is still in flight, which is when the stall bites.
+func TestBackgroundLaneRearmsAfterInflightDrops(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:         holdingServer{hold: 150 * time.Millisecond}.factory(),
+		Connections:     1,
+		MinConnections:  1,
+		Inflight:        2,
+		BackgroundFloor: 1,
+		SkipPing:        true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.Body(ctx, "fg@h"); err != nil { // stamps recent foreground: gate closes at the floor
+		t.Fatal(err)
+	}
+
+	errs := make(chan error, 3)
+	for i := range 3 {
+		go func() {
+			_, err := c.BodyBackground(ctx, fmt.Sprintf("bg%d@h", i))
+			errs <- err
+		}()
+	}
+	deadline := time.After(3 * time.Second)
+	for range 3 {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("background body: %v", err)
+			}
+		case <-deadline:
+			t.Fatal("background bodies stalled: the parked writer never re-armed the background lane")
 		}
 	}
 }
