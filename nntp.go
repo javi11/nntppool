@@ -570,12 +570,55 @@ func (c *NNTPConnection) bgLane() <-chan *Request {
 	return backgroundLaneFor(c.stats, c.bgCh)
 }
 
+// noteDispatched records a request that has just been written to the wire in
+// the provider group's background gate: a background request is counted in
+// flight until its reply is read (or the pending queue is drained); anything
+// else stamps the group as having recent foreground traffic. Keepalive probes
+// carry no lane and count as foreground, which is harmless — a connection
+// idle long enough to probe is one the gate would open for anyway.
+func (c *NNTPConnection) noteDispatched(req *Request) {
+	if c.stats == nil {
+		return
+	}
+	if req.lane == laneBackground {
+		c.stats.bgInflight.Add(1)
+		req.heldBg = true
+		return
+	}
+	c.stats.lastForeground.Store(time.Now().UnixNano())
+}
+
+// releaseBackground undoes noteDispatched's count for a background request,
+// exactly once.
+func (c *NNTPConnection) releaseBackground(req *Request) {
+	if req.heldBg && c.stats != nil {
+		req.heldBg = false
+		c.stats.bgInflight.Add(-1)
+	}
+}
+
 // backgroundYieldWindow is how long after the last priority- or normal-lane
 // dispatch a provider group counts as contended. Playback and imports issue
 // requests continuously, so while either runs the group stays contended and
 // background work is held to its floor; once they stop, the floor lifts after
 // this long and background may take every idle connection.
 const backgroundYieldWindow = 3 * time.Second
+
+// resolveBackgroundFloor applies Provider.BackgroundFloor's defaults and
+// clamps: a quarter of the connections by default, at least one, and never
+// the whole allowance (unless the allowance is a single connection).
+func resolveBackgroundFloor(connections, floor int) int32 {
+	if floor <= 0 {
+		floor = connections / 4
+	}
+	if floor < 1 {
+		floor = 1
+	}
+	if connections > 1 && floor > connections-1 {
+		floor = connections - 1
+	}
+	return int32(floor)
+}
 
 // backgroundLaneFor gates a provider group's background lane: the channel
 // when this connection may take background work, nil (never ready in a
@@ -713,6 +756,7 @@ func (c *NNTPConnection) drainPending() {
 				continue
 			}
 			failRequest(req.RespCh, connErr)
+			c.releaseBackground(req)
 			// Best-effort inflight release (not strictly needed once we're shutting down).
 			select {
 			case <-c.inflightSem:
@@ -1169,6 +1213,7 @@ func (c *NNTPConnection) Run() {
 			c.failOutstanding()
 			return
 		}
+		c.noteDispatched(req)
 		if req.PostMode {
 			// Two-phase POST: flush "POST\r\n" immediately so the server can
 			// respond with 340/440 before we send the article body.
@@ -1459,6 +1504,7 @@ mainLoop:
 			c.failOutstanding()
 			return
 		}
+		c.noteDispatched(req)
 		if req.PostMode {
 			// Two-phase POST: flush "POST\r\n" immediately so the server can
 			// respond with 340/440 before we send the article body. Blocking
@@ -1768,6 +1814,7 @@ func (c *NNTPConnection) readerLoop() {
 		if req.heldPrio {
 			<-c.prioBodySem
 		}
+		c.releaseBackground(req)
 
 		// If we hit a timeout, cancellation-related network error, or protocol
 		// desync, close the connection so the pool replaces it with a fresh one.
@@ -1884,6 +1931,15 @@ type Provider struct {
 	// bodies on its connection while normal-lane bodies keep Inflight.
 	// 0 defaults to min(Inflight, 4); a value >= Inflight disables the cap.
 	StreamInflight int
+
+	// BackgroundFloor is how many background-lane requests (BodyBackground,
+	// StatBackground, StatMany with Background) this provider keeps in flight
+	// while priority or normal traffic is recent. When the provider is idle
+	// background may use every connection; the floor only bounds it under
+	// contention so a stream never finds more than this many connections stuck
+	// behind background bodies. 0 defaults to max(1, Connections/4); values
+	// are clamped to [1, Connections-1] (or 1 for a single connection).
+	BackgroundFloor int
 
 	// AbortDrainBytes: when a body's request is cancelled while its bytes are
 	// still arriving, the connection normally drains the rest to stay in sync.
@@ -2241,6 +2297,7 @@ func (c *Client) newProviderGroup(p Provider, index int) (*providerGroup, ConnFa
 		quotaPeriod:   p.QuotaPeriod,
 	}
 	g.stats.quotaBytes = p.QuotaBytes
+	g.stats.bgFloor = resolveBackgroundFloor(p.Connections, p.BackgroundFloor)
 	if p.QuotaBytes > 0 {
 		if p.QuotaUsed > 0 {
 			g.stats.quotaUsed.Store(p.QuotaUsed)
@@ -2486,6 +2543,24 @@ func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io
 	}
 
 	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, lanePriority)
+	return respCh
+}
+
+// SendBackground is like Send but enqueues the request on the background
+// lane, which connections read only when the priority and normal lanes are
+// empty and which is capped per provider while foreground traffic is recent.
+func (c *Client) SendBackground(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response {
+	respCh := make(chan Response, 1)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var metaFn func(YEncMeta)
+	if len(onMeta) > 0 {
+		metaFn = onMeta[0]
+	}
+
+	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, laneBackground)
 	return respCh
 }
 
