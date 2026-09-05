@@ -731,6 +731,20 @@ func (g *connGate) enter(slotCtx, reqCtx context.Context) bool {
 	return true
 }
 
+// tryEnter reserves connection capacity without blocking. Cold slots use this
+// after dequeuing a request so a throttled gate cannot strand that request
+// behind connections which are already active and able to serve it.
+func (g *connGate) tryEnter() (entered bool, running int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.held >= g.allowed {
+		return false, g.running
+	}
+	g.held++
+	g.available.Store(int32(g.allowed - g.held))
+	return true, g.running
+}
+
 func (g *connGate) exit() {
 	g.mu.Lock()
 	g.held--
@@ -802,11 +816,31 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 // immediately on death), giving the provider a floor of connections that
 // stay hot independent of traffic. Callers pair preWarm with idleTimeout==0
 // so these connections are never torn down for being idle.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, hotIdleBodyCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, streamInflight int, abortDrainBytes int64, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh chan *Request, hotPrioCh chan *Request, hotIdleBodyCh chan *Request, factory ConnFactory, inflight int, statInflight int, streamInflight int, abortDrainBytes int64, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
 	var sharedBuf readBuffer
+	handoffToActive := func(req *Request, priority bool) {
+		if priority && !isCheapCommand(req.Payload) {
+			select {
+			case hotIdleBodyCh <- req:
+				return
+			default:
+			}
+		}
+		hotCh := hotReqCh
+		if priority {
+			hotCh = hotPrioCh
+		}
+		select {
+		case hotCh <- req:
+		case <-req.Ctx.Done():
+			failRequest(req.RespCh, req.Ctx.Err())
+		case <-ctx.Done():
+			failRequest(req.RespCh, ctx.Err())
+		}
+	}
 
 	for {
 		// preWarm slots have no request to wait on, so unlike the cold path
@@ -825,18 +859,21 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// pre-warmed slot, which dials immediately without waiting for real
 		// traffic so a minimum number of connections stay hot.
 		var firstReq *Request
+		var firstReqPriority bool
 		var ok bool
 		gateCtx := ctx
 		if !preWarm {
 			// Prefer priority requests over normal ones.
 			select {
 			case firstReq, ok = <-prioCh:
+				firstReqPriority = true
 				if !ok {
 					return
 				}
 			default:
 				select {
 				case firstReq, ok = <-prioCh:
+					firstReqPriority = true
 					if !ok {
 						return
 					}
@@ -859,15 +896,26 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 			}
 		}
 
-		// GATE: block if we're at the throttled capacity limit.
-		if !gate.enter(ctx, gateCtx) {
+		// GATE: a cold slot has already removed firstReq from the shared queue.
+		// If throttling leaves no room to dial while other connections are
+		// active, hand the request to one of those connections instead of
+		// blocking here with work that the active connections can no longer see.
+		entered := false
+		if firstReq != nil {
+			var running int
+			entered, running = gate.tryEnter()
+			if !entered && running > 0 {
+				handoffToActive(firstReq, firstReqPriority)
+				continue
+			}
+		}
+		if !entered && !gate.enter(ctx, gateCtx) {
 			// Slot or request context cancelled while waiting at the gate.
 			if firstReq != nil {
 				failRequest(firstReq.RespCh, context.Canceled)
 			}
 			continue
 		}
-
 		// CONNECTING: dial, greet, authenticate.
 		conn, err := factory(ctx)
 		if err != nil {
@@ -890,14 +938,19 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc, err := newNNTPConnectionFromConn(ctx, conn, statInflight, reqCh, prioCh, auth, userAgent, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
-			if firstReq != nil {
-				failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
-			}
 
 			if errors.Is(err, ErrMaxConnections) {
-				// Server said "max connections" — throttle and use longer backoff.
+				// The bootstrap request has not reached an NNTP connection. Hand it
+				// directly to an already-connected slot on its original priority lane
+				// instead of surfacing a transient capacity error to the caller.
 				gate.throttle()
 				gate.exit()
+				_, running := gate.snapshot()
+				if firstReq != nil && running > 0 {
+					handoffToActive(firstReq, firstReqPriority)
+				} else if firstReq != nil {
+					failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+				}
 				select {
 				case <-time.After(maxConnsBackoff):
 				case <-ctx.Done():
@@ -905,6 +958,9 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 				}
 			} else {
 				gate.exit()
+				if firstReq != nil {
+					failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+				}
 				select {
 				case <-time.After(connFailureBackoff):
 				case <-ctx.Done():
