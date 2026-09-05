@@ -341,3 +341,126 @@ func TestBackgroundLaneRearmsAfterInflightDrops(t *testing.T) {
 		}
 	}
 }
+
+// Background work may only land on a connection whose pipeline is empty:
+// behind a foreground body it would inherit that body's latency, and — the
+// other way round — a foreground request landing behind pipelined background
+// STATs on a missing-article-slow provider waits seconds per STAT.
+func TestBackgroundLaneRequiresIdlePipeline(t *testing.T) {
+	bg := make(chan *Request, 1)
+	c := &NNTPConnection{bgCh: bg, inflightSem: make(chan struct{}, 4), bodySem: make(chan struct{}, 2)}
+
+	c.inflightSem <- struct{}{} // the writer's own slot, held while it chooses
+	if c.bgLane() == nil {
+		t.Fatal("idle pipeline: background lane must be open")
+	}
+	c.inflightSem <- struct{}{} // one reply still owed
+	if c.bgLane() != nil {
+		t.Fatal("a reply is pending: background lane must be closed")
+	}
+	<-c.inflightSem
+	c.bodySem <- struct{}{} // a body in flight
+	if c.bgLane() != nil {
+		t.Fatal("a body is in flight: background lane must be closed")
+	}
+}
+
+// While a connection has background requests pending it reads only the
+// background lane, so foreground work never queues behind them.
+func TestForegroundLanesClosedWhileBackgroundPending(t *testing.T) {
+	prio := make(chan *Request, 1)
+	req := make(chan *Request, 1)
+	bg := make(chan *Request, 1)
+	prio <- &Request{Payload: []byte("BODY <p>\r\n"), lane: lanePriority}
+	req <- &Request{Payload: []byte("BODY <n>\r\n")}
+
+	c := &NNTPConnection{prioCh: prio, reqCh: req, bgCh: bg, inflightSem: make(chan struct{}, 4), bodySem: make(chan struct{}, 2)}
+	c.inflightSem <- struct{}{}
+	c.bgPending.Store(1)
+
+	if _, _, got := c.tryNextRequest(); got {
+		t.Fatal("foreground request served by a connection with background pending")
+	}
+	bgReq := &Request{Payload: []byte("STAT <b>\r\n"), lane: laneBackground}
+	bg <- bgReq
+	c.inflightSem <- struct{}{} // pending background reply: pipeline not idle, but more background may pipeline behind it
+	if r, _, got := c.tryNextRequest(); !got || r != bgReq {
+		t.Fatal("background request must still be served by a background-busy connection")
+	}
+
+	c.bgPending.Store(0)
+	<-c.inflightSem
+	if r, _, got := c.tryNextRequest(); !got || r.lane != lanePriority {
+		t.Fatal("with no background pending the priority request must be served")
+	}
+}
+
+// End to end: a connection draining a background body must not be handed a
+// priority body while the other connection is free.
+func TestPriorityBodyAvoidsBackgroundBusyConnection(t *testing.T) {
+	srv := &bodySteeringServer{
+		servedBy: map[string]int{},
+		slowID:   "slowbg@h",
+		release:  make(chan struct{}),
+		started:  make(chan struct{}),
+	}
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:        srv.factory(t),
+		Connections:    2,
+		MinConnections: 2,
+		Inflight:       2,
+		SkipPing:       true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := srv.conns
+		srv.mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connections never finished pre-warm dialing")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, id := range []string{"warm0@h", "warm1@h", "warm2@h", "warm3@h"} {
+		if _, err := c.Body(ctx, id); err != nil {
+			t.Fatalf("warm-up body %q: %v", id, err)
+		}
+	}
+
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		_, _ = c.BodyBackground(ctx, "slowbg@h")
+	}()
+	select {
+	case <-srv.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("background body never reached the server")
+	}
+
+	for i := range 6 {
+		id := fmt.Sprintf("fast%d@h", i)
+		if _, err := c.BodyPriority(ctx, id); err != nil {
+			t.Fatalf("priority body: %v", err)
+		}
+		srv.mu.Lock()
+		slowConn, fastConn := srv.servedBy["slowbg@h"], srv.servedBy[id]
+		srv.mu.Unlock()
+		if slowConn == fastConn {
+			t.Fatalf("priority body %s landed on connection %d, which is draining a background body", id, fastConn)
+		}
+	}
+
+	close(srv.release)
+	<-slowDone
+}

@@ -296,6 +296,20 @@ type NNTPConnection struct {
 	bgCh          <-chan *Request // background lane; read only when priority and normal are empty (see bgLane)
 	pending       chan *Request
 
+	// bgPending counts background-lane requests this connection has written
+	// and not yet seen replied. While it is non-zero the connection is
+	// dedicated to background work: it reads no foreground lane, so a stream
+	// body never queues behind pipelined background STATs (seconds each for a
+	// missing article on some providers). Written by the writer, released by
+	// the reader.
+	bgPending atomic.Int32
+
+	// wake is poked by the reader whenever a reply completes, so a writer
+	// parked with lanes disarmed (pipeline busy, or dedicated to background)
+	// re-evaluates them the moment the pipeline changes instead of waiting
+	// for an unrelated request or a timer.
+	wake chan struct{}
+
 	// inflightSem bounds the total pipeline depth (cap = StatInflight, i.e.
 	// max(Inflight, StatInflight)). bodySem additionally bounds concurrent
 	// body-bearing commands (cap = Inflight) so raising the STAT pipeline depth
@@ -377,6 +391,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		prioCh:      prioCh,
 		pending:     make(chan *Request, inflightLimit),
 		inflightSem: make(chan struct{}, inflightLimit),
+		wake:        make(chan struct{}, 1),
 		// Default bodySem to the full pipeline depth (no separate BODY bound);
 		// runConnSlot overrides this to Provider.Inflight when a deeper STAT
 		// pipeline is configured. Standalone connections keep them equal.
@@ -530,6 +545,14 @@ func isCheapCommand(payload []byte) bool {
 // got reports whether any channel was ready; ok is false when the channel that
 // fired was closed.
 func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
+	if c.bgPending.Load() > 0 {
+		select {
+		case req, ok = <-c.bgLane():
+			return req, ok, true
+		default:
+		}
+		return nil, false, false
+	}
 	select {
 	case req, ok = <-c.idleBodyChan():
 		return req, ok, true
@@ -567,7 +590,31 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 // bgLane returns the background lane this connection may read from, or nil
 // (never ready in a select) when it must not take background work right now.
 func (c *NNTPConnection) bgLane() <-chan *Request {
+	// Background work lands only on an empty pipeline — or behind other
+	// background work already pipelined here. Behind a foreground body it
+	// would inherit that body's transfer time, and the connection could not
+	// be dedicated (see bgPending) without stalling the body's owner.
+	if c.bgPending.Load() == 0 && !c.pipelineIdle() {
+		return nil
+	}
 	return backgroundLaneFor(c.stats, c.bgCh)
+}
+
+// pipelineIdle reports whether nothing is outstanding on the wire: no body in
+// flight and no pipelined reply owed. The writer holds one inflightSem slot of
+// its own while it chooses a request, hence <= 1.
+func (c *NNTPConnection) pipelineIdle() bool {
+	return len(c.bodySem) == 0 && len(c.inflightSem) <= 1
+}
+
+// foregroundLanes returns the lanes a connection may read besides background:
+// all of them normally, none while it is dedicated to background work.
+func (c *NNTPConnection) foregroundLanes() (idleBody, hotPrio, hotReq, coldPrio, req <-chan *Request) {
+	if c.bgPending.Load() > 0 {
+		return nil, nil, nil, nil, nil
+	}
+	hotPrio, coldPrio = c.prioLanes()
+	return c.idleBodyChan(), hotPrio, c.hotReqCh, coldPrio, c.reqCh
 }
 
 // noteDispatched records a request that has just been written to the wire in
@@ -582,10 +629,23 @@ func (c *NNTPConnection) noteDispatched(req *Request) {
 	}
 	if req.lane == laneBackground {
 		c.stats.bgInflight.Add(1)
+		c.bgPending.Add(1)
 		req.heldBg = true
 		return
 	}
 	c.stats.lastForeground.Store(time.Now().UnixNano())
+}
+
+// pokeWriter tells a parked writer that the pipeline changed. Non-blocking:
+// one pending poke is enough, the writer re-reads all state when it wakes.
+func (c *NNTPConnection) pokeWriter() {
+	if c.wake == nil {
+		return
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 // releaseBackground undoes noteDispatched's count for a background request,
@@ -594,6 +654,7 @@ func (c *NNTPConnection) releaseBackground(req *Request) {
 	if req.heldBg && c.stats != nil {
 		req.heldBg = false
 		c.stats.bgInflight.Add(-1)
+		c.bgPending.Add(-1)
 	}
 }
 
@@ -1347,15 +1408,20 @@ mainLoop:
 				<-c.inflightSem
 				return
 			}
-			hotPrio, coldPrio := c.prioLanes()
+			idleBody, hotPrio, hotReq, coldPrio, reqLane := c.foregroundLanes()
 			bgLane := c.bgLane()
 			select {
-			case req, ok = <-c.idleBodyChan():
+			case req, ok = <-idleBody:
 			case req, ok = <-hotPrio:
-			case req, ok = <-c.hotReqCh:
+			case req, ok = <-hotReq:
 			case req, ok = <-coldPrio:
-			case req, ok = <-c.reqCh:
+			case req, ok = <-reqLane:
 			case req, ok = <-bgLane:
+			case <-c.wake:
+				// A reply completed: the pipeline may be idle now, or the
+				// connection no longer dedicated to background. Re-evaluate.
+				<-c.inflightSem
+				continue
 			case <-backgroundRecheck(c.bgCh, bgLane):
 				// The gate was closed when this writer parked; in-flight may
 				// have dropped since with nothing else to wake it. Re-evaluate.
@@ -1841,6 +1907,7 @@ func (c *NNTPConnection) readerLoop() {
 			<-c.prioBodySem
 		}
 		c.releaseBackground(req)
+		c.pokeWriter()
 
 		// If we hit a timeout, cancellation-related network error, or protocol
 		// desync, close the connection so the pool replaces it with a fresh one.
