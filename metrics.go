@@ -42,6 +42,15 @@ type providerStats struct {
 	quotaUsed     atomic.Int64 // bytes consumed in the current quota period
 	quotaExceeded atomic.Bool  // cached flag: set when quotaUsed >= quotaBytes; cleared on period reset
 
+	// Background lane gate. bgInflight counts background-lane requests this
+	// group currently has on the wire; lastForeground is the Unix-nanosecond
+	// time a priority- or normal-lane request was last written; bgFloor is how
+	// many background requests may stay in flight while foreground traffic is
+	// recent (see backgroundLaneFor). bgFloor is set once at group init.
+	bgInflight     atomic.Int32
+	lastForeground atomic.Int64
+	bgFloor        int32
+
 	// Escalation circuit breaker. escFruitless counts consecutive escalated
 	// passes that expired without delivering anything; once it reaches
 	// escalationBreakerThreshold, escSuppressedUntil holds the Unix-nanosecond
