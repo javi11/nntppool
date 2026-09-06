@@ -2,7 +2,7 @@ module github.com/javi11/nntppool/v4
 
 go 1.25.1
 
-require github.com/mnightingale/rapidyenc v0.0.0-20251128204712-7aafef1eaf1c
+require github.com/javi11/rapidyenc v0.0.0-20260215144528-f0dac5a39d34
 
 require (
 	4d63.com/gocheckcompilerdirectives v1.3.0 // indirect

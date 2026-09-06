@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mnightingale/rapidyenc"
+	"github.com/javi11/rapidyenc"
 )
 
 // mockNNTPResponse builds a full NNTP response byte sequence.

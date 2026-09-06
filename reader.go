@@ -10,7 +10,7 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/mnightingale/rapidyenc"
+	"github.com/javi11/rapidyenc"
 )
 
 // YEncMeta groups yEnc metadata fields available from =ybegin and =ypart headers,

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mnightingale/rapidyenc"
+	"github.com/javi11/rapidyenc"
 )
 
 // ArticleEncoding describes the transfer encoding detected in an article body.
