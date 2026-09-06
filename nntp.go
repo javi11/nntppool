@@ -983,7 +983,7 @@ func (c *NNTPConnection) Run() {
 	// flushes at the moment it is about to block and not before: a run of
 	// commands queued behind one another leaves in a single write, which under
 	// TLS is a single record rather than 29 bytes of framing per command.
-	bw := bufio.NewWriterSize(c.conn, 4096)
+	bw := bufio.NewWriterSize(c.conn, 64*1024)
 
 	// flushBuffered empties the write buffer, if anything is in it.
 	flushBuffered := func() error {
