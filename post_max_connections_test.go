@@ -82,7 +82,7 @@ func TestRunConnSlot_MaxConnectionsPreservesPriorityLane(t *testing.T) {
 	hotPrioCh := make(chan *Request)
 	hotIdleBodyCh := make(chan *Request)
 	bgCh := make(chan *Request, 1)
-	req := &Request{Ctx: ctx, RespCh: make(chan Response, 1)}
+	req := &Request{Ctx: ctx, RespCh: make(chan Response, 1), lane: lanePriority}
 	prioCh <- req
 
 	factory := func(context.Context) (net.Conn, error) {
