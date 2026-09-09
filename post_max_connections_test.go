@@ -81,6 +81,7 @@ func TestRunConnSlot_MaxConnectionsPreservesPriorityLane(t *testing.T) {
 	hotReqCh := make(chan *Request)
 	hotPrioCh := make(chan *Request)
 	hotIdleBodyCh := make(chan *Request)
+	bgCh := make(chan *Request, 1)
 	req := &Request{Ctx: ctx, RespCh: make(chan Response, 1)}
 	prioCh <- req
 
@@ -93,7 +94,7 @@ func TestRunConnSlot_MaxConnectionsPreservesPriorityLane(t *testing.T) {
 	gate.markRunning() // Model a separate established connection.
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go runConnSlot(ctx, reqCh, prioCh, hotReqCh, hotPrioCh, hotIdleBodyCh, factory, 1, 1, 0, 0,
+	go runConnSlot(ctx, reqCh, prioCh, hotReqCh, hotPrioCh, hotIdleBodyCh, bgCh, factory, 1, 1, 0, 0,
 		Auth{Username: "testuser", Password: "testpass"}, "", 0, 0, 0, "",
 		gate, &providerStats{}, "posting", &wg, false)
 
@@ -126,6 +127,7 @@ func TestRunConnSlot_ThrottledGateHandsRequestToActiveConnection(t *testing.T) {
 	hotReqCh := make(chan *Request)
 	hotPrioCh := make(chan *Request)
 	hotIdleBodyCh := make(chan *Request)
+	bgCh := make(chan *Request, 1)
 	req := &Request{Ctx: ctx, RespCh: make(chan Response, 1), PostMode: true}
 	reqCh <- req
 
@@ -143,7 +145,7 @@ func TestRunConnSlot_ThrottledGateHandsRequestToActiveConnection(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go runConnSlot(ctx, reqCh, prioCh, hotReqCh, hotPrioCh, hotIdleBodyCh, factory, 1, 1, 0, 0,
+	go runConnSlot(ctx, reqCh, prioCh, hotReqCh, hotPrioCh, hotIdleBodyCh, bgCh, factory, 1, 1, 0, 0,
 		Auth{}, "", 0, 0, 0, "", gate, &providerStats{}, "posting", &wg, false)
 
 	select {

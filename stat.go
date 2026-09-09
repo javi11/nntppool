@@ -72,6 +72,13 @@ type StatManyOptions struct {
 	// pick it up ahead of normal (e.g. BODY) traffic.
 	Priority bool
 
+	// Background routes each STAT through the background lane: served only by
+	// connections with nothing priority or normal queued, and capped while
+	// foreground traffic is recent (see Provider.BackgroundFloor). For sweeps
+	// nobody is waiting on, such as a repair census. Takes precedence over
+	// Priority when both are set.
+	Background bool
+
 	// Provider, when set, restricts every STAT to the named provider group
 	// (per-provider availability audit — retention differs per provider). The
 	// name matches Client provider names ("host:port" or "host:port+username").
@@ -94,6 +101,17 @@ type StatManyOptions struct {
 	// safe for concurrent use. It should be cheap: it runs once per
 	// message-id.
 	Skip func(messageID string) bool
+}
+
+// lane resolves the sweep's request lane from the option flags.
+func (o StatManyOptions) lane() lane {
+	switch {
+	case o.Background:
+		return laneBackground
+	case o.Priority:
+		return lanePriority
+	}
+	return laneNormal
 }
 
 // StatMany checks the existence of many articles concurrently, streaming a
@@ -158,7 +176,7 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 					if opts.Skip != nil && opts.Skip(messageIDs[i]) {
 						continue
 					}
-					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.Priority)
+					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.lane())
 					select {
 					case out <- res:
 					case <-ctx.Done():
@@ -177,7 +195,7 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 // statOne performs a single STAT and maps it to a StatManyResult. When target is
 // set the check is confined to that provider group; otherwise it uses the
 // pool-wide failover path.
-func (c *Client) statOne(ctx context.Context, messageID string, target *providerGroup, targetErr error, priority bool) StatManyResult {
+func (c *Client) statOne(ctx context.Context, messageID string, target *providerGroup, targetErr error, ln lane) StatManyResult {
 	if targetErr != nil {
 		return StatManyResult{MessageID: messageID, Err: targetErr}
 	}
@@ -186,9 +204,9 @@ func (c *Client) statOne(ctx context.Context, messageID string, target *provider
 
 	var resp Response
 	if target != nil {
-		resp = c.statViaGroup(ctx, target, payload, priority)
+		resp = c.statViaGroup(ctx, target, payload, ln)
 	} else {
-		resp = c.sendSync(ctx, payload, priority)
+		resp = c.sendSync(ctx, payload, ln)
 	}
 
 	result, err := parseStat(messageID, resp)
@@ -198,8 +216,8 @@ func (c *Client) statOne(ctx context.Context, messageID string, target *provider
 // statViaGroup issues a STAT against a single provider group, reusing the same
 // resilient single-group send (with fresh-connection retry on connection death)
 // that the failover path uses per provider. No cross-provider failover.
-func (c *Client) statViaGroup(ctx context.Context, g *providerGroup, payload []byte, priority bool) Response {
-	resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, nil, nil, priority, 0)
+func (c *Client) statViaGroup(ctx context.Context, g *providerGroup, payload []byte, ln lane) Response {
+	resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, nil, nil, ln, 0)
 	switch {
 	case cancelled:
 		err := ctx.Err()

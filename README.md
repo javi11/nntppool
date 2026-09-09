@@ -14,6 +14,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
   - [Streaming body to a writer](#streaming-body-to-a-writer)
   - [Async body retrieval](#async-body-retrieval)
   - [Priority requests](#priority-requests)
+  - [Background requests](#background-requests)
   - [Check article existence](#check-article-existence)
   - [Fetch article headers](#fetch-article-headers)
   - [Post an article](#post-an-article)
@@ -268,6 +269,23 @@ for i, ch := range channels {
 body, err := client.BodyPriority(ctx, "critical-segment@example.com")
 ```
 
+### Background requests
+
+`BodyBackground`, `StatBackground`, `SendBackground` and `StatMany` with
+`StatManyOptions.Background` enqueue on a third, lowest lane for work nobody is
+waiting on — a PAR2 repair reading a whole release, or the census that prices it.
+Every connection reads the lanes in strict order: priority, normal, background.
+When a provider is idle, background work may use every connection. While
+priority or normal traffic is recent (within a few seconds), background is held
+to `Provider.BackgroundFloor` requests in flight (default: a quarter of
+`Connections`, at least 1), so a stream never finds more than that many
+connections busy with background bodies.
+
+```go
+// Read a whole release without delaying playback or imports
+body, err := client.BodyBackground(ctx, "segment-0042@example.com")
+```
+
 ### Check article existence
 
 ```go
@@ -316,6 +334,7 @@ fmt.Printf("availability: %d/%d present\n", have, have+missing)
 |-------|-------------|
 | `Concurrency` | Max STATs outstanding across the whole pool at once (0 ⇒ 64). |
 | `Priority` | Route each STAT through the priority queue. |
+| `Background` | Route each STAT through the background lane (see [Background requests](#background-requests)); wins over `Priority`. |
 | `Provider` | Restrict every STAT to one named provider group (per-provider availability audit). Empty ⇒ pool-wide with the same failover as `Stat`. |
 
 If `ctx` is cancelled mid-sweep, dispatch stops and in-flight checks are cancelled;
@@ -583,6 +602,7 @@ Each provider is represented by a `providerGroup`, which owns:
 
 - `reqCh` — buffered channel (capacity = `Connections`) for normal requests
 - `prioCh` — buffered channel (capacity = `Connections`) for priority requests (`SendPriority`)
+- `bgCh` — buffered channel (capacity = `Connections`) for background requests (`SendBackground`); read only when `prioCh` and `reqCh` are empty, and capped at `BackgroundFloor` in flight while foreground traffic is recent
 - `hotReqCh` / `hotPrioCh` — unbuffered channels; only already-connected (hot) connections listen here
 
 Each connection slot runs as a `runConnSlot` goroutine in one of three states:
@@ -735,9 +755,11 @@ Provider names default to `host:port` or `host:port+username` (when auth is set)
 | `BodyStream` | `(ctx, messageID, w, onMeta...) (*ArticleBody, error)` | Decode and stream to `io.Writer`; `body.Bytes` is nil |
 | `BodyAsync` | `(ctx, messageID, w, onMeta...) <-chan BodyResult` | Non-blocking fan-out; returns channel receiving exactly one `BodyResult` |
 | `BodyPriority` | `(ctx, messageID, onMeta...) (*ArticleBody, error)` | Like `Body` but dispatched via the priority queue |
+| `BodyBackground` | `(ctx, messageID, onMeta...) (*ArticleBody, error)` | Like `Body` but dispatched via the background lane |
 | `Head` | `(ctx, messageID) (*ArticleHead, error)` | Fetch RFC 5322 headers; returns parsed `map[string][]string` with folding resolved |
 | `Stat` | `(ctx, messageID) (*StatResult, error)` | Check article existence without transferring body |
 | `StatPriority` | `(ctx, messageID) (*StatResult, error)` | Like `Stat` but dispatched via the priority queue |
+| `StatBackground` | `(ctx, messageID) (*StatResult, error)` | Like `Stat` but dispatched via the background lane |
 | `StatAsync` | `(ctx, messageID) <-chan StatManyResult` | Non-blocking single existence check; channel receives exactly one result |
 | `StatMany` | `(ctx, messageIDs, StatManyOptions) <-chan StatManyResult` | Concurrent bulk existence check; streams one result per ID as it completes |
 
@@ -757,9 +779,10 @@ yEnc-encodes `body` on the fly and posts using the two-phase NNTP POST protocol.
 ```go
 func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
 func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
+func (c *Client) SendBackground(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
 ```
 
-Both return immediately with a buffered channel (capacity 1). The caller receives exactly one `Response`. Use `bodyWriter = nil` to buffer decoded bytes in `Response.Body`; use `io.Discard` to throw them away; use any `io.Writer` to stream them.
+All three return immediately with a buffered channel (capacity 1). The caller receives exactly one `Response`. Use `bodyWriter = nil` to buffer decoded bytes in `Response.Body`; use `io.Discard` to throw them away; use any `io.Writer` to stream them.
 
 ### Provider management
 

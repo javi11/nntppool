@@ -350,7 +350,7 @@ func TestPriorityBodySendPrefersIdleReceiver(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // let it genuinely park before dispatch runs
 
 	go func() {
-		_, _, _ = cl.tryGroupTimeout(ctx, g, []byte("BODY <fast@h>\r\n"), nil, nil, true, 500*time.Millisecond)
+		_, _, _ = cl.tryGroupTimeout(ctx, g, []byte("BODY <fast@h>\r\n"), nil, nil, lanePriority, 500*time.Millisecond)
 	}()
 
 	select {

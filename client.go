@@ -95,6 +95,28 @@ func (c *Client) BodyPriority(ctx context.Context, messageID string, onMeta ...f
 	return body, err
 }
 
+// BodyBackground is like Body but enqueues on the background lane: served
+// only by connections with nothing priority or normal queued, and held to a
+// per-provider floor while foreground traffic is recent (see
+// Provider.BackgroundFloor). For fetches nobody is waiting on — a PAR2 repair
+// reading a whole release — that may use every idle connection but must
+// never delay a stream or an import.
+func (c *Client) BodyBackground(ctx context.Context, messageID string, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
+	payload := []byte("BODY <" + messageID + ">\r\n")
+	var respCh <-chan Response
+	if len(onMeta) > 0 {
+		respCh = c.SendBackground(ctx, payload, nil, onMeta[0])
+	} else {
+		respCh = c.SendBackground(ctx, payload, nil)
+	}
+	body, err := c.finishBody(messageID, nil, respCh)
+	if body != nil {
+		body.Bytes = body.byteBuf
+		body.byteBuf = nil
+	}
+	return body, err
+}
+
 // BodyStreamPriority is BodyStream on the priority lane: decoded bytes are
 // written to w as each wire read is decoded, so a caller can serve the head
 // of an article before its tail has arrived. Bytes is nil on the result. If a
@@ -209,6 +231,13 @@ func (c *Client) Stat(ctx context.Context, messageID string) (*StatResult, error
 // existence check that must not queue behind a large BODY on a busy connection.
 func (c *Client) StatPriority(ctx context.Context, messageID string) (*StatResult, error) {
 	return parseStat(messageID, <-c.SendPriority(ctx, statPayload(messageID), nil))
+}
+
+// StatBackground is Stat on the background lane (see BodyBackground). For
+// existence checks nobody is waiting on; StatMany with
+// StatManyOptions.Background sweeps many at once.
+func (c *Client) StatBackground(ctx context.Context, messageID string) (*StatResult, error) {
+	return parseStat(messageID, <-c.SendBackground(ctx, statPayload(messageID), nil))
 }
 
 // StatAsync returns a channel that will receive exactly one StatManyResult,

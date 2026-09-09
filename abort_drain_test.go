@@ -216,3 +216,75 @@ func TestStreamInflightCapsPriorityBodies(t *testing.T) {
 		}
 	}
 }
+
+// A connection holding its StreamInflight priority bodies must leave further
+// priority requests on the lane for other slots, so a second connection dials
+// and takes them instead of the first parking them behind its full pipeline.
+func TestFullPriorityPipelineLeavesRequestsForIdleSlots(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		var dials atomic.Int32
+		srv := &heldServer{release: make(chan struct{}), article: yencSinglePart([]byte("x"), "x")}
+		factory := func(ctx context.Context) (net.Conn, error) {
+			dials.Add(1)
+			return srv.factory(ctx)
+		}
+		c, err := NewClient(context.Background(), []Provider{{
+			Factory: factory, Connections: 2, Inflight: 10, StatInflight: 10, StreamInflight: 2,
+			SkipPing: true, IdleTimeout: time.Hour,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		for i := 0; i < 4; i++ {
+			go func() { _, _ = c.BodyStreamPriority(ctx, "p@test", io.Discard) }()
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && srv.count() < 4 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		got, d := srv.count(), dials.Load()
+		cancel()
+		_ = c.Close()
+		if got != 4 || d != 2 {
+			t.Fatalf("round %d: %d BODY commands on the wire over %d connections, want 4 over 2", round, got, d)
+		}
+	}
+}
+
+// Priority bodies spread across slots before they deepen one connection's
+// pipeline: a connection with a priority body in flight leaves the hot lane,
+// so the next request goes cold, where idle slots compete for it and dial.
+func TestPriorityBodiesSpreadBeforeDeepening(t *testing.T) {
+	const rounds = 20
+	total := 0
+	for round := 0; round < rounds; round++ {
+		var dials atomic.Int32
+		srv := &heldServer{release: make(chan struct{}), article: yencSinglePart([]byte("x"), "x")}
+		factory := func(ctx context.Context) (net.Conn, error) {
+			dials.Add(1)
+			return srv.factory(ctx)
+		}
+		c, err := NewClient(context.Background(), []Provider{{
+			Factory: factory, Connections: 4, Inflight: 10, StatInflight: 10, StreamInflight: 4,
+			SkipPing: true, IdleTimeout: time.Hour,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		for i := 0; i < 4; i++ {
+			go func() { _, _ = c.BodyStreamPriority(ctx, "p@test", io.Discard) }()
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && srv.count() < i+1 {
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		total += int(dials.Load())
+		cancel()
+		_ = c.Close()
+	}
+	if avg := float64(total) / rounds; avg < 2.2 {
+		t.Fatalf("4 sequential priority bodies over 4 slots dialed %.2f connections on average, want spread (>= 2.2)", avg)
+	}
+}
