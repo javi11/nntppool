@@ -75,7 +75,7 @@ func TestStatInflight_DeepPipeline(t *testing.T) {
 	done := make(chan int, 1)
 	go func() {
 		n := 0
-		for r := range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: 32}) {
+		for r := range c.ExistsMany(context.Background(), ids, ManyOptions{Concurrency: 32}) {
 			if r.Err == nil && r.Result != nil {
 				n++
 			}
@@ -168,7 +168,7 @@ func TestStatInflight_BodyBounded(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = c.Body(context.Background(), "x@h")
+			_, _ = c.Fetch(context.Background(), Req{MessageID: "x@h"})
 		}()
 	}
 
@@ -249,16 +249,16 @@ func TestStatInflight_NoSemaphoreLeak(t *testing.T) {
 	for i := range 80 {
 		switch i % 4 {
 		case 0:
-			launch(func() { _, _ = c.Stat(context.Background(), "x@h") })
+			launch(func() { _, _ = c.Exists(context.Background(), Req{MessageID: "x@h"}) })
 		case 1:
-			launch(func() { _, _ = c.Body(context.Background(), "x@h") })
+			launch(func() { _, _ = c.Fetch(context.Background(), Req{MessageID: "x@h"}) })
 		case 2:
-			launch(func() { _, _ = c.Stat(context.Background(), "miss@h") })
+			launch(func() { _, _ = c.Exists(context.Background(), Req{MessageID: "miss@h"}) })
 		case 3:
 			launch(func() {
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel() // pre-cancelled: exercises the cancel-before-send release path
-				_, _ = c.Body(ctx, "x@h")
+				_, _ = c.Fetch(ctx, Req{MessageID: "x@h"})
 			})
 		}
 	}
@@ -275,7 +275,7 @@ func TestStatInflight_NoSemaphoreLeak(t *testing.T) {
 	// and this would hang.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := c.Stat(ctx, "x@h"); err != nil {
+	if _, err := c.Exists(ctx, Req{MessageID: "x@h"}); err != nil {
 		t.Fatalf("sentinel STAT failed after mixed workload: %v", err)
 	}
 }
@@ -287,7 +287,7 @@ func TestStatInflight_NoSemaphoreLeak(t *testing.T) {
 // wire before any reply: the server withholds replies until it has received
 // them all, with a watchdog flush so a capped client fails the depth
 // assertion instead of hanging.
-func TestStatMany_DefaultConcurrencyFillsPipeline(t *testing.T) {
+func TestExistsMany_DefaultConcurrencyFillsPipeline(t *testing.T) {
 	const depth = 128
 	var highWater int32
 
@@ -365,7 +365,7 @@ func TestStatMany_DefaultConcurrencyFillsPipeline(t *testing.T) {
 	}
 
 	got := 0
-	for r := range c.StatMany(context.Background(), ids, StatManyOptions{}) {
+	for r := range c.ExistsMany(context.Background(), ids, ManyOptions{}) {
 		if r.Err == nil && r.Result != nil {
 			got++
 		}

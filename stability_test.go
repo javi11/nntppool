@@ -68,7 +68,7 @@ func TestSlowBodySucceeds(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	body, err := c.Body(context.Background(), "id@test")
+	body, err := c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	if err != nil {
 		t.Fatalf("Body() error = %v, want success for a slow-but-healthy transfer", err)
 	}
@@ -127,7 +127,7 @@ func TestHungProviderFailsOverFast(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	start := time.Now()
-	body, err := c.Body(context.Background(), "id@test")
+	body, err := c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Body() error = %v, want failover to healthy provider", err)
@@ -180,7 +180,7 @@ func TestMidBodyStallStreamErrors(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	var sink bytes.Buffer
-	_, err = c.BodyStream(context.Background(), "id@test", &sink)
+	_, err = c.Fetch(context.Background(), Req{MessageID: "id@test", Writer: &sink})
 	if err == nil {
 		t.Fatal("BodyStream() error = nil, want stall error (no silent failover after partial stream)")
 	}
@@ -250,7 +250,7 @@ func TestStatProbeWinnerStallStreamErrors(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	var sink bytes.Buffer
-	_, err = c.BodyStream(context.Background(), "id@test", &sink)
+	_, err = c.Fetch(context.Background(), Req{MessageID: "id@test", Writer: &sink})
 	if err == nil {
 		t.Fatal("BodyStream() error = nil, want stall error (no re-stream onto provider C)")
 	}
@@ -314,7 +314,7 @@ func TestBufferedStallRecovers(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	body, err := c.Body(context.Background(), "id@test")
+	body, err := c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	if err != nil {
 		t.Fatalf("Body() error = %v, want recovery via healthy provider", err)
 	}
@@ -416,7 +416,7 @@ func TestStatsExposesNewFields(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	if _, err := c.Body(context.Background(), "id@test"); err != nil {
+	if _, err := c.Fetch(context.Background(), Req{MessageID: "id@test"}); err != nil {
 		t.Fatalf("Body() error = %v", err)
 	}
 
@@ -450,7 +450,7 @@ func newWeightGroup(avail int32, speed float64) *providerGroup {
 func TestDispatchWeights(t *testing.T) {
 	t.Run("no samples reduces to capacity weighting", func(t *testing.T) {
 		mains := []*providerGroup{newWeightGroup(2, 0), newWeightGroup(3, 0)}
-		cum, total := dispatchWeights(mains, true)
+		cum, total := dispatchWeights(mains, true, time.Time{}, time.Time{})
 		// No provider has a throughput sample => maxSpeed 0 => pure capacity.
 		if total != 5 || cum[0] != 2 || cum[1] != 5 {
 			t.Fatalf("cum = %v, total = %d, want [2 5], 5", cum, total)
@@ -461,7 +461,7 @@ func TestDispatchWeights(t *testing.T) {
 		fast := newWeightGroup(1, 4_000_000) // 4 MB/s
 		slow := newWeightGroup(1, 1_000_000) // 1 MB/s
 		mains := []*providerGroup{fast, slow}
-		_, total := dispatchWeights(mains, true)
+		_, total := dispatchWeights(mains, true, time.Time{}, time.Time{})
 		// fast: 1*4, slow: 1*round(4*1/4)=1*1 => 5 total.
 		if total != 5 {
 			t.Fatalf("total = %d, want 5 (fast 4 + slow 1)", total)
@@ -471,7 +471,7 @@ func TestDispatchWeights(t *testing.T) {
 	t.Run("speedAware off ignores throughput", func(t *testing.T) {
 		fast := newWeightGroup(1, 4_000_000)
 		slow := newWeightGroup(1, 1_000_000)
-		_, total := dispatchWeights([]*providerGroup{fast, slow}, false)
+		_, total := dispatchWeights([]*providerGroup{fast, slow}, false, time.Time{}, time.Time{})
 		if total != 2 {
 			t.Fatalf("total = %d, want 2 (pure capacity)", total)
 		}
@@ -482,7 +482,7 @@ func TestDispatchWeights(t *testing.T) {
 		g.stats.quotaBytes = 100
 		g.stats.quotaUsed.Store(100)
 		g.stats.quotaExceeded.Store(true)
-		_, total := dispatchWeights([]*providerGroup{g}, true)
+		_, total := dispatchWeights([]*providerGroup{g}, true, time.Time{}, time.Time{})
 		if total != 0 {
 			t.Fatalf("total = %d, want 0 for quota-exceeded provider", total)
 		}

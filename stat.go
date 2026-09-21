@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // minStatConcurrency floors the derived in-flight STAT bound when
-// StatManyOptions.Concurrency is unset. STAT is a single-line request with a
+// ManyOptions.Concurrency is unset. STAT is a single-line request with a
 // single-line reply and no body, so it is purely round-trip-latency bound; a
 // high floor lets even a small pool amortise RTT by keeping many checks
 // outstanding at once.
@@ -41,49 +42,48 @@ func (c *Client) statCapacity() int {
 
 // StatCapacity reports the pool's aggregate STAT pipeline depth: for every
 // provider (main and backup), connections × the per-connection bodyless-STAT
-// inflight cap, clamped to [64, 4096]. It is the number of STATs a sweep must
-// keep outstanding to fill every connection's pipeline, and the value StatMany
-// derives when StatManyOptions.Concurrency is unset. Callers sizing their own
+// inflight cap, clamped to [64, 4096]. It is the number of existence checks a
+// sweep must keep outstanding to fill every connection's pipeline, and the
+// value ExistsMany derives when ManyOptions.Concurrency is unset. Callers sizing their own
 // dispatch bounds, chunk deadlines, or admission budgets should read it from
 // here rather than re-deriving it from provider configuration.
 func (c *Client) StatCapacity() int {
 	return c.statCapacity()
 }
 
-// StatManyResult is the per-message outcome streamed by StatMany and StatAsync.
+// ExistsResult is the per-message outcome streamed by ExistsMany and ExistsAsync.
 // A genuine miss (article not found, NNTP 430/423) is reported as
 // Err == ErrArticleNotFound with a nil Result — it is a normal outcome of an
 // existence sweep, not a fatal error.
-type StatManyResult struct {
+type ExistsResult struct {
 	MessageID string
 	Result    *StatResult // non-nil on 2xx
 	Err       error
 }
 
-// StatManyOptions tunes a StatMany sweep.
-type StatManyOptions struct {
+// ManyOptions tunes an ExistsMany sweep.
+type ManyOptions struct {
 	// Concurrency bounds the number of STATs outstanding across the whole pool
 	// at once. <= 0 derives the bound from the pool's aggregate STAT pipeline
 	// capacity (connections × StatInflight per provider), so every
 	// connection's pipeline can fill.
 	Concurrency int
 
-	// Priority routes each STAT through the priority channel so idle connections
-	// pick it up ahead of normal (e.g. BODY) traffic.
-	Priority bool
+	// Lane selects the request queue every STAT in the sweep rides.
+	// LaneNormal, the zero value, is the default; LaneBackground is the one a
+	// census nobody is waiting on wants.
+	Lane Lane
 
-	// Background routes each STAT through the background lane: served only by
-	// connections with nothing priority or normal queued, and capped while
-	// foreground traffic is recent (see Provider.BackgroundFloor). For sweeps
-	// nobody is waiting on, such as a repair census. Takes precedence over
-	// Priority when both are set.
-	Background bool
+	// ArticleDate is when the articles in this sweep were posted. One sweep is
+	// normally one release, so one date covers it. See Req.ArticleDate: the
+	// zero value applies no retention policy.
+	ArticleDate time.Time
 
 	// Provider, when set, restricts every STAT to the named provider group
 	// (per-provider availability audit — retention differs per provider). The
 	// name matches Client provider names ("host:port" or "host:port+username").
 	// When empty, STATs dispatch across the whole pool with the same
-	// cross-provider/backup failover semantics as Stat ("exists anywhere").
+	// cross-provider/backup failover semantics as Exists ("exists anywhere").
 	Provider string
 
 	// Skip, when non-nil, is consulted immediately before each message-id is
@@ -92,7 +92,7 @@ type StatManyOptions struct {
 	// verdict is already settled without chunking the sweep, so sweep width
 	// and early-termination granularity stop competing.
 	//
-	// A skipped id emits no StatManyResult — same as an id left undispatched
+	// A skipped id emits no ExistsResult — same as an id left undispatched
 	// by context cancellation — so callers cannot assume one result per input
 	// id; check ctx.Err() or otherwise account for gaps after draining rather
 	// than relying on result count.
@@ -103,27 +103,16 @@ type StatManyOptions struct {
 	Skip func(messageID string) bool
 }
 
-// lane resolves the sweep's request lane from the option flags.
-func (o StatManyOptions) lane() lane {
-	switch {
-	case o.Background:
-		return laneBackground
-	case o.Priority:
-		return lanePriority
-	}
-	return laneNormal
-}
-
-// StatMany checks the existence of many articles concurrently, streaming a
-// StatManyResult per message-id as each check completes (results arrive out of
+// ExistsMany checks the existence of many articles concurrently, streaming a
+// ExistsResult per message-id as each check completes (results arrive out of
 // order). The returned channel is closed once every dispatched check has
 // reported. If ctx is cancelled mid-sweep, dispatch stops, in-flight checks are
 // cancelled, and the channel is closed; message-ids not yet dispatched produce
 // no result, so callers should check ctx.Err() after draining. Ids abandoned
-// via StatManyOptions.Skip likewise produce no result, so a caller cannot
+// via ManyOptions.Skip likewise produce no result, so a caller cannot
 // assume one result per input id in general — count dispatched vs. total, or
 // otherwise account for gaps, rather than relying on result count alone.
-func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatManyOptions) <-chan StatManyResult {
+func (c *Client) ExistsMany(ctx context.Context, messageIDs []string, opts ManyOptions) <-chan ExistsResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -135,7 +124,7 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 		conc = len(messageIDs)
 	}
 
-	out := make(chan StatManyResult, conc)
+	out := make(chan ExistsResult, conc)
 
 	// Resolve the target group once (outside the goroutine) so an unknown
 	// provider name fails every id with a clear error rather than silently
@@ -176,7 +165,7 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 					if opts.Skip != nil && opts.Skip(messageIDs[i]) {
 						continue
 					}
-					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.lane())
+					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.Lane, opts.ArticleDate)
 					select {
 					case out <- res:
 					case <-ctx.Done():
@@ -192,12 +181,12 @@ func (c *Client) StatMany(ctx context.Context, messageIDs []string, opts StatMan
 	return out
 }
 
-// statOne performs a single STAT and maps it to a StatManyResult. When target is
+// statOne performs a single STAT and maps it to a ExistsResult. When target is
 // set the check is confined to that provider group; otherwise it uses the
 // pool-wide failover path.
-func (c *Client) statOne(ctx context.Context, messageID string, target *providerGroup, targetErr error, ln lane) StatManyResult {
+func (c *Client) statOne(ctx context.Context, messageID string, target *providerGroup, targetErr error, ln Lane, at time.Time) ExistsResult {
 	if targetErr != nil {
-		return StatManyResult{MessageID: messageID, Err: targetErr}
+		return ExistsResult{MessageID: messageID, Err: targetErr}
 	}
 
 	payload := statPayload(messageID)
@@ -206,17 +195,17 @@ func (c *Client) statOne(ctx context.Context, messageID string, target *provider
 	if target != nil {
 		resp = c.statViaGroup(ctx, target, payload, ln)
 	} else {
-		resp = c.sendSync(ctx, payload, ln)
+		resp = c.sendSync(ctx, SendReq{Payload: payload, Lane: ln, ArticleDate: at})
 	}
 
 	result, err := parseStat(messageID, resp)
-	return StatManyResult{MessageID: messageID, Result: result, Err: err}
+	return ExistsResult{MessageID: messageID, Result: result, Err: err}
 }
 
 // statViaGroup issues a STAT against a single provider group, reusing the same
 // resilient single-group send (with fresh-connection retry on connection death)
 // that the failover path uses per provider. No cross-provider failover.
-func (c *Client) statViaGroup(ctx context.Context, g *providerGroup, payload []byte, ln lane) Response {
+func (c *Client) statViaGroup(ctx context.Context, g *providerGroup, payload []byte, ln Lane) Response {
 	resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, nil, nil, ln, 0)
 	switch {
 	case cancelled:

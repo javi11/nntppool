@@ -80,7 +80,7 @@ func TestStaleAttemptDeadlineDoesNotKillPipeline(t *testing.T) {
 	// The burst: every window expires while the server withholds. Outcomes are
 	// failure or escalation-rescued success — either is fine; the connection is
 	// what must survive.
-	for range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: 8}) {
+	for range c.ExistsMany(context.Background(), ids, ManyOptions{Concurrency: 8}) {
 	}
 
 	// Give the reader time to drain the late replies, then prove the same
@@ -88,7 +88,7 @@ func TestStaleAttemptDeadlineDoesNotKillPipeline(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		if _, lastErr = c.Stat(context.Background(), "x@h"); lastErr == nil {
+		if _, lastErr = c.Exists(context.Background(), Req{MessageID: "x@h"}); lastErr == nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -170,14 +170,14 @@ func TestCancelledBodyDrainSurvivesCallerDeadline(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if _, err := c.Body(ctx, "x@h"); err == nil {
+	if _, err := c.Fetch(ctx, Req{MessageID: "x@h"}); err == nil {
 		t.Fatal("expected the abandoned body to fail with the caller's deadline")
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		if _, lastErr = c.Stat(context.Background(), "x@h"); lastErr == nil {
+		if _, lastErr = c.Exists(context.Background(), Req{MessageID: "x@h"}); lastErr == nil {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -237,12 +237,12 @@ func TestAbandonedRequestOnHungServerStillDies(t *testing.T) {
 	// The first STAT hangs; whether this call fails or is rescued by an
 	// internal retry on the replacement connection is incidental. What matters:
 	// STATs eventually succeed AND the hung connection was torn down.
-	_, _ = c.Stat(context.Background(), "x@h")
+	_, _ = c.Exists(context.Background(), Req{MessageID: "x@h"})
 
 	deadline := time.Now().Add(5 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		if _, lastErr = c.Stat(context.Background(), "x@h"); lastErr == nil {
+		if _, lastErr = c.Exists(context.Background(), Req{MessageID: "x@h"}); lastErr == nil {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)

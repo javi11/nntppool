@@ -82,7 +82,7 @@ func TestAbortDrainClosesConnectionOnLargeRemainder(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &gateWriter{first: make(chan struct{})}
 	done := make(chan error, 1)
-	go func() { _, err := c.BodyStreamPriority(ctx, "big@test", w); done <- err }()
+	go func() { _, err := c.Fetch(ctx, Req{MessageID: "big@test", Writer: w, Lane: LanePriority}); done <- err }()
 	select {
 	case <-w.first:
 	case <-time.After(5 * time.Second):
@@ -103,7 +103,7 @@ func TestAbortDrainClosesConnectionOnLargeRemainder(t *testing.T) {
 	// The slot reconnects and serves the next request.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
-	body, err := c.BodyPriority(ctx2, "again@test")
+	body, err := c.Fetch(ctx2, Req{MessageID: "again@test", Lane: LanePriority})
 	if err != nil || len(body.Bytes) != 4<<20 {
 		t.Fatalf("follow-up body: err=%v len=%d", err, len(body.Bytes))
 	}
@@ -120,14 +120,17 @@ func TestSmallRemainderIsDrainedNotClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &gateWriter{first: make(chan struct{})}
 	done := make(chan error, 1)
-	go func() { _, err := c.BodyStreamPriority(ctx, "small@test", w); done <- err }()
+	go func() {
+		_, err := c.Fetch(ctx, Req{MessageID: "small@test", Writer: w, Lane: LanePriority})
+		done <- err
+	}()
 	<-w.first
 	cancel()
 	<-done
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
-	if _, err := c.BodyPriority(ctx2, "again@test"); err != nil {
+	if _, err := c.Fetch(ctx2, Req{MessageID: "again@test", Lane: LanePriority}); err != nil {
 		t.Fatal(err)
 	}
 	if srv.conns.Load() != 1 || srv.closed.Load() != 0 {
@@ -197,9 +200,9 @@ func TestStreamInflightCapsPriorityBodies(t *testing.T) {
 		for i := 0; i < 4; i++ {
 			go func() {
 				if priority {
-					_, _ = c.BodyStreamPriority(ctx, "p@test", io.Discard)
+					_, _ = c.Fetch(ctx, Req{MessageID: "p@test", Writer: io.Discard, Lane: LanePriority})
 				} else {
-					_, _ = c.BodyStream(ctx, "n@test", io.Discard)
+					_, _ = c.Fetch(ctx, Req{MessageID: "n@test", Writer: io.Discard})
 				}
 			}()
 		}
@@ -237,7 +240,7 @@ func TestFullPriorityPipelineLeavesRequestsForIdleSlots(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		for i := 0; i < 4; i++ {
-			go func() { _, _ = c.BodyStreamPriority(ctx, "p@test", io.Discard) }()
+			go func() { _, _ = c.Fetch(ctx, Req{MessageID: "p@test", Writer: io.Discard, Lane: LanePriority}) }()
 		}
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) && srv.count() < 4 {
@@ -274,7 +277,7 @@ func TestPriorityBodiesSpreadBeforeDeepening(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		for i := 0; i < 4; i++ {
-			go func() { _, _ = c.BodyStreamPriority(ctx, "p@test", io.Discard) }()
+			go func() { _, _ = c.Fetch(ctx, Req{MessageID: "p@test", Writer: io.Discard, Lane: LanePriority}) }()
 			deadline := time.Now().Add(2 * time.Second)
 			for time.Now().Before(deadline) && srv.count() < i+1 {
 				time.Sleep(5 * time.Millisecond)

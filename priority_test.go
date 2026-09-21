@@ -205,7 +205,7 @@ func TestPriorityBodyAvoidsBusyConnection(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	for _, id := range []string{"warm0@h", "warm1@h", "warm2@h", "warm3@h"} {
-		if _, err := c.Body(ctx, id); err != nil {
+		if _, err := c.Fetch(ctx, Req{MessageID: id}); err != nil {
 			t.Fatalf("warm-up body %q: %v", id, err)
 		}
 	}
@@ -214,7 +214,7 @@ func TestPriorityBodyAvoidsBusyConnection(t *testing.T) {
 	slowDone := make(chan struct{})
 	go func() {
 		defer close(slowDone)
-		_, _ = c.Body(ctx, "slow@h")
+		_, _ = c.Fetch(ctx, Req{MessageID: "slow@h"})
 	}()
 
 	// Block on a signal rather than polling: the test must not proceed until a
@@ -225,7 +225,7 @@ func TestPriorityBodyAvoidsBusyConnection(t *testing.T) {
 		t.Fatal("slow body never reached the server")
 	}
 
-	if _, err := c.BodyPriority(ctx, "fast@h"); err != nil {
+	if _, err := c.Fetch(ctx, Req{MessageID: "fast@h", Lane: LanePriority}); err != nil {
 		t.Fatalf("priority body: %v", err)
 	}
 
@@ -350,7 +350,7 @@ func TestPriorityBodySendPrefersIdleReceiver(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // let it genuinely park before dispatch runs
 
 	go func() {
-		_, _, _ = cl.tryGroupTimeout(ctx, g, []byte("BODY <fast@h>\r\n"), nil, nil, lanePriority, 500*time.Millisecond)
+		_, _, _ = cl.tryGroupTimeout(ctx, g, []byte("BODY <fast@h>\r\n"), nil, nil, LanePriority, 500*time.Millisecond)
 	}()
 
 	select {

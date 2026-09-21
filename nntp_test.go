@@ -1011,7 +1011,7 @@ func TestAddThenSend(t *testing.T) {
 
 	// Request should return 430 (only provider).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	cancel()
 	if resp.StatusCode != 430 {
 		t.Fatalf("StatusCode = %d, want 430 before adding backup", resp.StatusCode)
@@ -1025,7 +1025,7 @@ func TestAddThenSend(t *testing.T) {
 
 	// Now request should fallback to backup and return 223.
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-	resp = <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp = <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	cancel()
 	if resp.StatusCode != 223 {
 		t.Errorf("StatusCode = %d, want 223 after adding backup", resp.StatusCode)
@@ -1051,7 +1051,7 @@ func TestSend_FactoryErrorPropagates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err == nil {
 		t.Fatal("expected error from Send when factory fails")
 	}
@@ -1080,7 +1080,7 @@ func TestSend_ContextCancellationPropagates(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	respCh := c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	respCh := c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 
 	// Cancel the request context.
 	cancel()
@@ -1130,7 +1130,7 @@ func TestSend_All430Propagates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("expected no Err for 430 response, got %v", resp.Err)
 	}
@@ -1281,7 +1281,7 @@ func TestSend_430StatProbeWinnerGetsBody(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("BODY <test@host>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("unexpected error: %v", resp.Err)
 	}
@@ -1359,7 +1359,7 @@ func TestSend_423FailsOverLikeA430(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("BODY <test@host>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("unexpected error: %v", resp.Err)
 	}
@@ -1446,7 +1446,7 @@ func TestSend_430StatProbeParallel(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("BODY <test@host>\r\n")})
 	elapsed := time.Since(start)
 
 	if resp.StatusCode != 430 {
@@ -1497,7 +1497,7 @@ func TestSend_All430WithStatProbeReturnsSaved430(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("BODY <test@host>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("unexpected error: %v", resp.Err)
 	}
@@ -1554,7 +1554,7 @@ func TestSend_430NoMsgIDUsesSequentialFallback(t *testing.T) {
 	defer cancel()
 
 	// Use a command without a message-ID: STAT with a bare article number.
-	resp := <-c.Send(ctx, []byte("GROUP alt.test\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("GROUP alt.test\r\n")})
 	if resp.StatusCode != 211 {
 		t.Errorf("StatusCode = %d, want 211", resp.StatusCode)
 	}
@@ -1596,7 +1596,7 @@ func TestSend_WithStatProbeDisabled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("BODY <test@host>\r\n")})
 	if resp.StatusCode != 222 {
 		t.Errorf("StatusCode = %d, want 222", resp.StatusCode)
 	}
@@ -1675,7 +1675,7 @@ func TestSend_430Probe502RemovesProvider(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("BODY <test@host>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("BODY <test@host>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("unexpected error: %v", resp.Err)
 	}
@@ -2181,7 +2181,7 @@ func TestClient_QuotaExceeded_FallsThrough(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <article@ok>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <article@ok>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("Send() error = %v, want nil (second provider should serve)", resp.Err)
 	}
@@ -2223,7 +2223,7 @@ func TestClient_AllQuotaExceeded_ReturnsError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <x@x>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <x@x>\r\n")})
 	if resp.Err == nil {
 		t.Fatal("Send() should return an error when all providers are quota-exceeded")
 	}

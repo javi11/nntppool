@@ -3,6 +3,8 @@ package nntppool
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -22,7 +24,7 @@ func (r *chunkRecorder) Write(p []byte) (int, error) {
 	return r.buf.Write(p)
 }
 
-func TestClient_BodyStreamPriorityWritesDecodedBytes(t *testing.T) {
+func TestClient_FetchStreamsDecodedBytesOnPriorityLane(t *testing.T) {
 	original := bytes.Repeat([]byte("progressive body payload "), 20000)
 
 	factory := func(ctx context.Context) (net.Conn, error) {
@@ -55,7 +57,7 @@ func TestClient_BodyStreamPriorityWritesDecodedBytes(t *testing.T) {
 	defer cancel()
 
 	rec := &chunkRecorder{}
-	body, err := c.BodyStreamPriority(ctx, "test@example.com", rec)
+	body, err := c.Fetch(ctx, Req{MessageID: "test@example.com", Writer: rec, Lane: LanePriority})
 	if err != nil {
 		t.Fatalf("BodyStreamPriority() error = %v", err)
 	}
@@ -73,9 +75,19 @@ func TestClient_BodyStreamPriorityWritesDecodedBytes(t *testing.T) {
 	}
 }
 
-func TestClient_BodyStreamPriorityRequiresWriter(t *testing.T) {
+// A Req without a message-ID is rejected before the pool is touched: the
+// check runs on a zero-value Client, which has no providers to dispatch to.
+func TestFetchRejectsEmptyMessageID(t *testing.T) {
 	c := &Client{}
-	if _, err := c.BodyStreamPriority(context.Background(), "x@y", nil); err == nil {
-		t.Fatal("nil writer must be rejected")
+	for _, r := range []Req{
+		{},
+		{Writer: io.Discard, Lane: LanePriority},
+	} {
+		if _, err := c.Fetch(context.Background(), r); !errors.Is(err, ErrNoMessageID) {
+			t.Fatalf("Fetch(%+v) error = %v, want ErrNoMessageID", r, err)
+		}
+		if _, err := c.Exists(context.Background(), r); !errors.Is(err, ErrNoMessageID) {
+			t.Fatalf("Exists(%+v) error = %v, want ErrNoMessageID", r, err)
+		}
 	}
 }

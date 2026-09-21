@@ -2,6 +2,7 @@ package nntppool
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/mnightingale/rapidyenc"
@@ -127,9 +128,10 @@ func TestParseHeaders(t *testing.T) {
 	})
 }
 
-func TestBodyStream_NilWriter(t *testing.T) {
-	// BodyStream requires a non-nil writer; passing nil should return error.
-	// We need a Client, so create a minimal one.
+// In v4 a nil writer was an error on the streaming entry points. In v5 it is
+// the buffered mode, so it must reach the pool and fail for a transport
+// reason (nothing is listening on localhost:119) rather than be rejected.
+func TestFetchNilWriterMeansBuffered(t *testing.T) {
 	c, err := NewClient(context.Background(), []Provider{
 		{Host: "localhost:119", Connections: 1},
 	})
@@ -138,8 +140,8 @@ func TestBodyStream_NilWriter(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	_, err = c.BodyStream(context.Background(), "test@example.com", nil)
-	if err == nil {
-		t.Error("BodyStream(nil writer) should return error")
+	_, err = c.Fetch(context.Background(), Req{MessageID: "test@example.com"})
+	if errors.Is(err, ErrNoMessageID) {
+		t.Fatalf("a nil Writer must select buffered mode, not be rejected: %v", err)
 	}
 }

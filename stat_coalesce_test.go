@@ -132,7 +132,7 @@ func runSweep(tb testing.TB, cl *Client, n int) int {
 		ids[i] = fmt.Sprintf("a%d@h", i)
 	}
 	ok := 0
-	for r := range cl.StatMany(context.Background(), ids, StatManyOptions{}) {
+	for r := range cl.ExistsMany(context.Background(), ids, ManyOptions{}) {
 		if r.Err == nil && r.Result != nil {
 			ok++
 		}
@@ -202,7 +202,7 @@ func BenchmarkStatSweepConcurrency(b *testing.B) {
 			b.ResetTimer()
 			for range b.N {
 				ok := 0
-				for r := range cl.StatMany(context.Background(), ids, StatManyOptions{Concurrency: conc}) {
+				for r := range cl.ExistsMany(context.Background(), ids, ManyOptions{Concurrency: conc}) {
 					if r.Err == nil && r.Result != nil {
 						ok++
 					}
