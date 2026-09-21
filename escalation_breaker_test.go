@@ -24,7 +24,7 @@ func TestEscalationBreakerStopsRepeatedOutageCost(t *testing.T) {
 
 	start := time.Now()
 	for range 10 {
-		_, _ = c.Body(context.Background(), "seg@test")
+		_, _ = c.Fetch(context.Background(), Req{MessageID: "seg@test"})
 	}
 	elapsed := time.Since(start)
 
@@ -52,7 +52,7 @@ func TestEscalationBreakerKeepsEscalatingWhenItPaysOff(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	for i := range 6 {
-		body, err := c.Body(context.Background(), "aged@spool")
+		body, err := c.Fetch(context.Background(), Req{MessageID: "aged@spool"})
 		if err != nil {
 			t.Fatalf("request %d: slow-but-present article was LOST: %v", i, err)
 		}
@@ -81,12 +81,12 @@ func TestEscalationBreakerReprobesAfterCooldown(t *testing.T) {
 
 	// Trip the breaker: escalations here can never pay off.
 	for range 4 {
-		_, _ = c.Body(context.Background(), "seg@test")
+		_, _ = c.Fetch(context.Background(), Req{MessageID: "seg@test"})
 	}
 
 	// Suppressed: one base window only.
 	start := time.Now()
-	_, _ = c.Body(context.Background(), "seg@test")
+	_, _ = c.Fetch(context.Background(), Req{MessageID: "seg@test"})
 	if suppressed := time.Since(start); suppressed > 600*time.Millisecond {
 		t.Fatalf("tripped breaker still escalated (%v); want ~one 200ms window", suppressed)
 	}
@@ -95,7 +95,7 @@ func TestEscalationBreakerReprobesAfterCooldown(t *testing.T) {
 
 	// Half-open: the cooldown lapsed, so one escalation must be re-attempted.
 	start = time.Now()
-	_, _ = c.Body(context.Background(), "seg@test")
+	_, _ = c.Fetch(context.Background(), Req{MessageID: "seg@test"})
 	if reprobe := time.Since(start); reprobe < 700*time.Millisecond {
 		t.Errorf("after cooldown the breaker did not re-probe (%v); want base + escalation budget", reprobe)
 	}
@@ -115,7 +115,7 @@ func TestEscalationBreakerErrorStaysTyped(t *testing.T) {
 
 	var last error
 	for range 5 {
-		_, last = c.Body(context.Background(), "seg@test")
+		_, last = c.Fetch(context.Background(), Req{MessageID: "seg@test"})
 	}
 	var at *AttemptTimeoutError
 	if !errors.As(last, &at) {

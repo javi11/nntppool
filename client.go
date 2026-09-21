@@ -56,123 +56,117 @@ type StatResult struct {
 	Provider  string // provider name that returned the successful response
 }
 
-// BodyResult is the result type for BodyAsync.
+// BodyResult is the result type for FetchAsync.
 type BodyResult struct {
 	Body *ArticleBody
 	Err  error
 }
 
-// Body retrieves and decodes an article body, buffering the decoded bytes in memory.
-// An optional onMeta callback is invoked with yEnc metadata before body decoding begins.
-func (c *Client) Body(ctx context.Context, messageID string, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
-	var metaFn func(YEncMeta)
-	if len(onMeta) > 0 {
-		metaFn = onMeta[0]
+// Req is one article request: which article, on which lane, and where its
+// decoded bytes should go. Only MessageID is required — the zero value of
+// every other field is a buffered fetch on the normal lane, so a caller with
+// no opinion states none.
+type Req struct {
+	// MessageID is the article's message-ID without angle brackets.
+	MessageID string
+
+	// Lane selects the request queue. LaneNormal, the zero value, is the
+	// default; see Lane for what each one is for.
+	Lane Lane
+
+	// Writer, when non-nil, receives decoded bytes as each wire read is
+	// decoded, so a caller can serve the head of an article before its tail
+	// has arrived. ArticleBody.Bytes is then nil. When Writer is nil the
+	// decoded bytes are buffered and returned in ArticleBody.Bytes instead.
+	//
+	// A fetch that has already written bytes to Writer never fails over to
+	// another provider, since re-streaming would duplicate them: the error is
+	// returned instead, and a caller wanting a second attempt must supply a
+	// fresh writer.
+	//
+	// Ignored by Exists, which transfers no payload.
+	Writer io.Writer
+
+	// OnMeta, when non-nil, is called with the yEnc metadata parsed from
+	// =ybegin/=ypart, before body decoding begins.
+	//
+	// Ignored by Exists, which transfers no payload.
+	OnMeta func(YEncMeta)
+}
+
+// ErrNoMessageID is returned by Fetch, FetchAsync, and Exists when Req omits
+// the message-ID. Sending the resulting "BODY <>" would cost a round-trip to
+// learn what the caller already knew.
+var ErrNoMessageID = errors.New("nntp: Req.MessageID is required")
+
+// Fetch retrieves and decodes an article body.
+//
+// With Req.Writer nil the decoded bytes are buffered and returned in
+// ArticleBody.Bytes; with a writer set they are streamed to it as they decode
+// and Bytes is nil. Req.Lane selects the queue.
+//
+// A 430 from every provider surfaces as ErrArticleNotFound. A body that
+// arrived but failed its yEnc CRC is returned alongside ErrCRCMismatch, so a
+// caller may inspect or salvage the payload rather than only learn it was bad.
+func (c *Client) Fetch(ctx context.Context, r Req) (*ArticleBody, error) {
+	if r.MessageID == "" {
+		return nil, ErrNoMessageID
 	}
-	body, err := c.doBody(ctx, messageID, nil, metaFn)
-	if body != nil {
+	body, err := c.finishBody(r.MessageID, r.Writer, c.send(ctx, bodyPayload(r.MessageID), r.Writer, r.OnMeta, r.Lane))
+	if body != nil && r.Writer == nil {
 		body.Bytes = body.byteBuf
 		body.byteBuf = nil
 	}
 	return body, err
 }
 
-// BodyPriority is like Body but enqueues on the priority channel so idle
-// connections pick it up before normal requests.
-func (c *Client) BodyPriority(ctx context.Context, messageID string, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
-	payload := []byte("BODY <" + messageID + ">\r\n")
-	var respCh <-chan Response
-	if len(onMeta) > 0 {
-		respCh = c.SendPriority(ctx, payload, nil, onMeta[0])
-	} else {
-		respCh = c.SendPriority(ctx, payload, nil)
-	}
-	body, err := c.finishBody(messageID, nil, respCh)
-	if body != nil {
-		body.Bytes = body.byteBuf
-		body.byteBuf = nil
-	}
-	return body, err
-}
-
-// BodyBackground is like Body but enqueues on the background lane: served
-// only by connections with nothing priority or normal queued, and held to a
-// per-provider floor while foreground traffic is recent (see
-// Provider.BackgroundFloor). For fetches nobody is waiting on — a PAR2 repair
-// reading a whole release — that may use every idle connection but must
-// never delay a stream or an import.
-func (c *Client) BodyBackground(ctx context.Context, messageID string, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
-	payload := []byte("BODY <" + messageID + ">\r\n")
-	var respCh <-chan Response
-	if len(onMeta) > 0 {
-		respCh = c.SendBackground(ctx, payload, nil, onMeta[0])
-	} else {
-		respCh = c.SendBackground(ctx, payload, nil)
-	}
-	body, err := c.finishBody(messageID, nil, respCh)
-	if body != nil {
-		body.Bytes = body.byteBuf
-		body.byteBuf = nil
-	}
-	return body, err
-}
-
-// BodyStreamPriority is BodyStream on the priority lane: decoded bytes are
-// written to w as each wire read is decoded, so a caller can serve the head
-// of an article before its tail has arrived. Bytes is nil on the result. If a
-// provider fails after some bytes were written the client does not fail over,
-// since re-streaming into w would duplicate them, and returns the error;
-// callers wanting a second attempt must supply a fresh writer.
-func (c *Client) BodyStreamPriority(ctx context.Context, messageID string, w io.Writer, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
-	if w == nil {
-		return nil, fmt.Errorf("nntp: BodyStreamPriority requires a non-nil writer")
-	}
-	payload := []byte("BODY <" + messageID + ">\r\n")
-	var respCh <-chan Response
-	if len(onMeta) > 0 {
-		respCh = c.SendPriority(ctx, payload, w, onMeta[0])
-	} else {
-		respCh = c.SendPriority(ctx, payload, w)
-	}
-	return c.finishBody(messageID, w, respCh)
-}
-
-// BodyStream retrieves and decodes an article body, streaming decoded bytes to w.
-// The returned ArticleBody contains metadata but Bytes will be nil.
-// An optional onMeta callback is invoked with yEnc metadata before body decoding begins.
-func (c *Client) BodyStream(ctx context.Context, messageID string, w io.Writer, onMeta ...func(YEncMeta)) (*ArticleBody, error) {
-	if w == nil {
-		return nil, fmt.Errorf("nntp: BodyStream requires a non-nil writer")
-	}
-	var metaFn func(YEncMeta)
-	if len(onMeta) > 0 {
-		metaFn = onMeta[0]
-	}
-	return c.doBody(ctx, messageID, w, metaFn)
-}
-
-// BodyAsync returns a channel that will receive exactly one BodyResult.
-// The body is streamed to w (use io.Discard to discard decoded bytes).
-// This preserves the fan-out pattern used by Send.
-// An optional onMeta callback is invoked with yEnc metadata before body decoding begins.
-func (c *Client) BodyAsync(ctx context.Context, messageID string, w io.Writer, onMeta ...func(YEncMeta)) <-chan BodyResult {
-	var metaFn func(YEncMeta)
-	if len(onMeta) > 0 {
-		metaFn = onMeta[0]
-	}
+// FetchAsync is Fetch on its own goroutine, returning a channel that receives
+// exactly one BodyResult and is then closed. It is the fan-out form: a caller
+// dispatching many segments at once collects them as they land instead of
+// serialising on each.
+func (c *Client) FetchAsync(ctx context.Context, r Req) <-chan BodyResult {
 	ch := make(chan BodyResult, 1)
 	go func() {
-		body, err := c.doBody(ctx, messageID, w, metaFn)
+		defer close(ch)
+		body, err := c.Fetch(ctx, r)
 		ch <- BodyResult{Body: body, Err: err}
-		close(ch)
+	}()
+	return ch
+}
+
+// Exists reports whether an article is retrievable from at least one provider,
+// without transferring its body. Req.Lane applies; Req.Writer and Req.OnMeta
+// are ignored.
+//
+// An article no provider holds is not an error case for the pool but an
+// answer: it returns a nil result wrapping ErrArticleNotFound, so a bulk
+// liveness sweep reads a miss as a verdict rather than a failure.
+func (c *Client) Exists(ctx context.Context, r Req) (*StatResult, error) {
+	if r.MessageID == "" {
+		return nil, ErrNoMessageID
+	}
+	return parseStat(r.MessageID, c.sendSync(ctx, statPayload(r.MessageID), r.Lane))
+}
+
+// ExistsAsync is Exists on its own goroutine, mirroring FetchAsync. For a
+// slice of message-IDs prefer ExistsMany, which bounds concurrency to the
+// pool's STAT pipeline capacity instead of dispatching all of them at once.
+func (c *Client) ExistsAsync(ctx context.Context, r Req) <-chan ExistsResult {
+	ch := make(chan ExistsResult, 1)
+	go func() {
+		defer close(ch)
+		res, err := c.Exists(ctx, r)
+		ch <- ExistsResult{MessageID: r.MessageID, Result: res, Err: err}
 	}()
 	return ch
 }
 
 // Head retrieves the headers of an article.
 func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, error) {
-	payload := []byte("HEAD <" + messageID + ">\r\n")
-	respCh := c.Send(ctx, payload, nil)
+	if messageID == "" {
+		return nil, ErrNoMessageID
+	}
+	respCh := c.send(ctx, []byte("HEAD <"+messageID+">\r\n"), nil, nil, LaneNormal)
 
 	resp := <-respCh
 	if resp.Err != nil {
@@ -186,6 +180,11 @@ func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, erro
 		MessageID: messageID,
 		Headers:   parseHeaders(resp.Lines),
 	}, nil
+}
+
+// bodyPayload builds the wire payload for a BODY command.
+func bodyPayload(messageID string) []byte {
+	return []byte("BODY <" + messageID + ">\r\n")
 }
 
 // statPayload builds the wire payload for a STAT command.
@@ -219,52 +218,6 @@ func parseStat(messageID string, resp Response) (*StatResult, error) {
 	}
 
 	return result, nil
-}
-
-// Stat checks whether an article exists without transferring its contents.
-func (c *Client) Stat(ctx context.Context, messageID string) (*StatResult, error) {
-	return parseStat(messageID, <-c.Send(ctx, statPayload(messageID), nil))
-}
-
-// StatPriority is like Stat but enqueues on the priority channel so idle
-// connections pick it up before normal requests. Useful for a latency-sensitive
-// existence check that must not queue behind a large BODY on a busy connection.
-func (c *Client) StatPriority(ctx context.Context, messageID string) (*StatResult, error) {
-	return parseStat(messageID, <-c.SendPriority(ctx, statPayload(messageID), nil))
-}
-
-// StatBackground is Stat on the background lane (see BodyBackground). For
-// existence checks nobody is waiting on; StatMany with
-// StatManyOptions.Background sweeps many at once.
-func (c *Client) StatBackground(ctx context.Context, messageID string) (*StatResult, error) {
-	return parseStat(messageID, <-c.SendBackground(ctx, statPayload(messageID), nil))
-}
-
-// StatAsync returns a channel that will receive exactly one StatManyResult,
-// mirroring BodyAsync. It preserves the fan-out pattern used by BodyAsync so a
-// caller can dispatch many existence checks and collect them concurrently. For
-// checking a slice of message-IDs prefer StatMany, which bounds concurrency.
-func (c *Client) StatAsync(ctx context.Context, messageID string) <-chan StatManyResult {
-	ch := make(chan StatManyResult, 1)
-	go func() {
-		res, err := c.Stat(ctx, messageID)
-		ch <- StatManyResult{MessageID: messageID, Result: res, Err: err}
-		close(ch)
-	}()
-	return ch
-}
-
-// doBody is the shared implementation for Body, BodyStream, and BodyAsync.
-// When w is nil, decoded bytes are buffered in the Response.Body field.
-func (c *Client) doBody(ctx context.Context, messageID string, w io.Writer, onMeta func(YEncMeta)) (*ArticleBody, error) {
-	payload := []byte("BODY <" + messageID + ">\r\n")
-	var respCh <-chan Response
-	if onMeta != nil {
-		respCh = c.Send(ctx, payload, w, onMeta)
-	} else {
-		respCh = c.Send(ctx, payload, w)
-	}
-	return c.finishBody(messageID, w, respCh)
 }
 
 // finishBody waits on respCh and builds the ArticleBody result.

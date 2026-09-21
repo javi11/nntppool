@@ -68,7 +68,7 @@ func TestSlowBodySucceeds(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	body, err := c.Body(context.Background(), "id@test")
+	body, err := c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	if err != nil {
 		t.Fatalf("Body() error = %v, want success for a slow-but-healthy transfer", err)
 	}
@@ -127,7 +127,7 @@ func TestHungProviderFailsOverFast(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	start := time.Now()
-	body, err := c.Body(context.Background(), "id@test")
+	body, err := c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("Body() error = %v, want failover to healthy provider", err)
@@ -180,7 +180,7 @@ func TestMidBodyStallStreamErrors(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	var sink bytes.Buffer
-	_, err = c.BodyStream(context.Background(), "id@test", &sink)
+	_, err = c.Fetch(context.Background(), Req{MessageID: "id@test", Writer: &sink})
 	if err == nil {
 		t.Fatal("BodyStream() error = nil, want stall error (no silent failover after partial stream)")
 	}
@@ -250,7 +250,7 @@ func TestStatProbeWinnerStallStreamErrors(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	var sink bytes.Buffer
-	_, err = c.BodyStream(context.Background(), "id@test", &sink)
+	_, err = c.Fetch(context.Background(), Req{MessageID: "id@test", Writer: &sink})
 	if err == nil {
 		t.Fatal("BodyStream() error = nil, want stall error (no re-stream onto provider C)")
 	}
@@ -314,7 +314,7 @@ func TestBufferedStallRecovers(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	body, err := c.Body(context.Background(), "id@test")
+	body, err := c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	if err != nil {
 		t.Fatalf("Body() error = %v, want recovery via healthy provider", err)
 	}
@@ -416,7 +416,7 @@ func TestStatsExposesNewFields(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	if _, err := c.Body(context.Background(), "id@test"); err != nil {
+	if _, err := c.Fetch(context.Background(), Req{MessageID: "id@test"}); err != nil {
 		t.Fatalf("Body() error = %v", err)
 	}
 

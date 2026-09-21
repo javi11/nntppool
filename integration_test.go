@@ -399,7 +399,7 @@ func TestClient_SendRetryRoundRobin(t *testing.T) {
 	// Send a few requests
 	for range 4 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 		cancel()
 		if resp.Err != nil {
 			t.Fatalf("Send() error = %v", resp.Err)
@@ -465,7 +465,7 @@ func TestClient_WeightedRoundRobin(t *testing.T) {
 	const N = 60
 	for range N {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 		cancel()
 		if resp.Err != nil {
 			t.Fatalf("Send() error = %v", resp.Err)
@@ -521,7 +521,7 @@ func TestClient_SendRetryFallbackBackup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("Send() error = %v", resp.Err)
 	}
@@ -573,7 +573,7 @@ func TestClient_SendRetryConnectionDiedSameProvider(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("Send() error = %v, want recovery on a fresh same-provider connection", resp.Err)
 	}
@@ -617,7 +617,7 @@ func TestClient_SendRetryAll430(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.StatusCode != 430 {
 		t.Errorf("StatusCode = %d, want 430 (all providers exhausted)", resp.StatusCode)
 	}
@@ -665,7 +665,7 @@ func TestClient_Skip430SameHost(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.StatusCode != 430 {
 		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
 	}
@@ -712,7 +712,7 @@ func TestClient_Skip430DifferentHosts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.StatusCode != 430 {
 		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
 	}
@@ -759,7 +759,7 @@ func TestClient_Skip430FactoryProviders(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.StatusCode != 430 {
 		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
 	}
@@ -817,7 +817,7 @@ func TestClient_FIFODispatch(t *testing.T) {
 	const N = 10
 	for range N {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 		cancel()
 		if resp.Err != nil {
 			t.Fatalf("Send() error = %v", resp.Err)
@@ -865,7 +865,7 @@ func TestClient_FIFO430Fallthrough(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("Send() error = %v", resp.Err)
 	}
@@ -909,7 +909,7 @@ func TestClient_FIFO423Fallthrough(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("Send() error = %v", resp.Err)
 	}
@@ -956,7 +956,7 @@ func TestClient_RoundRobinMoreThan8Providers(t *testing.T) {
 	// Send several requests — any panic in the dispatch path will surface here.
 	for range 10 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 		cancel()
 		if resp.Err != nil {
 			t.Fatalf("Send() error = %v", resp.Err)
@@ -984,7 +984,7 @@ func benchSend(b *testing.B, providers []Provider) {
 	b.ResetTimer()
 	for range b.N {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp := <-c.Send(ctx, payload, nil)
+		resp := <-c.Send(ctx, SendReq{Payload: payload})
 		cancel()
 		if resp.Err != nil {
 			b.Fatalf("Send() error = %v", resp.Err)
@@ -1105,7 +1105,7 @@ func TestClient_HotConnectionPreference(t *testing.T) {
 
 	// First request: establishes 1 hot connection (cold slot wakeup).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	cancel()
 	if resp.Err != nil {
 		t.Fatalf("Send() error = %v", resp.Err)
@@ -1121,7 +1121,7 @@ func TestClient_HotConnectionPreference(t *testing.T) {
 		// after completing the previous response cycle.
 		time.Sleep(10 * time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+		resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 		cancel()
 		if resp.Err != nil {
 			t.Fatalf("Send()[%d] error = %v", i, resp.Err)
@@ -1179,11 +1179,11 @@ func TestClient_ColdWakeupOnSaturation(t *testing.T) {
 	defer cancel()
 
 	// Send 2 concurrent requests.
-	ch1 := c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	ch1 := c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	// Small delay so the first request is picked up and the connection
 	// becomes hot before we send the second one.
 	time.Sleep(50 * time.Millisecond)
-	ch2 := c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	ch2 := c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 
 	// Give time for cold slot to wake and dial.
 	time.Sleep(200 * time.Millisecond)
@@ -1206,7 +1206,7 @@ func TestClient_ColdWakeupOnSaturation(t *testing.T) {
 	}
 }
 
-func TestClient_BodyPriority(t *testing.T) {
+func TestClient_FetchOnPriorityLane(t *testing.T) {
 	original := []byte("Hello priority body content for testing.")
 
 	factory := func(ctx context.Context) (net.Conn, error) {
@@ -1241,7 +1241,7 @@ func TestClient_BodyPriority(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	body, err := c.BodyPriority(ctx, "test@example.com")
+	body, err := c.Fetch(ctx, Req{MessageID: "test@example.com", Lane: LanePriority})
 	if err != nil {
 		t.Fatalf("BodyPriority() error = %v", err)
 	}
@@ -1289,7 +1289,7 @@ func TestClient_502CommandRemovesProvider(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	// Both providers returned 502 and were removed — all providers exhausted.
 	if !errors.Is(resp.Err, ErrServiceUnavailable) {
 		t.Fatalf("Send() error = %v, want ErrServiceUnavailable", resp.Err)
@@ -1335,7 +1335,7 @@ func TestClient_502ReconnectDelay(t *testing.T) {
 	defer cancel()
 
 	// First request: hits 502, provider is removed.
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if !errors.Is(resp.Err, ErrServiceUnavailable) {
 		t.Fatalf("first Send() error = %v, want ErrServiceUnavailable", resp.Err)
 	}
@@ -1356,7 +1356,7 @@ func TestClient_502ReconnectDelay(t *testing.T) {
 	}
 
 	// Second request: should succeed via the re-added provider.
-	resp = <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp = <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("second Send() error = %v", resp.Err)
 	}
@@ -1397,7 +1397,7 @@ func TestClient_502CommandFallsBackToBackup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.Err != nil {
 		t.Fatalf("Send() error = %v", resp.Err)
 	}
@@ -1599,7 +1599,7 @@ func TestClient_Skip430SameStorageGroup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.StatusCode != 430 {
 		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
 	}
@@ -1651,7 +1651,7 @@ func TestClient_Skip430StorageGroupDoesNotSkipOtherGroups(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	resp := <-c.Send(ctx, []byte("STAT <id@test>\r\n"), nil)
+	resp := <-c.Send(ctx, SendReq{Payload: []byte("STAT <id@test>\r\n")})
 	if resp.StatusCode != 430 {
 		t.Fatalf("StatusCode = %d, want 430", resp.StatusCode)
 	}

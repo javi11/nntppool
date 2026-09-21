@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/javi11/nntppool/v4/nzb"
+	"github.com/javi11/nntppool/v5/nzb"
 )
 
 const DefaultSpeedTestNZBURL = "https://sabnzbd.org/tests/test_download_1GB.nzb"
@@ -138,7 +138,7 @@ func (c *Client) SpeedTest(ctx context.Context, opts SpeedTestOptions) (*SpeedTe
 		if targetGroup != nil {
 			respChans[i] = c.sendToGroup(stCtx, targetGroup, payload, io.Discard)
 		} else {
-			respChans[i] = c.Send(stCtx, payload, io.Discard)
+			respChans[i] = c.Send(stCtx, SendReq{Payload: payload, Writer: io.Discard})
 		}
 	}
 

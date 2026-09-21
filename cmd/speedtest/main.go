@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
+	"github.com/javi11/nntppool/v5"
 )
 
 const defaultNZBURL = "https://sabnzbd.org/tests/test_download_10GB.nzb"

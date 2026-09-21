@@ -56,15 +56,15 @@ func makeStatByIDFactory(t testing.TB, mu *sync.Mutex, cmdLog *[]string, replies
 }
 
 // collectStat drains a StatMany/StatAsync channel into a map keyed by message-id.
-func collectStat(ch <-chan StatManyResult) map[string]StatManyResult {
-	m := make(map[string]StatManyResult)
+func collectStat(ch <-chan ExistsResult) map[string]ExistsResult {
+	m := make(map[string]ExistsResult)
 	for r := range ch {
 		m[r.MessageID] = r
 	}
 	return m
 }
 
-func TestStatMany_AllExist(t *testing.T) {
+func TestExistsMany_AllExist(t *testing.T) {
 	ids := []string{"a@h", "b@h", "c@h"}
 	replies := map[string]string{
 		"a@h": "223 1 <a@h> exists",
@@ -80,7 +80,7 @@ func TestStatMany_AllExist(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{}))
+	got := collectStat(c.ExistsMany(context.Background(), ids, ManyOptions{}))
 	if len(got) != len(ids) {
 		t.Fatalf("got %d results, want %d", len(got), len(ids))
 	}
@@ -101,7 +101,7 @@ func TestStatMany_AllExist(t *testing.T) {
 	}
 }
 
-func TestStatMany_MissingIsNonFatal(t *testing.T) {
+func TestExistsMany_MissingIsNonFatal(t *testing.T) {
 	ids := []string{"hit@h", "miss@h"}
 	replies := map[string]string{
 		"hit@h": "223 1 <hit@h> exists",
@@ -116,7 +116,7 @@ func TestStatMany_MissingIsNonFatal(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{}))
+	got := collectStat(c.ExistsMany(context.Background(), ids, ManyOptions{}))
 	if len(got) != 2 {
 		t.Fatalf("got %d results, want 2", len(got))
 	}
@@ -153,7 +153,7 @@ func TestStatReportsSuccessfulProviderAfterFallback(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	result, err := c.Stat(context.Background(), "x@h")
+	result, err := c.Exists(context.Background(), Req{MessageID: "x@h"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestStatReportsSuccessfulProviderAfterFallback(t *testing.T) {
 	}
 }
 
-func TestStatMany_Completeness(t *testing.T) {
+func TestExistsMany_Completeness(t *testing.T) {
 	const total = 200
 	ids := make([]string, total)
 	replies := make(map[string]string, total)
@@ -180,7 +180,7 @@ func TestStatMany_Completeness(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: 16}))
+	got := collectStat(c.ExistsMany(context.Background(), ids, ManyOptions{Concurrency: 16}))
 	if len(got) != total {
 		t.Fatalf("got %d unique results, want %d", len(got), total)
 	}
@@ -191,7 +191,7 @@ func TestStatMany_Completeness(t *testing.T) {
 	}
 }
 
-func TestStatMany_ContextCancel(t *testing.T) {
+func TestExistsMany_ContextCancel(t *testing.T) {
 	const total = 500
 	ids := make([]string, total)
 	replies := make(map[string]string, total)
@@ -211,7 +211,7 @@ func TestStatMany_ContextCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch := c.StatMany(ctx, ids, StatManyOptions{Concurrency: 4})
+	ch := c.ExistsMany(ctx, ids, ManyOptions{Concurrency: 4})
 	// Read a few then cancel.
 	count := 0
 	for range ch {
@@ -227,7 +227,7 @@ func TestStatMany_ContextCancel(t *testing.T) {
 	}
 }
 
-func TestStatMany_ProviderTargeting(t *testing.T) {
+func TestExistsMany_ProviderTargeting(t *testing.T) {
 	var mu1, mu2 sync.Mutex
 	var p1Cmds, p2Cmds []string
 	replies := map[string]string{"x@h": "223 1 <x@h> exists"}
@@ -249,8 +249,8 @@ func TestStatMany_ProviderTargeting(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	got := collectStat(c.StatMany(context.Background(),
-		[]string{"x@h"}, StatManyOptions{Provider: "provider-two:119"}))
+	got := collectStat(c.ExistsMany(context.Background(),
+		[]string{"x@h"}, ManyOptions{Provider: "provider-two:119"}))
 	if r := got["x@h"]; r.Err != nil || r.Result == nil {
 		t.Fatalf("x@h: err=%v result=%v", r.Err, r.Result)
 	}
@@ -267,7 +267,7 @@ func TestStatMany_ProviderTargeting(t *testing.T) {
 	}
 }
 
-func TestStatMany_UnknownProvider(t *testing.T) {
+func TestExistsMany_UnknownProvider(t *testing.T) {
 	c, err := NewClient(context.Background(), []Provider{{
 		Factory:     makeStatByIDFactory(t, nil, nil, map[string]string{"a@h": "223 1 <a@h> exists"}),
 		Connections: 1,
@@ -277,8 +277,8 @@ func TestStatMany_UnknownProvider(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	got := collectStat(c.StatMany(context.Background(),
-		[]string{"a@h"}, StatManyOptions{Provider: "does-not-exist"}))
+	got := collectStat(c.ExistsMany(context.Background(),
+		[]string{"a@h"}, ManyOptions{Provider: "does-not-exist"}))
 	if r := got["a@h"]; r.Err == nil {
 		t.Errorf("want error for unknown provider, got result %v", r.Result)
 	}
@@ -286,7 +286,7 @@ func TestStatMany_UnknownProvider(t *testing.T) {
 
 // TestStatMany_SkipOmitsResult pins the contract: a skipped id emits no STAT
 // command and no result, while every non-skipped id still gets exactly one.
-func TestStatMany_SkipOmitsResult(t *testing.T) {
+func TestExistsMany_SkipOmitsResult(t *testing.T) {
 	var mu sync.Mutex
 	var cmdLog []string
 	ids := []string{"a@h", "b@h", "c@h"}
@@ -304,7 +304,7 @@ func TestStatMany_SkipOmitsResult(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+	got := collectStat(c.ExistsMany(context.Background(), ids, ManyOptions{
 		Skip: func(messageID string) bool { return messageID == "b@h" },
 	}))
 
@@ -336,7 +336,7 @@ func TestStatMany_SkipOmitsResult(t *testing.T) {
 // TestStatMany_SkipStopsFurtherDispatch confirms Skip can be flipped mid-sweep
 // to abandon the remaining ids without chunking: once it starts returning
 // true, none of the later ids should ever reach the wire.
-func TestStatMany_SkipStopsFurtherDispatch(t *testing.T) {
+func TestExistsMany_SkipStopsFurtherDispatch(t *testing.T) {
 	var mu sync.Mutex
 	var cmdLog []string
 	const n = 50
@@ -373,7 +373,7 @@ func TestStatMany_SkipStopsFurtherDispatch(t *testing.T) {
 		return false
 	}
 
-	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+	got := collectStat(c.ExistsMany(context.Background(), ids, ManyOptions{
 		Concurrency: 1, // serial dispatch makes the cutoff point deterministic
 		Skip:        skip,
 	}))
@@ -402,7 +402,7 @@ func TestStatMany_SkipStopsFurtherDispatch(t *testing.T) {
 
 // TestStatMany_SkipNil is a regression guard: a nil Skip must behave exactly
 // as if the option didn't exist.
-func TestStatMany_SkipNil(t *testing.T) {
+func TestExistsMany_SkipNil(t *testing.T) {
 	ids := []string{"a@h", "b@h"}
 	replies := map[string]string{
 		"a@h": "223 1 <a@h> exists",
@@ -417,7 +417,7 @@ func TestStatMany_SkipNil(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{Skip: nil}))
+	got := collectStat(c.ExistsMany(context.Background(), ids, ManyOptions{Skip: nil}))
 	if len(got) != len(ids) {
 		t.Fatalf("got %d results, want %d", len(got), len(ids))
 	}
@@ -431,7 +431,7 @@ func TestStatMany_SkipNil(t *testing.T) {
 // TestStatMany_SkipConcurrencySafety exercises Skip under -race with a wide
 // concurrency and a closure that reads/writes shared state behind a mutex, to
 // confirm Skip is safe to call from every dispatch goroutine concurrently.
-func TestStatMany_SkipConcurrencySafety(t *testing.T) {
+func TestExistsMany_SkipConcurrencySafety(t *testing.T) {
 	const n = 300
 	ids := make([]string, n)
 	replies := make(map[string]string, n)
@@ -462,7 +462,7 @@ func TestStatMany_SkipConcurrencySafety(t *testing.T) {
 		return idx%2 == 0
 	}
 
-	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+	got := collectStat(c.ExistsMany(context.Background(), ids, ManyOptions{
 		Concurrency: 128,
 		Skip:        skip,
 	}))
@@ -495,7 +495,7 @@ func TestStatPriority(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	res, err := c.StatPriority(context.Background(), "p@h")
+	res, err := c.Exists(context.Background(), Req{MessageID: "p@h", Lane: LanePriority})
 	if err != nil {
 		t.Fatalf("StatPriority: %v", err)
 	}
@@ -504,7 +504,7 @@ func TestStatPriority(t *testing.T) {
 	}
 }
 
-func TestStatAsync(t *testing.T) {
+func TestExistsAsync(t *testing.T) {
 	c, err := NewClient(context.Background(), []Provider{{
 		Factory:     makeStatByIDFactory(t, nil, nil, map[string]string{"async@h": "223 9 <async@h> exists"}),
 		Connections: 1,
@@ -515,7 +515,7 @@ func TestStatAsync(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	select {
-	case r := <-c.StatAsync(context.Background(), "async@h"):
+	case r := <-c.ExistsAsync(context.Background(), Req{MessageID: "async@h"}):
 		if r.Err != nil {
 			t.Fatalf("StatAsync err: %v", r.Err)
 		}
@@ -575,7 +575,7 @@ func TestStatCapacity(t *testing.T) {
 // TestStatMany_CompletenessUnderWideConcurrency pins the property the dispatch
 // rewrite must preserve: every id yields exactly one result, with no duplicates
 // and none dropped, even when workers vastly outnumber the ids they share.
-func TestStatMany_CompletenessUnderWideConcurrency(t *testing.T) {
+func TestExistsMany_CompletenessUnderWideConcurrency(t *testing.T) {
 	const n = 500
 	ids := make([]string, n)
 	replies := make(map[string]string, n)
@@ -594,7 +594,7 @@ func TestStatMany_CompletenessUnderWideConcurrency(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	seen := make(map[string]int, n)
-	for res := range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: 256}) {
+	for res := range c.ExistsMany(context.Background(), ids, ManyOptions{Concurrency: 256}) {
 		seen[res.MessageID]++
 	}
 
@@ -611,7 +611,7 @@ func TestStatMany_CompletenessUnderWideConcurrency(t *testing.T) {
 // TestStatMany_CancelMidSweepClosesChannel pins the documented contract: on
 // cancellation dispatch stops, in-flight checks are cancelled, and the channel
 // is closed, so a caller ranging over it always terminates.
-func TestStatMany_CancelMidSweepClosesChannel(t *testing.T) {
+func TestExistsMany_CancelMidSweepClosesChannel(t *testing.T) {
 	const n = 2000
 	ids := make([]string, n)
 	replies := make(map[string]string, n)
@@ -631,7 +631,7 @@ func TestStatMany_CancelMidSweepClosesChannel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ch := c.StatMany(ctx, ids, StatManyOptions{Concurrency: 64})
+	ch := c.ExistsMany(ctx, ids, ManyOptions{Concurrency: 64})
 
 	got := 0
 	for range ch {
@@ -672,7 +672,7 @@ func BenchmarkStatManyDispatch(b *testing.B) {
 
 	b.ResetTimer()
 	for range b.N {
-		for range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: n}) {
+		for range c.ExistsMany(context.Background(), ids, ManyOptions{Concurrency: n}) {
 		}
 	}
 }

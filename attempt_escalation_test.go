@@ -39,7 +39,7 @@ func TestSlowStatusLineEscalates(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	start := time.Now()
-	_, err = c.Body(context.Background(), "aged@spool")
+	_, err = c.Fetch(context.Background(), Req{MessageID: "aged@spool"})
 	elapsed := time.Since(start)
 
 	// The contract under test is DELIVERY: before escalation this request
@@ -69,7 +69,7 @@ func TestExpiredAttemptsKeepTheirReason(t *testing.T) {
 	}
 	defer func() { _ = c.Close() }()
 
-	_, err = c.Body(context.Background(), "id@test")
+	_, err = c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	if err == nil {
 		t.Fatal("Body() = nil error, want attempt-timeout failure")
 	}
@@ -105,7 +105,7 @@ func TestEscalationBounded(t *testing.T) {
 			defer func() { _ = c.Close() }()
 
 			start := time.Now()
-			_, err = c.Body(context.Background(), "id@test")
+			_, err = c.Fetch(context.Background(), Req{MessageID: "id@test"})
 			elapsed := time.Since(start)
 			if err == nil {
 				t.Fatal("Body() = nil error, want failure against a hung pool")
@@ -139,7 +139,7 @@ func TestEscalationNoOpWhenWindowCannotGrow(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	start := time.Now()
-	_, err = c.Body(context.Background(), "id@test")
+	_, err = c.Fetch(context.Background(), Req{MessageID: "id@test"})
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("Body() = nil error, want failure against a hung provider")

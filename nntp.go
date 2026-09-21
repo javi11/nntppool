@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -218,7 +219,7 @@ type Request struct {
 	// heldPrio is set when the request also took a prioBodySem slot.
 	heldPrio bool
 	// lane is the request lane this attempt was dispatched on; see lane.
-	lane lane
+	lane Lane
 	// heldBg is set once a background-lane request is on the wire and has
 	// been counted in its provider group's bgInflight, so the reader (or the
 	// pending drain) releases exactly what was counted.
@@ -228,31 +229,54 @@ type Request struct {
 	providerName string
 }
 
-// lane is which of the three request queues an attempt is dispatched on.
+// Lane is which of the three request queues an attempt is dispatched on.
 // Every connection writer reads them in strict preference order: priority,
 // then normal, then background. Priority is for reads something is blocked
 // on (a player waiting for the next article); normal is the default; background
 // is for work nobody is waiting on — a PAR2 repair reading a whole release, or
 // the liveness census that prices it — which may use every idle connection
 // but must never queue ahead of the other two.
-type lane uint8
+type Lane uint8
 
 const (
-	laneNormal lane = iota
-	lanePriority
-	laneBackground
+	// LaneNormal is the default lane. It is the zero value, so a Req that
+	// says nothing about lanes rides it.
+	LaneNormal Lane = iota
+	// LanePriority is for a read something is blocked on: idle connections
+	// prefer it over normal traffic, so a demand read is not queued behind
+	// read-ahead or an import.
+	LanePriority
+	// LaneBackground is for work nobody is waiting on. It is served only by
+	// connections with nothing priority or normal queued and is held to
+	// Provider.BackgroundFloor while foreground traffic is recent.
+	LaneBackground
 )
 
+// String implements fmt.Stringer so a lane reads as a name in test failures
+// and log lines rather than as 0, 1, or 2.
+func (l Lane) String() string {
+	switch l {
+	case LaneNormal:
+		return "normal"
+	case LanePriority:
+		return "priority"
+	case LaneBackground:
+		return "background"
+	default:
+		return "lane(" + strconv.Itoa(int(l)) + ")"
+	}
+}
+
 // isPriority reports whether the request rides the priority lane.
-func (r *Request) isPriority() bool { return r.lane == lanePriority }
+func (r *Request) isPriority() bool { return r.lane == LanePriority }
 
 // escalated is the lane a retry after a 430 rides: a normal request steps up
 // to priority so the failover to the next provider is not queued behind
 // read-ahead, while background work stays background — nobody is waiting on
 // it, so it has no claim to jump the queue however many providers it visits.
-func (l lane) escalated(post430 bool) lane {
-	if post430 && l == laneNormal {
-		return lanePriority
+func (l Lane) escalated(post430 bool) Lane {
+	if post430 && l == LaneNormal {
+		return LanePriority
 	}
 	return l
 }
@@ -627,7 +651,7 @@ func (c *NNTPConnection) noteDispatched(req *Request) {
 	if c.stats == nil {
 		return
 	}
-	if req.lane == laneBackground {
+	if req.lane == LaneBackground {
 		c.stats.bgInflight.Add(1)
 		c.bgPending.Add(1)
 		req.heldBg = true
@@ -2025,8 +2049,8 @@ type Provider struct {
 	// 0 defaults to min(Inflight, 4); a value >= Inflight disables the cap.
 	StreamInflight int
 
-	// BackgroundFloor is how many background-lane requests (BodyBackground,
-	// StatBackground, StatMany with Background) this provider keeps in flight
+	// BackgroundFloor is how many background-lane requests (any Fetch,
+	// Exists, or ExistsMany on LaneBackground) this provider keeps in flight
 	// while priority or normal traffic is recent. When the provider is idle
 	// background may use every connection; the floor only bounds it under
 	// contention so a stream never finds more than this many connections stuck
@@ -2607,53 +2631,41 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response {
-	respCh := make(chan Response, 1)
-	if ctx == nil {
-		ctx = context.Background()
-	}
+// SendReq is one raw NNTP request: the wire payload, which lane it rides, and
+// where a body-bearing response should be decoded to. It is the seam Fetch and
+// Exists are built on, for commands this package models no higher (GROUP,
+// XOVER, a server-specific extension).
+type SendReq struct {
+	// Payload is the complete command line, CRLF-terminated.
+	Payload []byte
 
-	var metaFn func(YEncMeta)
-	if len(onMeta) > 0 {
-		metaFn = onMeta[0]
-	}
+	// Lane selects the request queue. LaneNormal, the zero value, is the default.
+	Lane Lane
 
-	go c.sendWithRetry(ctx, payload, bodyWriter, metaFn, respCh)
-	return respCh
+	// Writer, when non-nil, receives the decoded body bytes as they arrive;
+	// when nil a body-bearing response is buffered into Response.Body.
+	Writer io.Writer
+
+	// OnMeta, when non-nil, is called with yEnc metadata before body decoding.
+	OnMeta func(YEncMeta)
 }
 
-// SendPriority is like Send but enqueues the request on the priority channel,
-// so idle connections will pick it up before normal requests.
-func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response {
-	respCh := make(chan Response, 1)
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	var metaFn func(YEncMeta)
-	if len(onMeta) > 0 {
-		metaFn = onMeta[0]
-	}
-
-	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, lanePriority)
-	return respCh
+// Send dispatches a raw request and returns a channel that receives exactly
+// one Response and is then closed. Provider failover, the 430 STAT probe, and
+// attempt-window escalation all apply, exactly as for Fetch.
+func (c *Client) Send(ctx context.Context, r SendReq) <-chan Response {
+	return c.send(ctx, r.Payload, r.Writer, r.OnMeta, r.Lane)
 }
 
-// SendBackground is like Send but enqueues the request on the background
-// lane, which connections read only when the priority and normal lanes are
-// empty and which is capped per provider while foreground traffic is recent.
-func (c *Client) SendBackground(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response {
+// send is the internal entry point every request in this package funnels
+// through, so lane selection has one definition rather than one per verb.
+func (c *Client) send(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), ln Lane) <-chan Response {
 	respCh := make(chan Response, 1)
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	var metaFn func(YEncMeta)
-	if len(onMeta) > 0 {
-		metaFn = onMeta[0]
-	}
-
-	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, laneBackground)
+	go c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, ln)
 	return respCh
 }
 
@@ -2664,7 +2676,7 @@ func (c *Client) SendBackground(ctx context.Context, payload []byte, bodyWriter 
 // what a caller that wants to get on with something else meanwhile needs. A
 // caller that blocks on the reply immediately does not: the goroutine is pure
 // overhead, and on a sweep that is one goroutine per message-id.
-func (c *Client) sendSync(ctx context.Context, payload []byte, ln lane) Response {
+func (c *Client) sendSync(ctx context.Context, payload []byte, ln Lane) Response {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -2752,7 +2764,7 @@ func (c *Client) raceCandidates(
 	// Single live candidate: skip the probe RTT and send the real payload directly.
 	if len(live) == 1 {
 		g := live[0]
-		resp, ok, done := c.tryGroup(ctx, g, payload, bodyWriter, onMeta, lanePriority)
+		resp, ok, done := c.tryGroup(ctx, g, payload, bodyWriter, onMeta, LanePriority)
 		if done {
 			return false, true, lastErr
 		}
@@ -2786,7 +2798,7 @@ func (c *Client) raceCandidates(
 	results := make(chan probeResult, len(live))
 	for _, g := range live {
 		go func(g *providerGroup) {
-			resp, ok, done := c.tryGroup(ctx, g, statPayload, nil, nil, lanePriority)
+			resp, ok, done := c.tryGroup(ctx, g, statPayload, nil, nil, LanePriority)
 			results <- probeResult{g: g, resp: resp, ok: ok, cancelled: done}
 		}(g)
 	}
@@ -2840,7 +2852,7 @@ func (c *Client) raceCandidates(
 	}
 
 	// Send the real payload to the winner on the priority lane.
-	resp, ok, done := c.tryGroup(ctx, winner, payload, bodyWriter, onMeta, lanePriority)
+	resp, ok, done := c.tryGroup(ctx, winner, payload, bodyWriter, onMeta, LanePriority)
 	if done {
 		return false, true, lastErr
 	}
@@ -2914,7 +2926,7 @@ func (c *Client) tryGroup(
 	payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
-	ln lane,
+	ln Lane,
 ) (resp Response, ok bool, done bool) {
 	return c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, ln, 0)
 }
@@ -2928,7 +2940,7 @@ func (c *Client) tryGroupTimeout(
 	payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
-	ln lane,
+	ln Lane,
 	attemptTimeout time.Duration,
 ) (resp Response, ok bool, done bool) {
 	attemptTimeout = g.windowOr(attemptTimeout)
@@ -2957,7 +2969,7 @@ func (c *Client) tryGroupTimeout(
 	timer := time.NewTimer(attemptTimeout)
 	defer timer.Stop()
 	var timerC <-chan time.Time
-	if ln == laneBackground {
+	if ln == LaneBackground {
 		req.attemptDeadline = time.Time{}
 	} else {
 		timerC = timer.C
@@ -2966,10 +2978,10 @@ func (c *Client) tryGroupTimeout(
 	var hotCh chan *Request
 	var coldCh chan *Request
 	switch ln {
-	case lanePriority:
+	case LanePriority:
 		hotCh = g.hotPrioCh
 		coldCh = g.prioCh
-	case laneBackground:
+	case LaneBackground:
 		// No hot variant: background work is never worth waking a cold slot
 		// ahead of anything, and a nil hotCh is never ready in the select.
 		coldCh = g.bgCh
@@ -2985,7 +2997,7 @@ func (c *Client) tryGroupTimeout(
 	// is in play nothing is ever sent here and every connection serves the
 	// normal lane exactly as before.
 	dispatched := false
-	if ln == lanePriority && !isCheapCommand(payload) {
+	if ln == LanePriority && !isCheapCommand(payload) {
 		select {
 		case g.hotIdleBodyCh <- req:
 			dispatched = true
@@ -3128,7 +3140,7 @@ func speedScore(speed, maxSpeed float64) int {
 }
 
 func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
-	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, laneNormal)
+	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, LaneNormal)
 }
 
 // tryGroupResilient retries a single provider on a fresh connection when a
@@ -3145,7 +3157,7 @@ func (c *Client) tryGroupResilient(
 	payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
-	ln lane,
+	ln Lane,
 	window time.Duration,
 ) (resp Response, ok bool, cancelled bool) {
 	// window == 0 uses the provider's adaptive attempt window. A positive
@@ -3242,7 +3254,7 @@ func expiredAwaitingResponse(resp Response, ok bool) bool {
 	return isTimeoutErr(resp.Err)
 }
 
-func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, ln lane) {
+func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, ln Lane) {
 	defer close(respCh)
 
 	// Precompute for STAT probe: extract message-ID once.

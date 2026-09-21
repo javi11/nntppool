@@ -78,7 +78,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
 ## Tech Stack
 
 - **Language**: Go 1.25+
-- **Module**: `github.com/javi11/nntppool/v4`
+- **Module**: `github.com/javi11/nntppool/v5`
 - **Key dependency**: `github.com/mnightingale/rapidyenc` — SIMD-accelerated yEnc decoder
 - **Metrics**: lock-free atomic counters — no external monitoring framework required
 - **Test tooling**: standard `testing` package, `golangci-lint v2`, `go-junit-report`, `govulncheck`
@@ -96,10 +96,13 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
 
 ## Getting Started
 
+> **Upgrading from v4?** The article-request API was collapsed into `Fetch`/`Exists`
+> with a `Req` struct. See [MIGRATION.md](MIGRATION.md) for the call-by-call mapping.
+
 ### Install the dependency
 
 ```bash
-go get github.com/javi11/nntppool/v4
+go get github.com/javi11/nntppool/v5
 ```
 
 ### Basic usage — single provider
@@ -114,7 +117,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/javi11/nntppool/v4"
+    "github.com/javi11/nntppool/v5"
 )
 
 func main() {
@@ -140,7 +143,7 @@ func main() {
     defer client.Close()
 
     // Fetch article body (buffered into memory)
-    body, err := client.Body(ctx, "some-message-id@example.com")
+    body, err := client.Fetch(ctx, nntppool.Req{MessageID: "some-message-id@example.com"})
     if errors.Is(err, nntppool.ErrArticleNotFound) {
         fmt.Println("article not available on this provider")
         return
@@ -194,7 +197,7 @@ client, err := nntppool.NewClient(ctx, providers,
 
 ### Streaming body to a writer
 
-Use `BodyStream` to decode directly into any `io.Writer` (file, buffer, pipe) without holding the entire article in memory. Ideal for large multi-gigabyte NZB segments.
+Set `Req.Writer` to decode directly into any `io.Writer` (file, buffer, pipe) without holding the entire article in memory. Ideal for large multi-gigabyte NZB segments.
 
 ```go
 f, err := os.Create("output.bin")
@@ -203,7 +206,10 @@ if err != nil {
 }
 defer f.Close()
 
-body, err := client.BodyStream(ctx, "message-id@example.com", f)
+body, err := client.Fetch(ctx, nntppool.Req{
+    MessageID: "message-id@example.com",
+    Writer:    f,
+})
 if err != nil {
     log.Fatal(err)
 }
@@ -221,17 +227,19 @@ You can also react to yEnc metadata before decoding begins (for example to open 
 ```go
 var outputFile *os.File
 
-body, err := client.BodyStream(ctx, "message-id@example.com", io.Discard,
-    func(meta nntppool.YEncMeta) {
+body, err := client.Fetch(ctx, nntppool.Req{
+    MessageID: "message-id@example.com",
+    Writer:    io.Discard,
+    OnMeta: func(meta nntppool.YEncMeta) {
         // Called once =ybegin/=ypart is parsed, before any body bytes arrive
         outputFile, _ = os.Create(meta.FileName)
     },
-)
+})
 ```
 
 ### Async body retrieval
 
-`BodyAsync` returns a channel immediately so you can fan out multiple segment downloads and collect results concurrently:
+`FetchAsync` returns a channel immediately so you can fan out multiple segment downloads and collect results concurrently. Omit `Req.Writer` to have each payload buffered into its own `Body.Bytes`:
 
 ```go
 type result struct {
@@ -245,8 +253,7 @@ messageIDs := []string{"seg1@example.com", "seg2@example.com", "seg3@example.com
 // Dispatch all requests concurrently
 channels := make([]<-chan nntppool.BodyResult, len(messageIDs))
 for i, id := range messageIDs {
-    var buf bytes.Buffer
-    channels[i] = client.BodyAsync(ctx, id, &buf)
+    channels[i] = client.FetchAsync(ctx, nntppool.Req{MessageID: id})
 }
 
 // Collect results
@@ -262,18 +269,20 @@ for i, ch := range channels {
 
 ### Priority requests
 
-`BodyPriority` and `SendPriority` enqueue on a separate priority channel. Idle connections prefer priority requests over normal ones, reducing latency for time-sensitive fetches.
+`Lane: LanePriority` enqueues on a separate priority channel. Idle connections prefer priority requests over normal ones, reducing latency for time-sensitive fetches.
 
 ```go
 // Fetch the most important segment first
-body, err := client.BodyPriority(ctx, "critical-segment@example.com")
+body, err := client.Fetch(ctx, nntppool.Req{
+    MessageID: "critical-segment@example.com",
+    Lane:      nntppool.LanePriority,
+})
 ```
 
 ### Background requests
 
-`BodyBackground`, `StatBackground`, `SendBackground` and `StatMany` with
-`StatManyOptions.Background` enqueue on a third, lowest lane for work nobody is
-waiting on — a PAR2 repair reading a whole release, or the census that prices it.
+`Lane: LaneBackground` — on a `Req`, a `SendReq`, or `ManyOptions` — enqueues on
+a third, lowest lane for work nobody is waiting on — a PAR2 repair reading a whole release, or the census that prices it.
 Every connection reads the lanes in strict order: priority, normal, background.
 When a provider is idle, background work may use every connection. While
 priority or normal traffic is recent (within a few seconds), background is held
@@ -283,13 +292,16 @@ connections busy with background bodies.
 
 ```go
 // Read a whole release without delaying playback or imports
-body, err := client.BodyBackground(ctx, "segment-0042@example.com")
+body, err := client.Fetch(ctx, nntppool.Req{
+    MessageID: "segment-0042@example.com",
+    Lane:      nntppool.LaneBackground,
+})
 ```
 
 ### Check article existence
 
 ```go
-stat, err := client.Stat(ctx, "message-id@example.com")
+stat, err := client.Exists(ctx, nntppool.Req{MessageID: "message-id@example.com"})
 if errors.Is(err, nntppool.ErrArticleNotFound) {
     fmt.Println("article not found on any provider")
 } else if err != nil {
@@ -299,15 +311,16 @@ if errors.Is(err, nntppool.ErrArticleNotFound) {
 }
 ```
 
-`StatPriority` is the same check dispatched via the priority queue (prefers idle
-connections, so a one-off check doesn't queue behind a large BODY). `StatAsync`
-returns a channel for a single non-blocking check.
+`Req.Lane` applies here too: `LanePriority` prefers idle connections, so a
+one-off check doesn't queue behind a large BODY. `ExistsAsync` returns a channel
+for a single non-blocking check. `Req.Writer` and `Req.OnMeta` are ignored —
+`Exists` transfers no payload.
 
 ### Bulk existence checks (NZB health checks)
 
 `STAT` is a single-line request with a single-line reply and **no body**, so it is
 purely round-trip-latency bound — the ideal command to run massively in parallel.
-`StatMany` checks a slice of message-IDs concurrently, streaming a result per ID as
+`ExistsMany` checks a slice of message-IDs concurrently, streaming a result per ID as
 each completes (out of order), and closes the channel when done. A genuine miss is
 reported as `ErrArticleNotFound` with a nil `Result` — a normal outcome of a sweep,
 not a fatal error:
@@ -315,7 +328,7 @@ not a fatal error:
 ```go
 ids := nzb.SegmentMessageIDs() // e.g. thousands of segments
 var have, missing int
-for r := range client.StatMany(ctx, ids, nntppool.StatManyOptions{Concurrency: 64}) {
+for r := range client.ExistsMany(ctx, ids, nntppool.ManyOptions{Concurrency: 64}) {
     switch {
     case r.Err == nil:
         have++
@@ -328,7 +341,7 @@ for r := range client.StatMany(ctx, ids, nntppool.StatManyOptions{Concurrency: 6
 fmt.Printf("availability: %d/%d present\n", have, have+missing)
 ```
 
-`StatManyOptions`:
+`ManyOptions`:
 
 | Field | Description |
 |-------|-------------|
@@ -344,7 +357,7 @@ IDs not yet dispatched produce no result, so check `ctx.Err()` after draining.
 
 Two levers, both usenet-informed:
 
-- **Fan-out across connections** — handled for you: `StatMany` spreads checks over
+- **Fan-out across connections** — handled for you: `ExistsMany` spreads checks over
   every connection via the pool's weighted round-robin. More `Connections` ⇒ more
   parallel checks.
 - **Pipeline depth per connection** — set `Provider.StatInflight` higher than
@@ -601,7 +614,7 @@ if result.Err != nil {
 Each provider is represented by a `providerGroup`, which owns:
 
 - `reqCh` — buffered channel (capacity = `Connections`) for normal requests
-- `prioCh` — buffered channel (capacity = `Connections`) for priority requests (`SendPriority`)
+- `prioCh` — buffered channel (capacity = `Connections`) for priority requests (`Lane: LanePriority`)
 - `bgCh` — buffered channel (capacity = `Connections`) for background requests (`SendBackground`); read only when `prioCh` and `reqCh` are empty, and capped at `BackgroundFloor` in flight while foreground traffic is recent
 - `hotReqCh` / `hotPrioCh` — unbuffered channels; only already-connected (hot) connections listen here
 
@@ -749,21 +762,27 @@ Provider names default to `host:port` or `host:port+username` (when auth is set)
 
 ### Reading articles
 
+Four methods cover every read. What varies between requests — which lane, buffered or streamed, with or without a metadata callback — are fields on `Req`, not separate methods:
+
+```go
+type Req struct {
+    MessageID string          // required, no angle brackets
+    Lane      Lane            // LaneNormal (default) | LanePriority | LaneBackground
+    Writer    io.Writer       // nil = buffer into ArticleBody.Bytes
+    OnMeta    func(YEncMeta)  // called once =ybegin/=ypart is parsed
+}
+```
+
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `Body` | `(ctx, messageID, onMeta...) (*ArticleBody, error)` | Fetch and decode body, buffer entire result in memory |
-| `BodyStream` | `(ctx, messageID, w, onMeta...) (*ArticleBody, error)` | Decode and stream to `io.Writer`; `body.Bytes` is nil |
-| `BodyAsync` | `(ctx, messageID, w, onMeta...) <-chan BodyResult` | Non-blocking fan-out; returns channel receiving exactly one `BodyResult` |
-| `BodyPriority` | `(ctx, messageID, onMeta...) (*ArticleBody, error)` | Like `Body` but dispatched via the priority queue |
-| `BodyBackground` | `(ctx, messageID, onMeta...) (*ArticleBody, error)` | Like `Body` but dispatched via the background lane |
+| `Fetch` | `(ctx, Req) (*ArticleBody, error)` | Fetch and decode a body. Buffered into `body.Bytes`, or streamed to `Req.Writer` (then `body.Bytes` is nil) |
+| `FetchAsync` | `(ctx, Req) <-chan BodyResult` | `Fetch` on its own goroutine; the channel receives exactly one `BodyResult` and closes |
+| `Exists` | `(ctx, Req) (*StatResult, error)` | Check article existence without transferring the body. `Req.Writer`/`OnMeta` ignored |
+| `ExistsAsync` | `(ctx, Req) <-chan ExistsResult` | Non-blocking single existence check; channel receives exactly one result |
+| `ExistsMany` | `(ctx, messageIDs, ManyOptions) <-chan ExistsResult` | Concurrent bulk existence check; streams one result per ID as it completes |
 | `Head` | `(ctx, messageID) (*ArticleHead, error)` | Fetch RFC 5322 headers; returns parsed `map[string][]string` with folding resolved |
-| `Stat` | `(ctx, messageID) (*StatResult, error)` | Check article existence without transferring body |
-| `StatPriority` | `(ctx, messageID) (*StatResult, error)` | Like `Stat` but dispatched via the priority queue |
-| `StatBackground` | `(ctx, messageID) (*StatResult, error)` | Like `Stat` but dispatched via the background lane |
-| `StatAsync` | `(ctx, messageID) <-chan StatManyResult` | Non-blocking single existence check; channel receives exactly one result |
-| `StatMany` | `(ctx, messageIDs, StatManyOptions) <-chan StatManyResult` | Concurrent bulk existence check; streams one result per ID as it completes |
 
-The `onMeta` optional callback is called once `=ybegin`/`=ypart` is fully parsed (before any body bytes), enabling pre-allocation or filename routing.
+`Req.OnMeta` is called once `=ybegin`/`=ypart` is fully parsed (before any body bytes), enabling pre-allocation or filename routing. A `Req` with an empty `MessageID` returns `ErrNoMessageID` without touching the pool.
 
 ### Posting articles
 
@@ -777,12 +796,17 @@ yEnc-encodes `body` on the fly and posts using the two-phase NNTP POST protocol.
 ### Low-level send
 
 ```go
-func (c *Client) Send(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
-func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
-func (c *Client) SendBackground(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response
+func (c *Client) Send(ctx context.Context, r SendReq) <-chan Response
+
+type SendReq struct {
+    Payload []byte          // complete CRLF-terminated command line
+    Lane    Lane            // LaneNormal (default) | LanePriority | LaneBackground
+    Writer  io.Writer       // nil = buffer decoded bytes into Response.Body
+    OnMeta  func(YEncMeta)
+}
 ```
 
-All three return immediately with a buffered channel (capacity 1). The caller receives exactly one `Response`. Use `bodyWriter = nil` to buffer decoded bytes in `Response.Body`; use `io.Discard` to throw them away; use any `io.Writer` to stream them.
+`Send` is the seam `Fetch` and `Exists` are built on, for commands this package models no higher (GROUP, XOVER, a server-specific extension). It returns immediately with a buffered channel (capacity 1); the caller receives exactly one `Response`. Use `Writer = nil` to buffer decoded bytes in `Response.Body`, `io.Discard` to throw them away, or any `io.Writer` to stream them. Failover, the 430 STAT probe, and attempt-window escalation all apply, exactly as for `Fetch`.
 
 ### Provider management
 
@@ -815,10 +839,10 @@ Dials a temporary connection, authenticates, sends DATE, and returns RTT + serve
 ### Key types
 
 ```go
-// ArticleBody is the result of Body/BodyStream/BodyAsync.
+// ArticleBody is the result of Fetch/FetchAsync.
 type ArticleBody struct {
     MessageID     string
-    Bytes         []byte          // nil when BodyStream was used
+    Bytes         []byte          // nil when Req.Writer was set
     BytesDecoded  int             // decoded payload bytes
     BytesConsumed int             // wire bytes consumed (pre-decode)
     Encoding      ArticleEncoding // EncodingYEnc | EncodingUU | EncodingUnknown

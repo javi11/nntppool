@@ -18,7 +18,7 @@ func TestTryNextRequest_BackgroundAfterNormal(t *testing.T) {
 		req := make(chan *Request, 1)
 		bg := make(chan *Request, 1)
 		normReq := &Request{Payload: []byte("BODY <norm>\r\n")}
-		bg <- &Request{Payload: []byte("BODY <bg>\r\n"), lane: laneBackground}
+		bg <- &Request{Payload: []byte("BODY <bg>\r\n"), lane: LaneBackground}
 		req <- normReq
 
 		c := newBgLaneTestConn(nil, req, bg)
@@ -34,7 +34,7 @@ func TestTryNextRequest_BackgroundAfterNormal(t *testing.T) {
 
 func TestTryNextRequest_BackgroundServedWhenAlone(t *testing.T) {
 	bg := make(chan *Request, 1)
-	bgReq := &Request{Payload: []byte("BODY <bg>\r\n"), lane: laneBackground}
+	bgReq := &Request{Payload: []byte("BODY <bg>\r\n"), lane: LaneBackground}
 	bg <- bgReq
 
 	c := newBgLaneTestConn(nil, nil, bg)
@@ -130,12 +130,12 @@ func newBgTestClient(t *testing.T) (*Client, *providerGroup) {
 	return c, (*c.mainGroups.Load())[0]
 }
 
-func TestClient_BodyBackgroundRoundTrip(t *testing.T) {
+func TestClient_FetchBackgroundRoundTrip(t *testing.T) {
 	c, g := newBgTestClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	body, err := c.BodyBackground(ctx, "bg@h")
+	body, err := c.Fetch(ctx, Req{MessageID: "bg@h", Lane: LaneBackground})
 	if err != nil {
 		t.Fatalf("BodyBackground: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestClient_BodyBackgroundRoundTrip(t *testing.T) {
 		t.Fatal("a background body must not stamp lastForeground")
 	}
 
-	if _, err := c.Body(ctx, "fg@h"); err != nil {
+	if _, err := c.Fetch(ctx, Req{MessageID: "fg@h"}); err != nil {
 		t.Fatalf("Body: %v", err)
 	}
 	if g.stats.lastForeground.Load() == 0 {
@@ -160,16 +160,16 @@ func TestClient_BodyBackgroundRoundTrip(t *testing.T) {
 	}
 }
 
-func TestClient_StatBackgroundAndStatManyBackground(t *testing.T) {
+func TestClient_ExistsAndExistsManyOnBackgroundLane(t *testing.T) {
 	c, g := newBgTestClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := c.StatBackground(ctx, "one@h"); err != nil {
+	if _, err := c.Exists(ctx, Req{MessageID: "one@h", Lane: LaneBackground}); err != nil {
 		t.Fatalf("StatBackground: %v", err)
 	}
 	n := 0
-	for r := range c.StatMany(ctx, []string{"a@h", "b@h", "c@h"}, StatManyOptions{Background: true}) {
+	for r := range c.ExistsMany(ctx, []string{"a@h", "b@h", "c@h"}, ManyOptions{Lane: LaneBackground}) {
 		if r.Err != nil {
 			t.Fatalf("StatMany background: %v", r.Err)
 		}
@@ -202,13 +202,13 @@ func TestBackgroundDispatchUsesBackgroundChannel(t *testing.T) {
 	cl := &Client{ctx: context.Background()}
 
 	go func() {
-		_, _, _ = cl.tryGroupTimeout(ctx, g, []byte("BODY <bg@h>\r\n"), nil, nil, laneBackground, 500*time.Millisecond)
+		_, _, _ = cl.tryGroupTimeout(ctx, g, []byte("BODY <bg@h>\r\n"), nil, nil, LaneBackground, 500*time.Millisecond)
 	}()
 
 	select {
 	case req := <-g.bgCh:
-		if req.lane != laneBackground {
-			t.Fatalf("request lane = %v, want laneBackground", req.lane)
+		if req.lane != LaneBackground {
+			t.Fatalf("request lane = %v, want LaneBackground", req.lane)
 		}
 		req.RespCh <- Response{}
 	case <-g.hotIdleBodyCh:
@@ -257,7 +257,7 @@ func TestBackgroundDispatchWaitsPastAttemptWindow(t *testing.T) {
 		req.RespCh <- Response{StatusCode: 223}
 	}()
 
-	resp, ok, done := cl.tryGroupTimeout(ctx, g, []byte("STAT <bg@h>\r\n"), nil, nil, laneBackground, 100*time.Millisecond)
+	resp, ok, done := cl.tryGroupTimeout(ctx, g, []byte("STAT <bg@h>\r\n"), nil, nil, LaneBackground, 100*time.Millisecond)
 	if done || !ok || resp.Err != nil {
 		t.Fatalf("resp.Err=%v ok=%v done=%v: background dispatch must wait, not expire", resp.Err, ok, done)
 	}
@@ -318,14 +318,14 @@ func TestBackgroundLaneRearmsAfterInflightDrops(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := c.Body(ctx, "fg@h"); err != nil { // stamps recent foreground: gate closes at the floor
+	if _, err := c.Fetch(ctx, Req{MessageID: "fg@h"}); err != nil { // stamps recent foreground: gate closes at the floor
 		t.Fatal(err)
 	}
 
 	errs := make(chan error, 3)
 	for i := range 3 {
 		go func() {
-			_, err := c.BodyBackground(ctx, fmt.Sprintf("bg%d@h", i))
+			_, err := c.Fetch(ctx, Req{MessageID: fmt.Sprintf("bg%d@h", i), Lane: LaneBackground})
 			errs <- err
 		}()
 	}
@@ -371,7 +371,7 @@ func TestForegroundLanesClosedWhileBackgroundPending(t *testing.T) {
 	prio := make(chan *Request, 1)
 	req := make(chan *Request, 1)
 	bg := make(chan *Request, 1)
-	prio <- &Request{Payload: []byte("BODY <p>\r\n"), lane: lanePriority}
+	prio <- &Request{Payload: []byte("BODY <p>\r\n"), lane: LanePriority}
 	req <- &Request{Payload: []byte("BODY <n>\r\n")}
 
 	c := &NNTPConnection{prioCh: prio, reqCh: req, bgCh: bg, inflightSem: make(chan struct{}, 4), bodySem: make(chan struct{}, 2)}
@@ -381,7 +381,7 @@ func TestForegroundLanesClosedWhileBackgroundPending(t *testing.T) {
 	if _, _, got := c.tryNextRequest(); got {
 		t.Fatal("foreground request served by a connection with background pending")
 	}
-	bgReq := &Request{Payload: []byte("STAT <b>\r\n"), lane: laneBackground}
+	bgReq := &Request{Payload: []byte("STAT <b>\r\n"), lane: LaneBackground}
 	bg <- bgReq
 	c.inflightSem <- struct{}{} // pending background reply: pipeline not idle, but more background may pipeline behind it
 	if r, _, got := c.tryNextRequest(); !got || r != bgReq {
@@ -390,7 +390,7 @@ func TestForegroundLanesClosedWhileBackgroundPending(t *testing.T) {
 
 	c.bgPending.Store(0)
 	<-c.inflightSem
-	if r, _, got := c.tryNextRequest(); !got || r.lane != lanePriority {
+	if r, _, got := c.tryNextRequest(); !got || r.lane != LanePriority {
 		t.Fatal("with no background pending the priority request must be served")
 	}
 }
@@ -432,7 +432,7 @@ func TestPriorityBodyAvoidsBackgroundBusyConnection(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	for _, id := range []string{"warm0@h", "warm1@h", "warm2@h", "warm3@h"} {
-		if _, err := c.Body(ctx, id); err != nil {
+		if _, err := c.Fetch(ctx, Req{MessageID: id}); err != nil {
 			t.Fatalf("warm-up body %q: %v", id, err)
 		}
 	}
@@ -440,7 +440,7 @@ func TestPriorityBodyAvoidsBackgroundBusyConnection(t *testing.T) {
 	slowDone := make(chan struct{})
 	go func() {
 		defer close(slowDone)
-		_, _ = c.BodyBackground(ctx, "slowbg@h")
+		_, _ = c.Fetch(ctx, Req{MessageID: "slowbg@h", Lane: LaneBackground})
 	}()
 	select {
 	case <-srv.started:
@@ -450,7 +450,7 @@ func TestPriorityBodyAvoidsBackgroundBusyConnection(t *testing.T) {
 
 	for i := range 6 {
 		id := fmt.Sprintf("fast%d@h", i)
-		if _, err := c.BodyPriority(ctx, id); err != nil {
+		if _, err := c.Fetch(ctx, Req{MessageID: id, Lane: LanePriority}); err != nil {
 			t.Fatalf("priority body: %v", err)
 		}
 		srv.mu.Lock()
