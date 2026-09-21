@@ -15,6 +15,7 @@ A high-performance NNTP connection pool library for Go. It manages multiple NNTP
   - [Async body retrieval](#async-body-retrieval)
   - [Priority requests](#priority-requests)
   - [Background requests](#background-requests)
+  - [Per-provider retention](#per-provider-retention)
   - [Check article existence](#check-article-existence)
   - [Fetch article headers](#fetch-article-headers)
   - [Post an article](#post-an-article)
@@ -297,6 +298,48 @@ body, err := client.Fetch(ctx, nntppool.Req{
     Lane:      nntppool.LaneBackground,
 })
 ```
+
+### Per-provider retention
+
+Providers differ in how far back they reach. A cheap provider with a short
+retention window can serve recent articles perfectly well, and every request it
+absorbs is a connection and a byte of quota the deep-retention provider does not
+spend. `MaxArticleAge` tells the pool how far back a provider reaches, and
+`Req.ArticleDate` tells it how old the article is:
+
+```go
+providers := []nntppool.Provider{
+    {Host: "deep.example.com:563", Connections: 20},                              // unlimited retention
+    {Host: "cheap.example.com:563", Connections: 10,
+     MaxArticleAge: 100 * 24 * time.Hour},                                        // ~100 days
+}
+
+body, err := client.Fetch(ctx, nntppool.Req{
+    MessageID:   "segment@example.com",
+    ArticleDate: nzbFile.PostedAt, // from the NZB, or your own metadata
+})
+```
+
+For an article inside `cheap`'s window, both providers are eligible and `cheap`'s
+dispatch weight is doubled — so despite having half the connections it absorbs a
+comparable share, leaving `deep`'s capacity for articles only `deep` can serve.
+For an article older than 100 days, `cheap` drops behind every in-range provider
+and is tried only if they all miss. Set `StrictMaxAge: true` to make it not be
+tried at all.
+
+Two properties are worth relying on:
+
+- **A zero `ArticleDate` applies no policy.** Not knowing an article's age is not
+  the same as knowing it is old, so a request without a date reaches every
+  provider exactly as it did before the field existed. Metadata that predates
+  having a post date needs no migration.
+- **A misconfigured age cannot make an article unreachable.** `StrictMaxAge` is
+  ignored for any request where honouring it on every provider would leave
+  nowhere to send it, and a non-strict limit only ever reorders.
+
+`ManyOptions.ArticleDate` does the same for a bulk sweep — one release is one
+date — so a health census does not hammer a short-retention provider with ids it
+cannot possibly hold.
 
 ### Check article existence
 
@@ -924,6 +967,8 @@ type ProviderStats struct {
 | `KeepaliveInterval` | `time.Duration` | 0 (disabled) | Application-level probe interval; 0 or when `SkipPing && KeepaliveCommand == ""` disables |
 | `KeepaliveCommand` | `string` | `"DATE"` | NNTP command for application-level probe: `"DATE"` (111), `"HELP"` (100), `"CAPABILITIES"` (101) |
 | `UserAgent` | `string` | `""` | Sent as `X-User-Agent` or equivalent; empty disables |
+| `MaxArticleAge` | `time.Duration` | 0 (unlimited) | How far back this provider's retention reaches; see [Per-provider retention](#per-provider-retention) |
+| `StrictMaxAge` | `bool` | false | Make `MaxArticleAge` binding (never contacted for older articles) rather than an ordering preference |
 | `QuotaBytes` | `int64` | 0 (unlimited) | Maximum bytes per `QuotaPeriod`; 0 = unlimited |
 | `QuotaPeriod` | `time.Duration` | 0 (no reset) | Rolling window for quota reset; 0 = lifetime cap |
 | `QuotaUsed` | `int64` | 0 | Bytes already consumed at startup (for state restoration) |

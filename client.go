@@ -92,6 +92,18 @@ type Req struct {
 	//
 	// Ignored by Exists, which transfers no payload.
 	OnMeta func(YEncMeta)
+
+	// ArticleDate is when the article was posted. It selects providers against
+	// their Provider.MaxArticleAge: a provider whose retention does not reach
+	// back this far is tried only after those that do, or not at all when it
+	// set StrictMaxAge.
+	//
+	// The zero value means the date is unknown, which is not the same as
+	// knowing the article is old: no retention policy is applied and every
+	// provider is eligible, exactly as before the field existed. A caller
+	// whose metadata predates having a post date should leave it zero rather
+	// than guess.
+	ArticleDate time.Time
 }
 
 // ErrNoMessageID is returned by Fetch, FetchAsync, and Exists when Req omits
@@ -112,7 +124,7 @@ func (c *Client) Fetch(ctx context.Context, r Req) (*ArticleBody, error) {
 	if r.MessageID == "" {
 		return nil, ErrNoMessageID
 	}
-	body, err := c.finishBody(r.MessageID, r.Writer, c.send(ctx, bodyPayload(r.MessageID), r.Writer, r.OnMeta, r.Lane))
+	body, err := c.finishBody(r.MessageID, r.Writer, c.send(ctx, SendReq{Payload: bodyPayload(r.MessageID), Lane: r.Lane, Writer: r.Writer, OnMeta: r.OnMeta, ArticleDate: r.ArticleDate}))
 	if body != nil && r.Writer == nil {
 		body.Bytes = body.byteBuf
 		body.byteBuf = nil
@@ -145,7 +157,7 @@ func (c *Client) Exists(ctx context.Context, r Req) (*StatResult, error) {
 	if r.MessageID == "" {
 		return nil, ErrNoMessageID
 	}
-	return parseStat(r.MessageID, c.sendSync(ctx, statPayload(r.MessageID), r.Lane))
+	return parseStat(r.MessageID, c.sendSync(ctx, SendReq{Payload: statPayload(r.MessageID), Lane: r.Lane, ArticleDate: r.ArticleDate}))
 }
 
 // ExistsAsync is Exists on its own goroutine, mirroring FetchAsync. For a
@@ -166,7 +178,7 @@ func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, erro
 	if messageID == "" {
 		return nil, ErrNoMessageID
 	}
-	respCh := c.send(ctx, []byte("HEAD <"+messageID+">\r\n"), nil, nil, LaneNormal)
+	respCh := c.send(ctx, SendReq{Payload: []byte("HEAD <" + messageID + ">\r\n")})
 
 	resp := <-respCh
 	if resp.Err != nil {
@@ -399,7 +411,7 @@ func (c *Client) doSendPost(ctx context.Context, payloadBody io.Reader, target *
 		}
 	default: // DispatchRoundRobin
 		// Sized to len(mains), unlike a fixed-size array — never overflows.
-		cumWeights, totalW := dispatchWeights(mains, c.speedAware)
+		cumWeights, totalW := dispatchWeights(mains, c.speedAware, time.Time{}, time.Time{})
 		if totalW == 0 {
 			start = 0 // all providers quota-exceeded; let the loop below fail each
 		} else {

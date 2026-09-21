@@ -2093,6 +2093,30 @@ type Provider struct {
 	// UserAgent identifies this client to the NNTP server. Empty string disables it.
 	UserAgent string
 
+	// MaxArticleAge is how far back this provider's retention reaches. An
+	// article older than this is served by it only after every provider that
+	// does reach back that far has been tried, so a short-retention provider
+	// absorbs recent traffic and leaves the deep-retention providers'
+	// connections and quota for the articles that have nowhere else to go.
+	// 0, the default, declares no limit.
+	//
+	// It applies only to requests that say when the article was posted (Req,
+	// SendReq, or ManyOptions ArticleDate). A request that does not is treated
+	// as in range everywhere: not knowing an article's age is not the same as
+	// knowing it is old.
+	MaxArticleAge time.Duration
+
+	// StrictMaxAge makes MaxArticleAge binding rather than an ordering
+	// preference: this provider is not contacted at all for an article older
+	// than its retention. Use it for a metered or quota-limited provider whose
+	// capacity should not be spent on a request that will almost certainly
+	// come back 430.
+	//
+	// The flag is ignored for a request where honouring it on every provider
+	// would leave nowhere to send it — a misconfigured age must not be able to
+	// make an article unreachable.
+	StrictMaxAge bool
+
 	// QuotaBytes is the maximum number of bytes that may be downloaded from this
 	// provider per QuotaPeriod. 0 means unlimited.
 	QuotaBytes int64
@@ -2648,24 +2672,37 @@ type SendReq struct {
 
 	// OnMeta, when non-nil, is called with yEnc metadata before body decoding.
 	OnMeta func(YEncMeta)
+
+	// ArticleDate is when the article was posted. It selects providers against
+	// their Provider.MaxArticleAge: a provider whose retention does not reach
+	// back this far is tried only after those that do, or not at all when it
+	// set StrictMaxAge.
+	//
+	// The zero value means the date is unknown, which is not the same as
+	// knowing the article is old: no retention policy is applied and every
+	// provider is eligible, exactly as before the field existed. A caller
+	// whose metadata predates having a post date should leave it zero rather
+	// than guess.
+	ArticleDate time.Time
 }
 
 // Send dispatches a raw request and returns a channel that receives exactly
 // one Response and is then closed. Provider failover, the 430 STAT probe, and
 // attempt-window escalation all apply, exactly as for Fetch.
 func (c *Client) Send(ctx context.Context, r SendReq) <-chan Response {
-	return c.send(ctx, r.Payload, r.Writer, r.OnMeta, r.Lane)
+	return c.send(ctx, r)
 }
 
 // send is the internal entry point every request in this package funnels
-// through, so lane selection has one definition rather than one per verb.
-func (c *Client) send(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), ln Lane) <-chan Response {
+// through, so lane selection and retention filtering have one definition
+// rather than one per verb.
+func (c *Client) send(ctx context.Context, r SendReq) <-chan Response {
 	respCh := make(chan Response, 1)
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	go c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, ln)
+	go c.doSendWithRetry(ctx, r, respCh)
 	return respCh
 }
 
@@ -2676,12 +2713,12 @@ func (c *Client) send(ctx context.Context, payload []byte, bodyWriter io.Writer,
 // what a caller that wants to get on with something else meanwhile needs. A
 // caller that blocks on the reply immediately does not: the goroutine is pure
 // overhead, and on a sweep that is one goroutine per message-id.
-func (c *Client) sendSync(ctx context.Context, payload []byte, ln Lane) Response {
+func (c *Client) sendSync(ctx context.Context, r SendReq) Response {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	respCh := make(chan Response, 1)
-	c.doSendWithRetry(ctx, payload, nil, nil, respCh, ln)
+	c.doSendWithRetry(ctx, r, respCh)
 	return <-respCh
 }
 
@@ -3098,7 +3135,13 @@ const maxSpeedScore = 4
 // true the base weight is scaled by speedScore so faster providers receive
 // proportionally more traffic. With no throughput samples this reduces to pure
 // capacity weighting (the historical behavior).
-func dispatchWeights(mains []*providerGroup, speedAware bool) (cum []int, total int) {
+// dispatchWeights prices each candidate for weighted round-robin: available
+// connections, scaled by the provider's speed score when speed-aware dispatch
+// is on, and by retentionBiasFactor when the provider declares a retention
+// limit this article falls inside. date is zero when the caller does not know
+// the article's age, which prices every provider as it would have before
+// retention existed.
+func dispatchWeights(mains []*providerGroup, speedAware bool, date, now time.Time) (cum []int, total int) {
 	cum = make([]int, len(mains))
 	var maxSpeed float64
 	if speedAware {
@@ -3114,6 +3157,9 @@ func dispatchWeights(mains []*providerGroup, speedAware bool) (cum []int, total 
 			w = max(1, int(g.gate.available.Load()))
 			if speedAware && maxSpeed > 0 {
 				w *= speedScore(speedEWMABytesPerSec(&g.stats), maxSpeed)
+			}
+			if !date.IsZero() && g.p.MaxArticleAge > 0 && g.classify(date, now) == retentionInRange {
+				w *= retentionBiasFactor
 			}
 		}
 		total += w
@@ -3137,10 +3183,6 @@ func speedScore(speed, maxSpeed float64) int {
 		return maxSpeedScore
 	}
 	return s
-}
-
-func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
-	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, LaneNormal)
 }
 
 // tryGroupResilient retries a single provider on a fresh connection when a
@@ -3254,8 +3296,10 @@ func expiredAwaitingResponse(resp Response, ok bool) bool {
 	return isTimeoutErr(resp.Err)
 }
 
-func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, ln Lane) {
+func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Response) {
 	defer close(respCh)
+
+	payload, bodyWriter, onMeta, ln := r.Payload, r.Writer, r.OnMeta, r.Lane
 
 	// Precompute for STAT probe: extract message-ID once.
 	msgID := extractProbeMsgID(payload)
@@ -3278,19 +3322,49 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 
 	// 1. Try all main providers.
 	mains := *c.mainGroups.Load()
-	n := len(mains)
-	if n == 0 {
+	if len(mains) == 0 {
 		respCh <- Response{Err: errors.New("nntp: no main providers")}
 		return
 	}
 
-	// Pick start index based on dispatch strategy.
+	// order is the sequence of indices into mains this request attempts, and
+	// choosable how many of its leading entries dispatch may open with.
+	// Retention reorders it: in-range providers first, then over-age ones as a
+	// fallback tier, with strictly-excluded ones absent. A request that
+	// carries no article date, or a pool where no provider declares a limit,
+	// keeps the natural order and pays only the nil check.
+	var order []int
+	var retNow time.Time // the single clock read retention classification shares
+	choosable := len(mains)
+	if !r.ArticleDate.IsZero() {
+		retNow = time.Now()
+		if order = retentionOrder(mains, r.ArticleDate, retNow); order != nil {
+			choosable = inRangeCount(mains, order, r.ArticleDate, retNow)
+			if choosable == 0 {
+				// Every remaining provider is over-age. They are still tried,
+				// in declared order, so dispatch opens with the first.
+				choosable = len(order)
+			}
+		}
+	}
+	candidates := mains
+	if order != nil {
+		candidates = make([]*providerGroup, len(order))
+		for i, idx := range order {
+			candidates[i] = mains[idx]
+		}
+	}
+	n := len(candidates)
+
+	// Pick start index based on dispatch strategy. It indexes candidates, and
+	// never lands past choosable: the over-age tier is a fallback, not
+	// something to open a request with.
 	var start int
 	switch c.dispatch {
 	case DispatchFIFO:
 		// Priority order: first provider with available capacity and within quota,
 		// falling back to provider 0 if all are saturated or exceeded.
-		for i, g := range mains {
+		for i, g := range candidates[:choosable] {
 			if g.gate.available.Load() > 0 && !g.isQuotaExceeded() {
 				start = i
 				break
@@ -3299,7 +3373,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	default: // DispatchRoundRobin
 		// Dynamic weighted round-robin. Quota-exceeded providers get weight 0
 		// so they are never selected during normal dispatch.
-		cumWeights, totalW := dispatchWeights(mains, c.speedAware)
+		cumWeights, totalW := dispatchWeights(candidates[:choosable], c.speedAware, r.ArticleDate, retNow)
 		if totalW == 0 {
 			// All providers are quota-exceeded; start at 0 and let the main
 			// loop below return ErrQuotaExceeded for each.
@@ -3334,7 +3408,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		sawOther := false
 		for attempt := range n {
 			idx := (start + attempt) % n
-			g := mains[idx]
+			g := candidates[idx]
 			var window time.Duration // 0 = the provider's base window
 			if escalated {
 				// Cheapest discriminator first: a provider that answered
@@ -3443,7 +3517,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 					// Build remaining mains and race them in parallel via STAT.
 					rest := make([]*providerGroup, 0, n-attempt-1)
 					for a := attempt + 1; a < n; a++ {
-						rest = append(rest, mains[(start+a)%n])
+						rest = append(rest, candidates[(start+a)%n])
 					}
 					delivered, cancelled, raceErr := c.raceCandidates(
 						ctx, rest, statPayload, payload, bodyWriter, onMeta,
@@ -3492,7 +3566,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 		now = time.Now()
 		grows := false
 		for i, w := range expiredWin {
-			if _, ok := mains[i].escalationWindow(w, budget, now); ok {
+			if _, ok := candidates[i].escalationWindow(w, budget, now); ok {
 				grows = true
 				break
 			}
@@ -3504,7 +3578,21 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 	}
 
 	// 2. All main providers returned 430 (or died) — try backup providers.
+	// Retention orders them the same way it ordered the mains: a backup whose
+	// retention does not reach this article goes last, or is absent when it
+	// set StrictMaxAge. Without this the feature would leak on failover — the
+	// short-retention provider skipped among the mains would be probed here
+	// anyway.
 	backups := *c.backupGroups.Load()
+	if !r.ArticleDate.IsZero() && len(backups) > 0 {
+		if border := retentionOrder(backups, r.ArticleDate, retNow); border != nil {
+			ordered := make([]*providerGroup, len(border))
+			for i, idx := range border {
+				ordered[i] = backups[idx]
+			}
+			backups = ordered
+		}
+	}
 	if raceable && post430 {
 		delivered, cancelled, raceErr := c.raceCandidates(
 			ctx, backups, statPayload, payload, bodyWriter, onMeta,

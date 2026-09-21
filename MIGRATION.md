@@ -83,6 +83,14 @@ Everything else — failover order, the 430 STAT probe, attempt-window escalatio
 lane preference, quota accounting, `Provider` configuration, `Stats`, `AddProvider`
 /`RemoveProvider` — is unchanged.
 
+## New in v5: per-provider retention
+
+`Provider.MaxArticleAge` and `Provider.StrictMaxAge`, together with
+`Req.ArticleDate` / `SendReq.ArticleDate` / `ManyOptions.ArticleDate`, let a
+short-retention provider absorb recent articles and stay out of the way for old
+ones. It is entirely opt-in: leave the fields unset and dispatch behaves exactly
+as v4 did. See [Per-provider retention](README.md#per-provider-retention).
+
 ## Mechanical migration
 
 Most call sites convert with a search and replace. A regex that covers the

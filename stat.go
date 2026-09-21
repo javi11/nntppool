@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // minStatConcurrency floors the derived in-flight STAT bound when
@@ -72,6 +73,11 @@ type ManyOptions struct {
 	// LaneNormal, the zero value, is the default; LaneBackground is the one a
 	// census nobody is waiting on wants.
 	Lane Lane
+
+	// ArticleDate is when the articles in this sweep were posted. One sweep is
+	// normally one release, so one date covers it. See Req.ArticleDate: the
+	// zero value applies no retention policy.
+	ArticleDate time.Time
 
 	// Provider, when set, restricts every STAT to the named provider group
 	// (per-provider availability audit — retention differs per provider). The
@@ -159,7 +165,7 @@ func (c *Client) ExistsMany(ctx context.Context, messageIDs []string, opts ManyO
 					if opts.Skip != nil && opts.Skip(messageIDs[i]) {
 						continue
 					}
-					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.Lane)
+					res := c.statOne(ctx, messageIDs[i], target, targetErr, opts.Lane, opts.ArticleDate)
 					select {
 					case out <- res:
 					case <-ctx.Done():
@@ -178,7 +184,7 @@ func (c *Client) ExistsMany(ctx context.Context, messageIDs []string, opts ManyO
 // statOne performs a single STAT and maps it to a ExistsResult. When target is
 // set the check is confined to that provider group; otherwise it uses the
 // pool-wide failover path.
-func (c *Client) statOne(ctx context.Context, messageID string, target *providerGroup, targetErr error, ln Lane) ExistsResult {
+func (c *Client) statOne(ctx context.Context, messageID string, target *providerGroup, targetErr error, ln Lane, at time.Time) ExistsResult {
 	if targetErr != nil {
 		return ExistsResult{MessageID: messageID, Err: targetErr}
 	}
@@ -189,7 +195,7 @@ func (c *Client) statOne(ctx context.Context, messageID string, target *provider
 	if target != nil {
 		resp = c.statViaGroup(ctx, target, payload, ln)
 	} else {
-		resp = c.sendSync(ctx, payload, ln)
+		resp = c.sendSync(ctx, SendReq{Payload: payload, Lane: ln, ArticleDate: at})
 	}
 
 	result, err := parseStat(messageID, resp)
