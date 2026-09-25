@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mnightingale/rapidyenc"
+	"github.com/javi11/rapidyenc"
 )
 
 // --- PostHeaders tests ---

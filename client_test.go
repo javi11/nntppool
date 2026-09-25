@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/mnightingale/rapidyenc"
+	"github.com/javi11/rapidyenc"
 )
 
 func TestMapFormat(t *testing.T) {
