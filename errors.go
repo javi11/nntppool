@@ -75,15 +75,22 @@ func errorCategory(code int) int {
 }
 
 var (
-	ErrArticleNotFound    = &Error{Code: 430, Message: "no such article"}
+	ErrArticleNotFound     = &Error{Code: 430, Message: "no such article"}
 	ErrPostingNotPermitted = &Error{Code: 440, Message: "posting not permitted"}
 	ErrPostingFailed       = &Error{Code: 441, Message: "posting failed"}
-	ErrAuthRequired       = &Error{Code: 480, Message: "authentication required"}
-	ErrAuthRejected       = &Error{Code: 481, Message: "authentication rejected"}
-	ErrServiceUnavailable = &Error{Code: 502, Message: "service unavailable"}
-	ErrCRCMismatch        = errors.New("nntp: yEnc CRC mismatch")
-	ErrProtocolDesync     = errors.New("nntp: protocol desync: expected status line, got binary data")
-	ErrQuotaExceeded      = errors.New("nntp: download quota exceeded")
+	ErrAuthRequired        = &Error{Code: 480, Message: "authentication required"}
+	ErrAuthRejected        = &Error{Code: 481, Message: "authentication rejected"}
+	ErrServiceUnavailable  = &Error{Code: 502, Message: "service unavailable"}
+	ErrCRCMismatch         = errors.New("nntp: yEnc CRC mismatch")
+	ErrProtocolDesync      = errors.New("nntp: protocol desync: expected status line, got binary data")
+	ErrQuotaExceeded       = errors.New("nntp: download quota exceeded")
+
+	// ErrArticleUnconfirmed is returned instead of a 430 when at least one
+	// provider that could hold the article never answered (its attempts
+	// expired or its connection died) while the others reported it missing.
+	// It deliberately does not match ErrArticleNotFound: the article may well
+	// exist, so callers should retry rather than treat it as gone.
+	ErrArticleUnconfirmed = errors.New("nntp: article not confirmed missing: a provider did not answer")
 )
 
 // toError maps an NNTP status code to a sentinel error, or returns nil for success codes.
