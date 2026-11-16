@@ -2750,29 +2750,86 @@ func extractProbeMsgID(payload []byte) []byte {
 	return payload[open : open+close+1]
 }
 
+// missSet records, for one request, the providers that answered it with a
+// definitive 430/423, and the storage identities (skipID) those answers speak
+// for. Unlike the fixed four-entry skip cache, which only saves redundant
+// attempts, it is uncapped: it decides whether a miss is confirmed, so it
+// must not forget an identity. A provider with an empty skip identity speaks
+// only for itself.
+type missSet struct {
+	providers map[*providerGroup]bool
+	storage   map[string]bool
+}
+
+func (m *missSet) add(g *providerGroup) {
+	if m.providers == nil {
+		m.providers = make(map[*providerGroup]bool, 4)
+	}
+	m.providers[g] = true
+	if g.skipID != "" {
+		if m.storage == nil {
+			m.storage = make(map[string]bool, 4)
+		}
+		m.storage[g.skipID] = true
+	}
+}
+
+// covers reports whether g, or a provider sharing its storage, said 430.
+func (m *missSet) covers(g *providerGroup) bool {
+	return m.providers[g] || (g.skipID != "" && m.storage[g.skipID])
+}
+
+// confirmWindow is the window confirmUnanswered re-asks a provider at (or the
+// provider's own window, when that is wider). A var rather than a const so
+// tests can shorten it; not exported, so callers cannot depend on tuning it.
+var confirmWindow = maxAttemptTimeout
+
+// stopErr returns why the request must stop: the caller's context, the pool
+// closing, or the caller's deadline having passed. The last one matters
+// because a connection read deadline taken from the caller's deadline can fire
+// before the context's own timer marks it done.
+func (c *Client) stopErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	if d, ok := ctx.Deadline(); ok && !time.Now().Before(d) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 // confirmUnanswered runs before a 430 becomes a request's answer. Every
 // provider in groups that never answered definitively — its attempt expired,
 // its connection died, or its STAT probe was dropped from a race — gets one
-// more attempt with the widest window (its base window when its escalation
-// breaker is open). Providers that said 430, share storage with one that did,
-// are over quota, or have left the pool are not asked again.
+// more attempt at confirmWindow (its base window when its escalation breaker
+// is open). Providers that said 430, share storage with one that did, are over
+// quota, or have left the pool are not asked again.
+//
+// The re-ask is an escalation and is booked like one: an expiry on a widened
+// window counts toward the provider's breaker, and a definitive answer resets
+// it, so a provider that stays silent stops costing the wide window on every
+// request.
 //
 // A 2xx (or any non-miss status) is delivered and delivered is true; a 430
-// joins said430. unknown counts providers still without an answer, in which
-// case the caller must not report the article missing.
+// joins miss. unresolved counts providers still without an answer from
+// themselves or from their shared storage, in which case the caller must not
+// report the article missing. stop is non-nil when the caller's context, its
+// deadline, or the pool ended the confirmation; it takes precedence over an
+// unconfirmed verdict.
 func (c *Client) confirmUnanswered(
 	ctx context.Context,
 	groups []*providerGroup,
-	said430 map[string]bool,
-	skipHosts *[4]string,
-	skipCount *int,
+	miss *missSet,
 	payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
 	ln Lane,
 	respCh chan<- Response,
 	lastErr *error,
-) (delivered, cancelled bool, unknown int) {
+) (delivered bool, unresolved int, stop error) {
 	live := make(map[*providerGroup]bool)
 	for _, gs := range []*[]*providerGroup{c.mainGroups.Load(), c.backupGroups.Load()} {
 		if gs == nil {
@@ -2784,55 +2841,76 @@ func (c *Client) confirmUnanswered(
 	}
 	now := time.Now()
 	seen := make(map[*providerGroup]bool, len(groups))
+	var pending []*providerGroup
 	for _, g := range groups {
-		if g == nil || seen[g] || said430[g.name] || !live[g] {
+		if g == nil || seen[g] || !live[g] {
 			continue
 		}
 		seen[g] = true
-		if hostSkipped(g.skipID, skipHosts, *skipCount) || g.isQuotaExceeded() {
+		if miss.covers(g) || g.isQuotaExceeded() {
 			continue
 		}
-		window := maxAttemptTimeout
+		base := g.attemptTimeout()
+		window := max(confirmWindow, base)
 		if g.escalationSuppressed(now) {
-			window = 0
+			window = base
 		}
 		resp, ok, done := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, ln.escalated(true), window)
 		if done {
-			return false, true, 0
+			return false, 0, c.stopErr(ctx)
 		}
 		if !ok {
+			// A caller deadline or a closing pool that cut the attempt says
+			// nothing about the provider, and outranks its verdict.
+			if err := c.stopErr(ctx); err != nil {
+				return false, 0, err
+			}
 			keepErr(lastErr, resp)
-			unknown++
+			if _, expired := responseExpiry(resp.Err); expired && window > base {
+				g.noteEscalationFruitless(time.Now())
+			}
+			pending = append(pending, g)
 			continue
 		}
+		g.resetEscalationBreaker()
 		if resp.Err != nil {
 			if bodyWriter != nil && attemptCommittedResp(resp) {
 				respCh <- resp
-				return true, false, 0
+				return true, 0, nil
 			}
 			*lastErr = resp.Err
-			unknown++
+			pending = append(pending, g)
 			continue
 		}
 		switch resp.StatusCode {
 		case 430, 423:
-			if g.skipID != "" && *skipCount < len(skipHosts) {
-				skipHosts[*skipCount] = g.skipID
-				*skipCount++
-			}
+			miss.add(g)
 		case 502:
 			_ = c.RemoveProvider(g.name)
 			if g.p.ReconnectDelay > 0 {
 				c.scheduleReconnect(g)
 			}
 			*lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
-			unknown++
+			pending = append(pending, g)
 		default:
 			respCh <- resp
-			return true, false, 0
+			return true, 0, nil
 		}
 	}
-	return false, false, unknown
+	// Settle after every answer is in: a provider that stayed silent is
+	// answered for by a later 430 from another provider on its storage, in
+	// whatever order the two were asked.
+	for _, g := range pending {
+		if !miss.covers(g) {
+			unresolved++
+		}
+	}
+	if unresolved > 0 {
+		if err := c.stopErr(ctx); err != nil {
+			return false, 0, err
+		}
+	}
+	return false, unresolved, nil
 }
 
 // probeResult carries the outcome of one parallel STAT probe.
@@ -2858,7 +2936,7 @@ func (c *Client) raceCandidates(
 	skipHosts *[4]string,
 	skipCount *int,
 	respCh chan<- Response,
-	note430 func(*providerGroup),
+	miss *missSet,
 ) (delivered, cancelled bool, lastErr error) {
 	// Filter to live candidates (skip same hosts and quota-exceeded).
 	live := make([]*providerGroup, 0, len(candidates))
@@ -2906,7 +2984,7 @@ func (c *Client) raceCandidates(
 			return false, false, fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 		}
 		if resp.StatusCode == 430 || resp.StatusCode == 423 {
-			note430(g)
+			miss.add(g)
 			if g.skipID != "" && *skipCount < len(skipHosts) {
 				skipHosts[*skipCount] = g.skipID
 				*skipCount++
@@ -2953,7 +3031,7 @@ func (c *Client) raceCandidates(
 			}
 			lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 		case 430, 423:
-			note430(g)
+			miss.add(g)
 			if g.skipID != "" && *skipCount < len(skipHosts) {
 				skipHosts[*skipCount] = g.skipID
 				*skipCount++
@@ -2997,7 +3075,7 @@ func (c *Client) raceCandidates(
 	}
 	if resp.StatusCode == 430 || resp.StatusCode == 423 {
 		// Rare: article expired between STAT and BODY.
-		note430(winner)
+		miss.add(winner)
 		if winner.skipID != "" && *skipCount < len(skipHosts) {
 			skipHosts[*skipCount] = winner.skipID
 			*skipCount++
@@ -3403,17 +3481,11 @@ func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Res
 	var lastErr error
 	post430 := false
 
-	// said430 records the providers that answered this request with a definitive
+	// miss records the providers that answered this request with a definitive
 	// 430/423. A miss is only reported when every provider that could hold the
-	// article is in it (see confirmUnanswered); a provider that timed out or
-	// dropped its connection has not said anything about the article.
-	var said430 map[string]bool
-	note430 := func(g *providerGroup) {
-		if said430 == nil {
-			said430 = make(map[string]bool, 4)
-		}
-		said430[g.name] = true
-	}
+	// article is covered by it (see confirmUnanswered); a provider that timed
+	// out or dropped its connection has not said anything about the article.
+	var miss missSet
 
 	// Track providers that returned 430 so we can skip others sharing the same
 	// article availability — same host (different credentials won't help), or
@@ -3605,7 +3677,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Res
 			// here delivered a 423 straight to the caller with no failover to
 			// the remaining mains or the backups.
 			if resp.StatusCode == 430 || resp.StatusCode == 423 {
-				note430(g)
+				miss.add(g)
 				c.nextIdx.Add(1) // bias next request away from this provider
 				if g.skipID != "" && skipCount < len(skipHosts) {
 					skipHosts[skipCount] = g.skipID
@@ -3623,7 +3695,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Res
 					}
 					delivered, cancelled, raceErr := c.raceCandidates(
 						ctx, rest, statPayload, payload, bodyWriter, onMeta,
-						&skipHosts, &skipCount, respCh, note430,
+						&skipHosts, &skipCount, respCh, &miss,
 					)
 					if cancelled {
 						err := ctx.Err()
@@ -3698,7 +3770,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Res
 	if raceable && post430 {
 		delivered, cancelled, raceErr := c.raceCandidates(
 			ctx, backups, statPayload, payload, bodyWriter, onMeta,
-			&skipHosts, &skipCount, respCh, note430,
+			&skipHosts, &skipCount, respCh, &miss,
 		)
 		if cancelled {
 			err := ctx.Err()
@@ -3760,7 +3832,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Res
 				// One backup's miss says nothing about the next backup's
 				// spool: remember it and ask the next one. The terminal step
 				// delivers it if no backup has the article.
-				note430(g)
+				miss.add(g)
 				if g.skipID != "" && skipCount < len(skipHosts) {
 					skipHosts[skipCount] = g.skipID
 					skipCount++
@@ -3778,24 +3850,20 @@ func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Res
 	if hasResp {
 		// A 430 is only the answer if no provider is left that never answered.
 		groups := append(append(make([]*providerGroup, 0, len(candidates)+len(backups)), candidates...), backups...)
-		delivered, cancelled, unknown := c.confirmUnanswered(ctx, groups, said430, &skipHosts, &skipCount,
+		delivered, unresolved, stop := c.confirmUnanswered(ctx, groups, &miss,
 			payload, bodyWriter, onMeta, ln, respCh, &lastErr)
-		if cancelled {
-			err := ctx.Err()
-			if err == nil {
-				err = c.ctx.Err()
-			}
-			respCh <- Response{Err: err}
+		if stop != nil {
+			respCh <- Response{Err: stop}
 			return
 		}
 		if delivered {
 			return
 		}
-		if unknown > 0 {
+		if unresolved > 0 {
 			if lastErr != nil {
-				respCh <- Response{Err: fmt.Errorf("%w: %d provider(s) did not answer: %w", ErrArticleUnconfirmed, unknown, lastErr)}
+				respCh <- Response{Err: fmt.Errorf("%w: %d provider(s) did not answer: %w", ErrArticleUnconfirmed, unresolved, lastErr)}
 			} else {
-				respCh <- Response{Err: fmt.Errorf("%w: %d provider(s) did not answer", ErrArticleUnconfirmed, unknown)}
+				respCh <- Response{Err: fmt.Errorf("%w: %d provider(s) did not answer", ErrArticleUnconfirmed, unresolved)}
 			}
 			return
 		}
