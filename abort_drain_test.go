@@ -126,7 +126,9 @@ func TestSmallRemainderIsDrainedNotClosed(t *testing.T) {
 	}()
 	<-w.first
 	cancel()
-	<-done
+	if err := <-done; err == nil {
+		t.Fatal("cancelled request must fail")
+	}
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel2()
