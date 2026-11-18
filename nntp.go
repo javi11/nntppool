@@ -1183,9 +1183,20 @@ type streamFeeder interface {
 
 type writerRef struct {
 	w io.Writer
+	// claim, when set, runs once before the first byte reaches w. It returns
+	// false when the attempt was already abandoned; the body is then drained
+	// into io.Discard instead.
+	claim func() bool
 }
 
 func (wr *writerRef) Write(p []byte) (int, error) {
+	if wr.claim != nil {
+		owned := wr.claim()
+		wr.claim = nil
+		if !owned {
+			wr.w = io.Discard
+		}
+	}
 	return wr.w.Write(p)
 }
 
@@ -1720,6 +1731,21 @@ func (c *NNTPConnection) readerLoop() {
 		// Allow us to switch output to io.Discard if the request is cancelled while
 		// we are still draining the response.
 		outRef := &writerRef{w: out}
+		// A caller's writer is shared by every attempt of the request, so this
+		// attempt must own the request before its first decoded byte goes in.
+		// The read loop only marks the attempt committed on the read after the
+		// first chunk was decoded; an attempt timer firing in between abandoned
+		// it and failed over, and the next provider wrote the body from byte 0
+		// behind that chunk (the caller got the first N KiB, then the body
+		// again). Committing here, with the same CAS the timer uses, settles
+		// it: either the timer won and nothing of this attempt reaches the
+		// writer, or this attempt won and the timer keeps waiting for it.
+		if deliver && req.BodyWriter != nil {
+			outRef.claim = func() bool {
+				return req.attemptState.CompareAndSwap(attemptPending, attemptCommitted) ||
+					req.attemptState.Load() == attemptCommitted
+			}
+		}
 
 		// Progress-aware deadline: before the first response byte we honor the
 		// attempt window as a TTFB bound — re-anchored at drain start, so time
