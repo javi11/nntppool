@@ -3654,7 +3654,18 @@ func (c *Client) doSendWithRetry(ctx context.Context, r SendReq, respCh chan Res
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 				continue
 			}
-			// Deliver whatever backup returns (including 430).
+			if resp.StatusCode == 430 || resp.StatusCode == 423 {
+				// One backup's miss says nothing about the next backup's
+				// spool: remember it and ask the next one. The terminal step
+				// delivers it if no backup has the article.
+				if g.skipID != "" && skipCount < len(skipHosts) {
+					skipHosts[skipCount] = g.skipID
+					skipCount++
+				}
+				lastResp = resp
+				hasResp = true
+				continue
+			}
 			respCh <- resp
 			return
 		}
